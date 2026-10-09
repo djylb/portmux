@@ -43,6 +43,33 @@ func TestEvictionUnderSilentFlood(t *testing.T) {
 	}
 }
 
+// TestSlotWaitKeepsSniffTimeout fills the pending budget with a matched
+// connection that nobody accepts. The next client waits for the slot longer
+// than its sniff timeout, and is matched once it has one.
+func TestSlotWaitKeepsSniffTimeout(t *testing.T) {
+	log := newErrorLog()
+	m := startMux(t, log.option(), WithMaxPending(1), WithSniffTimeout(200*time.Millisecond),
+		WithDispatchTimeout(time.Second), WithBanPerIP(1, time.Minute, time.Minute))
+	route := m.Match(Prefix("GET"))
+	serve(t, m)
+
+	_, _ = dial(t, m).Write([]byte("GET"))
+	// Matched, it can no longer be evicted for the next one.
+	for deadline := time.Now().Add(5 * time.Second); route.Info().Queued != 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("not queued")
+		}
+	}
+	_, _ = dial(t, m).Write([]byte("GET"))
+	if err := log.wait(t); !errors.Is(err, ErrDispatchTimeout) {
+		t.Fatalf("first connection: %v", err)
+	}
+	accept(t, route)
+	if bans := m.Bans(); len(bans) != 0 {
+		t.Fatalf("bans %+v", bans)
+	}
+}
+
 // TestEvictionUnderSlowloris does the same with clients that send a partial
 // request head and stall.
 func TestEvictionUnderSlowloris(t *testing.T) {
@@ -88,6 +115,28 @@ func TestEvictionSparesMatchedConnections(t *testing.T) {
 	p.closeAll()
 	if conns[0].n != 0 {
 		t.Fatal("closeAll closed a removed connection")
+	}
+}
+
+// TestEvictionFollowsAcceptOrder adds connections out of accept order, with
+// start times a coarse clock does not tell apart, in shared and separate
+// shards.
+func TestEvictionFollowsAcceptOrder(t *testing.T) {
+	var p pendingSet
+	conns := map[uint64]*closeCounter{}
+	for _, seq := range []uint64{33, 2, 17, 18, 1} {
+		conns[seq] = &closeCounter{}
+		p.add(&sniffer{conn: &Conn{conn: conns[seq], stripe: uint8(seq % counterStripes)}, seq: seq}, true)
+	}
+	for _, want := range []uint64{1, 2, 17, 18, 33} {
+		if !p.evictOldest() {
+			t.Fatal("nothing evicted")
+		}
+		for seq, c := range conns {
+			if closed := seq <= want; (c.n == 1) != closed {
+				t.Fatalf("after evicting %d: connection %d closed %d times", want, seq, c.n)
+			}
+		}
 	}
 }
 

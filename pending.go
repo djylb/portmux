@@ -2,7 +2,6 @@ package portmux
 
 import (
 	"sync"
-	"sync/atomic"
 )
 
 // pendingShards is the number of independently locked parts of a pendingSet.
@@ -10,9 +9,10 @@ const pendingShards = 16
 
 // pendingSet tracks every undelivered connection, so that Close can close
 // them. Undecided connections from Serve are kept in accept order, so that the
-// oldest one can be evicted when the pending limit is reached.
+// oldest one can be evicted when the pending limit is reached. A connection
+// is kept in the shard of its counter stripe, so connections handled at once
+// rarely share a lock.
 type pendingSet struct {
-	seq    atomic.Uint64
 	shards [pendingShards]pendingShard
 }
 
@@ -37,6 +37,26 @@ func (l *sniffList) push(s *sniffer) {
 	l.tail = s
 }
 
+// insert adds s in accept order. Goroutines may reach it out of order, but
+// rarely by much.
+func (l *sniffList) insert(s *sniffer) {
+	at := l.tail
+	for at != nil && at.seq > s.seq {
+		at = at.prev
+	}
+	s.list, s.prev = l, at
+	if at != nil {
+		s.next, at.next = at.next, s
+	} else {
+		s.next, l.head = l.head, s
+	}
+	if s.next != nil {
+		s.next.prev = s
+	} else {
+		l.tail = s
+	}
+}
+
 func (l *sniffList) remove(s *sniffer) {
 	if s.prev != nil {
 		s.prev.next = s.next
@@ -51,13 +71,15 @@ func (l *sniffList) remove(s *sniffer) {
 	s.list, s.prev, s.next = nil, nil, nil
 }
 
+func (p *pendingSet) shard(s *sniffer) *pendingShard {
+	return &p.shards[s.conn.stripe%pendingShards]
+}
+
 func (p *pendingSet) add(s *sniffer, evictable bool) {
-	s.seq = p.seq.Add(1)
-	s.shard = uint8(s.seq % pendingShards)
-	sh := &p.shards[s.shard]
+	sh := p.shard(s)
 	sh.mu.Lock()
 	if evictable {
-		sh.idle.push(s)
+		sh.idle.insert(s)
 	} else {
 		sh.busy.push(s)
 	}
@@ -66,7 +88,7 @@ func (p *pendingSet) add(s *sniffer, evictable bool) {
 
 // decided marks s as matched, which protects it from eviction.
 func (p *pendingSet) decided(s *sniffer) {
-	sh := &p.shards[s.shard]
+	sh := p.shard(s)
 	sh.mu.Lock()
 	if s.list == &sh.idle {
 		sh.idle.remove(s)
@@ -76,7 +98,7 @@ func (p *pendingSet) decided(s *sniffer) {
 }
 
 func (p *pendingSet) remove(s *sniffer) {
-	sh := &p.shards[s.shard]
+	sh := p.shard(s)
 	sh.mu.Lock()
 	if s.list != nil {
 		s.list.remove(s)

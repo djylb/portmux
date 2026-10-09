@@ -133,11 +133,11 @@ func BenchmarkLoopback(b *testing.B) {
 	go func() { _ = m.Serve(ln) }()
 	go func() {
 		for {
-			c, err := r.Accept()
+			c, err := r.AcceptConn()
 			if err != nil {
 				return
 			}
-			_ = c.Close()
+			closeNow(c)
 		}
 	}()
 	b.ReportAllocs()
@@ -271,7 +271,7 @@ func BenchmarkDelivery(b *testing.B) {
 			}
 			m := New()
 			defer func() { _ = m.Close() }()
-			serveConn := func(c *Conn) { _ = c.Close() }
+			serveConn := closeNow
 			cfg := RouteConfig{Matchers: []Matcher{TLS()}}
 			if mode == "handler" {
 				cfg.Handler = serveConn
@@ -325,4 +325,39 @@ func BenchmarkServeConnHandler(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkServeConnParallelHandler is BenchmarkServeConnParallel with a
+// handler instead of an accept loop.
+func BenchmarkServeConnParallelHandler(b *testing.B) {
+	hello := testutil.ClientHelloBytes(b, &tls.Config{ServerName: "www.example.com", InsecureSkipVerify: true})
+	m := New()
+	defer func() { _ = m.Close() }()
+	m.Match(Prefix("TST"))
+	m.Match(HTTP1(Host("manager.example.com")))
+	if _, err := m.Add(RouteConfig{Matchers: []Matcher{HTTP1(), TLS()}, Handler: func(c *Conn) { _ = c.Close() }}); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			data := hello
+			if rand.IntN(2) == 0 {
+				data = benchRequest
+			}
+			if err := m.ServeConn(&memConn{data: data}); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}
+
+// closeNow closes a connection with a reset, which leaves no TIME_WAIT
+// behind, so that benchmarks of many connections do not run out of ports.
+func closeNow(c *Conn) {
+	if tc, ok := c.NetConn().(*net.TCPConn); ok {
+		_ = tc.SetLinger(0)
+	}
+	_ = c.Close()
 }

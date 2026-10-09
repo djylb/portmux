@@ -2,6 +2,7 @@ package portmux
 
 import (
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -253,5 +254,128 @@ func TestAlwaysTakesNoBuffer(t *testing.T) {
 	in.SetEntry("x")
 	if Always().Match(in) != Match || in.Entry() != "x" || describe(Always()) != "Always()" {
 		t.Fatal("Always on an Input")
+	}
+}
+
+// TestEntryOptions gives entries settings of their own on top of the Mux's.
+func TestEntryOptions(t *testing.T) {
+	type report struct {
+		entry string
+		err   error
+	}
+	reports := make(chan report, 16)
+	m := New(WithMaxPending(100), WithBanPerIP(1, time.Minute, time.Minute), WithObserver(func(ev Event) {
+		if ev.Err != nil {
+			reports <- report{ev.Entry, ev.Err}
+		}
+	}))
+	t.Cleanup(func() { _ = m.Close() })
+	web, err := m.Add(RouteConfig{Matchers: []Matcher{Prefix("GET")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect := func(entry string, want error) {
+		t.Helper()
+		select {
+		case r := <-reports:
+			if r.entry != entry || !errors.Is(r.err, want) {
+				t.Fatalf("reported %+v, want %v on %s", r, want, entry)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no report on %s", entry)
+		}
+	}
+	public, internal := m.Entry("public"), m.Entry("internal")
+	public.SetOptions(WithSniffTimeout(50*time.Millisecond), WithRateLimitPerIP(0.001, 2), WithBanPerIP(0, 0, 0))
+	internal.SetOptions(WithBanPerIP(0, 0, 0))
+	pub, in := listen(t, public), listen(t, internal)
+	waitServing(t, m, 2)
+
+	// The short sniff timeout of the public entry; the internal one waits.
+	// Neither entry bans yet, although the Mux bans at the first failure.
+	c := dialTo(t, pub, "")
+	expectClosed(t, c)
+	expect("public", ErrSniffTimeout)
+	c = dialTo(t, in, "GE")
+	time.Sleep(100 * time.Millisecond)
+	if web.Matched() != 0 || m.Stats().Pending != 1 {
+		t.Fatalf("matched %d, stats %+v", web.Matched(), m.Stats())
+	}
+	_, _ = c.Write([]byte("T"))
+	accept(t, web)
+
+	// Failures on the internal entry do not ban, and its rate is the Mux's.
+	_ = dialTo(t, in, "XX")
+	expect("internal", ErrNoMatch)
+	_ = dialTo(t, in, "GET")
+	accept(t, web)
+	// The public entry has buckets of its own: the timed-out connection took
+	// the first token, this one the second, the next none.
+	_ = dialTo(t, pub, "GET")
+	accept(t, web)
+	c = dialTo(t, pub, "GET")
+	expectClosed(t, c)
+	expect("public", ErrRateLimited)
+
+	// Settings read back, with the entry's on top of the Mux's.
+	if got := m.Config(); got.SniffTimeout != DefaultSniffTimeout || got.BanFailures != 1 || got.MaxPending != 100 || !got.Observer {
+		t.Fatalf("Mux config %+v", got)
+	}
+	got := public.Config()
+	if got.SniffTimeout != 50*time.Millisecond || got.RateLimitPerIP != 0.001 || got.RateBurstPerIP != 2 || got.BanFailures != 0 || got.MaxPending != 100 {
+		t.Fatalf("public config %+v", got)
+	}
+	// A change to the Mux applies to what the entry does not override, and
+	// the entry keeps its buckets.
+	m.SetOptions(WithSniffTimeout(time.Minute), WithMaxSniffBytes(512))
+	if got := public.Config(); got.SniffTimeout != 50*time.Millisecond || got.MaxSniffBytes != 512 {
+		t.Fatalf("public config after Mux change %+v", got)
+	}
+	c = dialTo(t, pub, "GET")
+	expectClosed(t, c)
+	expect("public", ErrRateLimited)
+
+	// Reset, the entry follows the Mux again.
+	public.ResetOptions()
+	if got, want := public.Config(), m.Config(); got != want {
+		t.Fatalf("after reset %+v, want %+v", got, want)
+	}
+	_ = dialTo(t, pub, "GET")
+	accept(t, web)
+	// A failure on the public entry bans the client on every entry.
+	_ = dialTo(t, pub, "XX")
+	expect("public", ErrNoMatch)
+	c = dialTo(t, in, "GET")
+	expectClosed(t, c)
+	expect("internal", ErrBanned)
+}
+
+// TestEntryOwnRateBuckets gives an entry a per-client rate of its own, equal
+// to the Mux's: the entry keeps buckets apart, also when the Mux's rate
+// changes.
+func TestEntryOwnRateBuckets(t *testing.T) {
+	log := newErrorLog()
+	m := New(WithRateLimitPerIP(0.001, 1), log.option())
+	t.Cleanup(func() { _ = m.Close() })
+	web, err := m.Add(RouteConfig{Matchers: []Matcher{Prefix("GET")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := m.Entry("own")
+	own.SetOptions(WithRateLimitPerIP(0.001, 1))
+	def, ln := listen(t, m.Entry("")), listen(t, own)
+	waitServing(t, m, 2)
+
+	_ = dialTo(t, def, "GET")
+	accept(t, web)
+	// The Mux's bucket of the client is empty, the entry's is not.
+	_ = dialTo(t, ln, "GET")
+	accept(t, web)
+	for _, rate := range []float64{0.002, 0.001} {
+		m.SetOptions(WithRateLimitPerIP(rate, 1))
+		expectClosed(t, dialTo(t, ln, "GET"))
+		if err := log.wait(t); !errors.Is(err, ErrRateLimited) {
+			t.Fatalf("after the Mux's rate became %v: %v", rate, err)
+		}
 	}
 }

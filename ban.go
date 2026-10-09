@@ -24,14 +24,14 @@ func banWorthy(err error) bool {
 // are not checked.
 func (m *Mux) Ban(client netip.Addr, d time.Duration) {
 	if key, ok := clientKey(net.TCPAddrFromAddrPort(netip.AddrPortFrom(client, 0))); ok {
-		m.bans.set(key, m.bans.now(), d)
+		m.bans.set(banKey{client: key}, m.bans.now(), d)
 	}
 }
 
 // Unban lifts the ban of client and reports whether it was banned.
 func (m *Mux) Unban(client netip.Addr) bool {
 	key, ok := clientKey(net.TCPAddrFromAddrPort(netip.AddrPortFrom(client, 0)))
-	return ok && m.bans.set(key, m.bans.now(), 0)
+	return ok && m.bans.set(banKey{client: key}, m.bans.now(), 0)
 }
 
 // Ban is a banned client.
@@ -50,8 +50,8 @@ func (m *Mux) Bans() []Ban {
 
 const (
 	banShards = 16
-	// maxBanClients bounds the clients a banList tracks. When they do not
-	// fit, failures of new clients are not counted.
+	// maxBanClients bounds the records a banList keeps. When they do not fit,
+	// failures of new clients are not counted.
 	maxBanClients = 1 << 16
 )
 
@@ -59,18 +59,28 @@ const (
 // a while, automatically or on request.
 type banList struct {
 	epoch  time.Time
-	size   atomic.Int64 // tracked clients, so that an empty list costs nothing
+	size   atomic.Int64 // records, so that an empty list costs nothing
 	shards [banShards]banShard
 }
 
 type banShard struct {
 	mu      sync.Mutex
 	checks  int
-	clients map[netip.Addr]banEntry
+	clients map[banKey]banEntry
+}
+
+// banKey names a record of a client: the one with its ban and the failures
+// counted for the Mux, or with own set, the failures counted for an entry
+// with its own WithBanPerIP.
+type banKey struct {
+	client netip.Addr
+	entry  string
+	own    bool
 }
 
 type banEntry struct {
 	start    time.Duration // start of the failure window, since epoch
+	window   time.Duration // length of the failure window
 	until    time.Duration // end of the ban, since epoch; zero when not banned
 	failures int
 }
@@ -78,7 +88,7 @@ type banEntry struct {
 func newBanList() *banList {
 	l := &banList{epoch: time.Now()}
 	for i := range l.shards {
-		l.shards[i].clients = make(map[netip.Addr]banEntry)
+		l.shards[i].clients = make(map[banKey]banEntry)
 	}
 	return l
 }
@@ -98,65 +108,86 @@ func (l *banList) banned(client netip.Addr, now time.Duration) bool {
 	sh := l.shard(client)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	e, ok := sh.clients[client]
+	e, ok := sh.clients[banKey{client: client}]
 	return ok && e.until > now
 }
 
-// fail counts a failed connection of client and bans it for d once failures
-// connections failed within window.
-func (l *banList) fail(client netip.Addr, now time.Duration, failures int, window, d time.Duration) {
-	sh := l.shard(client)
+// fail counts a failed connection in the record key and bans its client for
+// d once failures connections failed within window.
+func (l *banList) fail(key banKey, now time.Duration, failures int, window, d time.Duration) {
+	sh := l.shard(key.client)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if sh.checks++; sh.checks >= rateSweepEvery {
 		sh.checks = 0
-		l.sweep(sh, now, window)
+		l.sweep(sh, now)
 	}
-	e, ok := sh.clients[client]
-	if !ok {
-		if len(sh.clients) >= maxBanClients/banShards {
-			return
-		}
-		l.size.Add(1)
-	}
-	if e.until > now {
+	ban := banKey{client: key.client}
+	b, banned := sh.clients[ban]
+	if banned && b.until > now {
 		return // already banned
+	}
+	e, ok := sh.clients[key]
+	if !ok && !l.track(sh) {
+		return
 	}
 	if now-e.start > window {
 		e.start, e.failures = now, 0
 	}
-	if e.failures++; e.failures >= failures {
-		e.until, e.failures = now+d, 0
+	e.window = window
+	if e.failures++; e.failures < failures {
+		sh.clients[key] = e
+		return
 	}
-	sh.clients[client] = e
+	e.failures = 0
+	sh.clients[key] = e
+	if key != ban {
+		if !banned && !l.track(sh) {
+			return
+		}
+		e = b
+	}
+	e.until = now + d
+	sh.clients[ban] = e
 }
 
-// set bans client until now+d, or lifts its ban for d <= 0. It reports
-// whether the client was banned before.
-func (l *banList) set(client netip.Addr, now, d time.Duration) bool {
-	sh := l.shard(client)
+// track makes room for a new record in sh and reports whether there was
+// some.
+func (l *banList) track(sh *banShard) bool {
+	if len(sh.clients) >= maxBanClients/banShards {
+		return false
+	}
+	l.size.Add(1)
+	return true
+}
+
+// set bans the client of key until now+d, or lifts its ban for d <= 0. It
+// reports whether the client was banned before.
+func (l *banList) set(key banKey, now, d time.Duration) bool {
+	sh := l.shard(key.client)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	e, ok := sh.clients[client]
+	e, ok := sh.clients[key]
 	was := ok && e.until > now
 	switch {
 	case d > 0:
 		if !ok {
 			l.size.Add(1)
 		}
-		sh.clients[client] = banEntry{start: now, until: now + d}
+		sh.clients[key] = banEntry{start: now, until: now + d}
 	case ok:
-		delete(sh.clients, client)
+		delete(sh.clients, key)
 		l.size.Add(-1)
 	}
 	return was
 }
 
-// sweep forgets clients that are not banned and whose window has passed.
-func (l *banList) sweep(sh *banShard, now, window time.Duration) {
-	for client, e := range sh.clients {
-		if e.until <= now && now-e.start > window {
-			delete(sh.clients, client)
+// sweep forgets the records of clients that are not banned and whose window
+// has passed.
+func (l *banList) sweep(sh *banShard, now time.Duration) {
+	for key, e := range sh.clients {
+		if e.until <= now && now-e.start > e.window {
+			delete(sh.clients, key)
 			l.size.Add(-1)
 		}
 	}
@@ -168,9 +199,9 @@ func (l *banList) list(now time.Duration) []Ban {
 	for i := range l.shards {
 		sh := &l.shards[i]
 		sh.mu.Lock()
-		for client, e := range sh.clients {
+		for key, e := range sh.clients {
 			if e.until > now {
-				bans = append(bans, Ban{Client: clientPrefix(client), Until: l.epoch.Add(e.until)})
+				bans = append(bans, Ban{Client: clientPrefix(key.client), Until: l.epoch.Add(e.until)})
 			}
 		}
 		sh.mu.Unlock()

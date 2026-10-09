@@ -37,27 +37,67 @@ type options struct {
 	proxyPolicy     func(entry string, peer, local net.Addr) proxyproto.Policy
 }
 
-// Option configures New and Mux.SetOptions.
-type Option func(*options)
+// Option configures a Mux; see New and Mux.SetOptions.
+type Option interface {
+	apply(o *options)
+}
 
-// WithSniffTimeout bounds the time from accepting a connection until it is
-// matched, including reading a PROXY protocol header. A connection that is
+// EntryOption is an Option that can also be set for the connections of one
+// entry alone; see Entry.SetOptions. The options that bound the Mux as a
+// whole, WithMaxPending, WithObserver and WithProxyProtocol, are not entry
+// options.
+type EntryOption interface {
+	Option
+	setting() entrySetting
+}
+
+type optionFunc func(*options)
+
+func (f optionFunc) apply(o *options) { f(o) }
+
+// entrySetting numbers the settings that entries can override.
+type entrySetting uint8
+
+const (
+	settingSniffTimeout entrySetting = iota
+	settingDispatchTimeout
+	settingMaxSniffBytes
+	settingMaxPendingPerIP
+	settingRateLimitPerIP
+	settingRateLimitPerListener
+	settingBanPerIP
+	settingMaxQueuedPerRoute
+	numEntrySettings
+)
+
+type entryOption struct {
+	s   entrySetting
+	set func(*options)
+}
+
+func (e entryOption) apply(o *options)      { e.set(o) }
+func (e entryOption) setting() entrySetting { return e.s }
+
+// WithSniffTimeout bounds the time from taking a connection until it is
+// matched, including reading a PROXY protocol header. Serve takes a
+// connection once it has a pending slot, so the wait for one, see
+// WithMaxPending, does not count. A connection that is
 // still undecided when it expires is closed and reported with ErrSniffTimeout.
 // A non-positive value disables the limit.
-func WithSniffTimeout(d time.Duration) Option {
-	return func(o *options) {
+func WithSniffTimeout(d time.Duration) EntryOption {
+	return entryOption{settingSniffTimeout, func(o *options) {
 		o.sniffTimeout = d
-	}
+	}}
 }
 
 // WithDispatchTimeout bounds how long a matched connection waits for its
 // route's Accept. The connection is closed and reported with
 // ErrDispatchTimeout when it expires. A non-positive value waits until the
 // route or the Mux is closed.
-func WithDispatchTimeout(d time.Duration) Option {
-	return func(o *options) {
+func WithDispatchTimeout(d time.Duration) EntryOption {
+	return entryOption{settingDispatchTimeout, func(o *options) {
 		o.dispatchTimeout = d
-	}
+	}}
 }
 
 // WithMaxSniffBytes limits how many bytes are buffered while matching, not
@@ -65,10 +105,10 @@ func WithDispatchTimeout(d time.Duration) Option {
 // still need more bytes are treated as not matching. A non-positive value
 // selects DefaultMaxSniffBytes, and values above MaxSniffBytes are lowered to
 // it.
-func WithMaxSniffBytes(n int) Option {
-	return func(o *options) {
+func WithMaxSniffBytes(n int) EntryOption {
+	return entryOption{settingMaxSniffBytes, func(o *options) {
 		o.maxSniffBytes = n
-	}
+	}}
 }
 
 // WithMaxPending limits how many connections accepted by Serve may be
@@ -81,9 +121,9 @@ func WithMaxSniffBytes(n int) Option {
 // clients in the kernel's accept queue. A non-positive value removes the
 // limit.
 func WithMaxPending(n int) Option {
-	return func(o *options) {
+	return optionFunc(func(o *options) {
 		o.maxPending = n
-	}
+	})
 }
 
 // WithMaxPendingPerIP limits how many connections accepted by Serve from one
@@ -93,10 +133,10 @@ func WithMaxPending(n int) Option {
 // address or an IPv6 /64 network of the peer of the TCP connection, not an
 // address from a PROXY protocol header. A non-positive value, the default,
 // removes the limit.
-func WithMaxPendingPerIP(n int) Option {
-	return func(o *options) {
+func WithMaxPendingPerIP(n int) EntryOption {
+	return entryOption{settingMaxPendingPerIP, func(o *options) {
 		o.maxPendingPerIP = n
-	}
+	}}
 }
 
 // WithRateLimitPerIP limits how fast one client may open connections that
@@ -106,10 +146,10 @@ func WithMaxPendingPerIP(n int) Option {
 // ErrRateLimited. Clients are counted as in WithMaxPendingPerIP. Up to 65536
 // clients are tracked; beyond that, new clients pass unchecked. A
 // non-positive rate, the default, disables the limit.
-func WithRateLimitPerIP(perSecond float64, burst int) Option {
-	return func(o *options) {
+func WithRateLimitPerIP(perSecond float64, burst int) EntryOption {
+	return entryOption{settingRateLimitPerIP, func(o *options) {
 		o.rate, o.rateBurst = perSecond, burst
-	}
+	}}
 }
 
 // WithRateLimitPerListener limits how fast each listener served by Serve
@@ -119,10 +159,10 @@ func WithRateLimitPerIP(perSecond float64, burst int) Option {
 // ErrRateLimited. It keeps a flood from many addresses, which per-client
 // limits do not catch, from taking the CPU of every port. A non-positive
 // rate, the default, disables the limit.
-func WithRateLimitPerListener(perSecond float64, burst int) Option {
-	return func(o *options) {
+func WithRateLimitPerListener(perSecond float64, burst int) EntryOption {
+	return entryOption{settingRateLimitPerListener, func(o *options) {
 		o.listenerRate, o.listenerBurst = perSecond, burst
-	}
+	}}
 }
 
 // WithBanPerIP bans clients whose connections keep failing, as scanners'
@@ -134,20 +174,20 @@ func WithRateLimitPerListener(perSecond float64, burst int) Option {
 // Clients are counted as in WithMaxPendingPerIP; Mux.Ban and Mux.Bans manage
 // bans directly. A non-positive failures, the default, disables automatic
 // bans.
-func WithBanPerIP(failures int, window, d time.Duration) Option {
-	return func(o *options) {
+func WithBanPerIP(failures int, window, d time.Duration) EntryOption {
+	return entryOption{settingBanPerIP, func(o *options) {
 		o.banFailures, o.banWindow, o.banTime = failures, window, d
-	}
+	}}
 }
 
 // WithMaxQueuedPerRoute limits how many matched connections may wait for one
 // route's Accept, so that a route whose server stalls cannot take up the
 // pending budget of the others. Connections over the limit are closed and
 // reported with ErrRouteBusy. A non-positive value removes the limit.
-func WithMaxQueuedPerRoute(n int) Option {
-	return func(o *options) {
+func WithMaxQueuedPerRoute(n int) EntryOption {
+	return entryOption{settingMaxQueuedPerRoute, func(o *options) {
 		o.maxQueued = n
-	}
+	}}
 }
 
 // WithObserver sets a function called with an Event for every connection
@@ -158,9 +198,9 @@ func WithMaxQueuedPerRoute(n int) Option {
 // synchronously, for limit errors in the accept loop, so it must be cheap
 // under attack: prefer counting to logging every rejected connection.
 func WithObserver(fn func(Event)) Option {
-	return func(o *options) {
+	return optionFunc(func(o *options) {
 		o.observer = fn
-	}
+	})
 }
 
 // WithProxyProtocol enables PROXY protocol v1 and v2 headers, parsed with
@@ -180,9 +220,9 @@ func WithObserver(fn func(Event)) Option {
 // Only trusted peers such as a load balancer should be allowed to send a
 // header, since it lets the peer choose the reported client address.
 func WithProxyProtocol(policy func(entry string, peer, local net.Addr) proxyproto.Policy) Option {
-	return func(o *options) {
+	return optionFunc(func(o *options) {
 		o.proxyPolicy = policy
-	}
+	})
 }
 
 func newOptions(opts []Option) options {
@@ -200,11 +240,62 @@ func newOptions(opts []Option) options {
 func (o *options) apply(opts []Option) {
 	for _, opt := range opts {
 		if opt != nil {
-			opt(o)
+			opt.apply(o)
 		}
 	}
+	o.normalize()
+}
+
+func (o *options) normalize() {
 	if o.maxSniffBytes <= 0 {
 		o.maxSniffBytes = DefaultMaxSniffBytes
 	}
 	o.maxSniffBytes = min(o.maxSniffBytes, MaxSniffBytes)
+}
+
+// Config reports the settings of a Mux, or those that apply to the
+// connections of one entry, as the options set them; see Mux.Config and
+// Entry.Config.
+type Config struct {
+	SniffTimeout      time.Duration
+	DispatchTimeout   time.Duration
+	MaxSniffBytes     int
+	MaxPending        int
+	MaxPendingPerIP   int
+	MaxQueuedPerRoute int
+	// RateLimitPerIP and RateBurstPerIP are the arguments of
+	// WithRateLimitPerIP, and the next two those of WithRateLimitPerListener.
+	RateLimitPerIP       float64
+	RateBurstPerIP       int
+	RateLimitPerListener float64
+	RateBurstPerListener int
+	// BanFailures, BanWindow and BanDuration are the arguments of
+	// WithBanPerIP.
+	BanFailures int
+	BanWindow   time.Duration
+	BanDuration time.Duration
+	// Observer and ProxyProtocol report whether WithObserver and
+	// WithProxyProtocol set a function.
+	Observer      bool
+	ProxyProtocol bool
+}
+
+func (o *options) config() Config {
+	return Config{
+		SniffTimeout:         o.sniffTimeout,
+		DispatchTimeout:      o.dispatchTimeout,
+		MaxSniffBytes:        o.maxSniffBytes,
+		MaxPending:           o.maxPending,
+		MaxPendingPerIP:      o.maxPendingPerIP,
+		MaxQueuedPerRoute:    o.maxQueued,
+		RateLimitPerIP:       o.rate,
+		RateBurstPerIP:       o.rateBurst,
+		RateLimitPerListener: o.listenerRate,
+		RateBurstPerListener: o.listenerBurst,
+		BanFailures:          o.banFailures,
+		BanWindow:            o.banWindow,
+		BanDuration:          o.banTime,
+		Observer:             o.observer != nil,
+		ProxyProtocol:        o.proxyPolicy != nil,
+	}
 }

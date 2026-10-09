@@ -25,6 +25,7 @@ type sniffer struct {
 	off      int   // length of the PROXY header at the start of buf
 	err      error // error of the last read, examined after its bytes
 	start    time.Time
+	seq      uint64    // accept order of a connection from Serve
 	deadline time.Time // sniff deadline, zero without one
 	armed    time.Time // read deadline currently set on the connection
 	silentAt time.Duration
@@ -39,8 +40,6 @@ type sniffer struct {
 	// Membership in a pendingSet list, guarded by the shard's lock.
 	list       *sniffList
 	prev, next *sniffer
-	seq        uint64
-	shard      uint8
 	evicted    atomic.Bool
 }
 
@@ -54,11 +53,11 @@ const maxEmptyReads = 100
 
 var snifferPool = sync.Pool{New: func() any { return new(sniffer) }}
 
-// newSniffer takes a sniffer from the pool for conn, which keeps the options
-// it starts with.
-func newSniffer(conn *Conn, opts *options) *sniffer {
+// newSniffer takes a sniffer from the pool for conn, accepted at start, which
+// keeps the options it starts with.
+func newSniffer(conn *Conn, opts *options, start time.Time) *sniffer {
 	s := snifferPool.Get().(*sniffer)
-	s.conn, s.opts, s.start = conn, opts, time.Now()
+	s.conn, s.opts, s.start = conn, opts, start
 	s.in.entry = conn.entry
 	if opts.sniffTimeout > 0 {
 		s.deadline = s.start.Add(opts.sniffTimeout)
@@ -72,15 +71,27 @@ func (s *sniffer) release() {
 	snifferPool.Put(s)
 }
 
+// arrival is when the Mux started on a connection, once it had a pending
+// slot, and the counter stripe it uses. Connections from Serve are also
+// numbered in accept order.
+type arrival struct {
+	start  time.Time
+	seq    uint64
+	stripe uint8
+}
+
 // serveConn matches c and delivers it. Connections from Serve come with their
 // listener, which counts them; they are reported to the error handler and may
 // be evicted while undecided. For a route with a handler, serveConn returns
 // the handler instead of calling it, so that the caller first releases what
 // counts the connection as pending.
-func (m *Mux) serveConn(c net.Conn, l *listener, entry string) (handler func(*Conn), conn *Conn, err error) {
-	m.count(l, func(c *counters) { c.pending.Add(1) })
-	conn = &Conn{conn: c, entry: entry}
-	s := newSniffer(conn, m.opts.Load())
+func (m *Mux) serveConn(c net.Conn, l *listener, entry string, at arrival) (handler func(*Conn), conn *Conn, err error) {
+	stripe := at.stripe
+	conn = &Conn{conn: c, entry: entry, stripe: stripe}
+	m.count(l, stripe, func(c *counters) { c.pending.Add(1) })
+	o, _ := m.settings(entry)
+	s := newSniffer(conn, o, at.start)
+	s.seq = at.seq
 	m.undelivered.add(s, l != nil)
 	delivered := false
 	defer func() {
@@ -98,17 +109,25 @@ func (m *Mux) serveConn(c net.Conn, l *listener, entry string) (handler func(*Co
 			ev.Remote, ev.Local = conn.RemoteAddr(), conn.LocalAddr()
 		}
 		s.release()
-		m.count(l, func(c *counters) {
-			c.pending.Add(-1)
+		// The outcome is counted before the connection leaves pending and
+		// before the client sees it closed, so that the counts add up for
+		// anyone who waited for either.
+		var reason rejectReason
+		if !delivered {
+			reason = reasonOf(err)
+		}
+		m.count(l, stripe, func(c *counters) {
 			if delivered {
 				c.delivered.Add(1)
+			} else {
+				c.rejected[reason].Add(1)
 			}
+			c.pending.Add(-1)
 		})
 		if delivered {
 			ev.Route = conn.route
 		} else {
 			_ = conn.Close()
-			m.reject(l, err)
 		}
 		if observed {
 			m.observe(ev)
@@ -154,11 +173,11 @@ func (m *Mux) serveConn(c net.Conn, l *listener, entry string) (handler func(*Co
 			return nil, conn, ErrRefused
 		}
 		if !r.tryOpen(m.table.Load().routes[r].maxConns) {
-			return nil, conn, ErrRouteBusy
+			return nil, conn, ErrRouteFull
 		}
 		conn.mux, conn.ln = m, l
 		conn.open.Store(true)
-		m.count(l, func(c *counters) { c.open.Add(1) })
+		m.count(l, stripe, func(c *counters) { c.open.Add(1) })
 		if r.handler != nil {
 			delivered = true
 			return r.handler, conn, nil

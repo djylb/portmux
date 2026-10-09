@@ -2,6 +2,7 @@ package portmux
 
 import (
 	"errors"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"strings"
@@ -29,7 +30,7 @@ func (m *Mux) Snapshot() Snapshot {
 	}
 	m.mu.Lock()
 	for ln, l := range m.listeners {
-		snap.Listeners = append(snap.Listeners, ListenerInfo{Entry: l.entry, Addr: ln.Addr(), Stats: l.stats()})
+		snap.Listeners = append(snap.Listeners, ListenerInfo{Entry: l.entry, Addr: ln.Addr(), Stats: l.counts.stats()})
 	}
 	m.mu.Unlock()
 	slices.SortFunc(snap.Listeners, func(a, b ListenerInfo) int {
@@ -110,7 +111,7 @@ func reasonOf(err error) rejectReason {
 		return reasonTimeout
 	case errors.Is(err, ErrEvicted):
 		return reasonEvicted
-	case errors.Is(err, ErrPendingLimit), errors.Is(err, ErrRateLimited), errors.Is(err, ErrRouteBusy):
+	case errors.Is(err, ErrPendingLimit), errors.Is(err, ErrRateLimited), errors.Is(err, ErrRouteBusy), errors.Is(err, ErrRouteFull):
 		return reasonLimited
 	case errors.Is(err, ErrBanned):
 		return reasonBanned
@@ -123,7 +124,60 @@ func (m *Mux) Stats() Stats {
 	return m.total.stats()
 }
 
-// counters counts connections, for a Mux and for each listener.
+// counterStripes is the number of stripes that the counters of a Mux and of
+// a listener are spread over, so that connections handled on different cores
+// do not contend for one cache line. A connection keeps one stripe: those
+// from Serve take turns by accept order, those from ServeConn take one at
+// random. Readers add the stripes up.
+const counterStripes = 16
+
+// stripedCounters holds the stripes of counters, each on cache lines of its
+// own, also where lines are 128 bytes long.
+type stripedCounters [counterStripes]struct {
+	counters
+	_ [128]byte
+}
+
+// newStripe picks the stripe of a connection from ServeConn.
+func newStripe() uint8 {
+	return uint8(rand.Uint32() % counterStripes)
+}
+
+func (c *stripedCounters) at(stripe uint8) *counters {
+	return &c[stripe%counterStripes].counters
+}
+
+// stats adds the stripes up.
+func (c *stripedCounters) stats() Stats {
+	var st Stats
+	for i := range c {
+		s := c[i].stats()
+		st.Accepted += s.Accepted
+		st.Delivered += s.Delivered
+		st.Pending += s.Pending
+		st.Open += s.Open
+		st.NoMatch += s.NoMatch
+		st.Refused += s.Refused
+		st.Timeouts += s.Timeouts
+		st.Evicted += s.Evicted
+		st.Limited += s.Limited
+		st.Banned += s.Banned
+		st.Failed += s.Failed
+	}
+	st.Rejected = st.NoMatch + st.Refused + st.Timeouts + st.Evicted + st.Limited + st.Banned + st.Failed
+	return st
+}
+
+// pending returns the number of pending connections.
+func (c *stripedCounters) pending() int64 {
+	var n int64
+	for i := range c {
+		n += c[i].pending.Load()
+	}
+	return n
+}
+
+// counters counts connections, in one stripe.
 type counters struct {
 	accepted  atomic.Uint64
 	delivered atomic.Uint64
@@ -150,19 +204,19 @@ func (c *counters) stats() Stats {
 	return st
 }
 
-// count applies f to the counters of the Mux and, for a connection from
-// Serve, of its listener.
-func (m *Mux) count(l *listener, f func(*counters)) {
-	f(&m.total)
+// count applies f to a stripe of the counters of the Mux and, for a
+// connection from Serve, of its listener.
+func (m *Mux) count(l *listener, stripe uint8, f func(*counters)) {
+	f(m.total.at(stripe))
 	if l != nil {
-		f(&l.counters)
+		f(l.counts.at(stripe))
 	}
 }
 
 // reject counts a connection that is closed without delivery.
-func (m *Mux) reject(l *listener, err error) {
+func (m *Mux) reject(l *listener, stripe uint8, err error) {
 	reason := reasonOf(err)
-	m.count(l, func(c *counters) { c.rejected[reason].Add(1) })
+	m.count(l, stripe, func(c *counters) { c.rejected[reason].Add(1) })
 }
 
 // Event describes a connection that a Mux delivered or closed, or an Accept
@@ -179,8 +233,8 @@ type Event struct {
 	// Err is why the connection was closed, or the Accept error; it is nil
 	// for a delivered connection.
 	Err error
-	// Elapsed is the time from accepting the connection to the decision, by
-	// the monotonic clock, whose ticks are coarse on some systems such as
+	// Elapsed is the time from taking the connection, as in
+	// WithSniffTimeout, to the decision, by the monotonic clock, whose ticks are coarse on some systems such as
 	// Windows.
 	Elapsed time.Duration
 	// Sniffed is the number of bytes read while matching, including a PROXY

@@ -47,7 +47,7 @@ type RouteConfig struct {
 	Fallback bool
 	// MaxConns limits the connections the route has open: delivered, or
 	// waiting for Accept, and not closed yet. Connections over the limit are
-	// closed and reported with ErrRouteBusy. Zero means no limit.
+	// closed and reported with ErrRouteFull. Zero means no limit.
 	MaxConns int
 	// Handler, when set, serves the route's connections instead of Accept:
 	// each matched connection is passed to it in the goroutine that matched

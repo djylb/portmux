@@ -39,7 +39,9 @@
 //     oldest undecided connection, rate limits per client and per listener,
 //     bans of clients whose connections keep failing, a queue limit per
 //     route, an observer of every connection, and a PROXY protocol v1/v2
-//     policy per entry and peer, all of which can change while serving.
+//     policy per entry and peer. They can change while serving, most of them
+//     can be set for one entry alone with Entry.SetOptions, and Config reads
+//     them back.
 //
 // The parsers and sets work on their own in packages that import little:
 // hostmatch matches host names, ipmatch IP addresses, tlshello parses TLS

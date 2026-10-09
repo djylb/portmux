@@ -33,9 +33,13 @@ var (
 	ErrEvicted = errors.New("portmux: evicted to make room for new connections")
 
 	// ErrRouteBusy is reported for a matched connection closed because its
-	// route already had WithMaxQueuedPerRoute connections waiting for Accept
-	// or MaxConns connections open.
+	// route already had WithMaxQueuedPerRoute connections waiting for Accept,
+	// which tells that its server does not keep up.
 	ErrRouteBusy = errors.New("portmux: route has too many connections waiting")
+
+	// ErrRouteFull is reported for a matched connection closed because its
+	// route already had RouteConfig.MaxConns connections open.
+	ErrRouteFull = errors.New("portmux: route has too many open connections")
 
 	// ErrRouteClosed is reported for a connection that a resolver sent to a
 	// route that was closed or removed.

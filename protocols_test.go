@@ -145,7 +145,7 @@ func TestDNS(t *testing.T) {
 	matchAll(t, m, []byte("GET / HTTP/1.1\r\n"), 14, NoMatch)
 }
 
-func TestParseRDPCookie(t *testing.T) {
+func TestRDPCookie(t *testing.T) {
 	request := func(cookie string) []byte {
 		x224 := "\xe0\x00\x00\x00\x00\x00" + cookie + "\x01\x00\x08\x00\x03\x00\x00\x00"
 		n := 5 + len(x224)
@@ -157,20 +157,33 @@ func TestParseRDPCookie(t *testing.T) {
 		"Cookie: msts=3640205228.15629.0000\r\n": "3640205228.15629.0000",
 	} {
 		data := request(cookie)
-		if got, res := ParseRDPCookie(data); res != Match || got != want {
+		if got, res := rdpCookie(data); res != Match || got != want {
 			t.Errorf("%q: %q, %v", cookie, got, res)
 		}
-		if _, res := ParseRDPCookie(data[:len(data)-1]); res != NeedMore {
+		if _, res := rdpCookie(data[:len(data)-1]); res != NeedMore {
 			t.Errorf("%q cut short: %v", cookie, res)
 		}
 	}
-	if _, res := ParseRDPCookie(request("")); res != NoMatch {
+	if _, res := rdpCookie(request("")); res != NoMatch {
 		t.Errorf("no cookie: %v", res)
 	}
-	if _, res := ParseRDPCookie(request("Cookie: mstshash=x")); res != NoMatch {
+	if _, res := rdpCookie(request("Cookie: mstshash=x")); res != NoMatch {
 		t.Errorf("unterminated cookie: %v", res)
 	}
-	if _, res := ParseRDPCookie([]byte("GET")); res != NoMatch {
+	if _, res := rdpCookie([]byte("GET")); res != NoMatch {
 		t.Errorf("http: %v", res)
+	}
+	// Through an Input, as resolvers see it: an incomplete request that ends
+	// has no cookie.
+	data := request("Cookie: mstshash=bob\r\n")
+	in := NewInput(nil, nil)
+	in.SetBytes(data, false)
+	if got, res := in.RDPCookie(); res != Match || got != "bob" {
+		t.Errorf("Input.RDPCookie = %q, %v", got, res)
+	}
+	in = NewInput(nil, nil)
+	in.SetBytes(data[:10], true)
+	if _, res := in.RDPCookie(); res != NoMatch {
+		t.Errorf("final partial request: %v", res)
 	}
 }

@@ -31,6 +31,7 @@ type Conn struct {
 	mux     *Mux      // counts the connection while open, with ln
 	ln      *listener // the listener it came from, or nil
 	entry   string
+	stripe  uint8 // of the counters, and the shard of the pending set
 	mu      sync.Mutex
 	drained atomic.Bool
 	open    atomic.Bool // counted as open by its route, listener and Mux
@@ -119,7 +120,7 @@ func (c *Conn) Close() error {
 func (c *Conn) closeOpen() {
 	if c.open.CompareAndSwap(true, false) {
 		c.route.open.Add(-1)
-		c.mux.count(c.ln, func(n *counters) { n.open.Add(-1) })
+		c.mux.count(c.ln, c.stripe, func(n *counters) { n.open.Add(-1) })
 	}
 }
 

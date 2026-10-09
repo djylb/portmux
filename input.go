@@ -171,3 +171,16 @@ func (in *Input) HTTP2Request() (*httphead.Request, Result) {
 	}
 	return in.req2, Match
 }
+
+// RDPCookie returns the cookie of a Remote Desktop connection request, the
+// routing token that load balancers route by, for example in a resolver: the
+// user name of "Cookie: mstshash=name" or the token of "Cookie: msts=token".
+// It returns NoMatch for input that is not a connection request or has no
+// cookie, and NeedMore while the request is incomplete.
+func (in *Input) RDPCookie() (string, Result) {
+	cookie, res := rdpCookie(in.data)
+	if res == NeedMore && in.final {
+		return "", NoMatch
+	}
+	return cookie, res
+}

@@ -257,12 +257,7 @@ func matchDNS(b []byte) Result {
 	return matchIf(n >= 17 && flags&0xf840 == 0 && flags&0x000f == 0 && qd == 1 && an == 0 && ns == 0)
 }
 
-// ParseRDPCookie returns the cookie of a Remote Desktop connection request,
-// the routing token that load balancers route by: the user name of
-// "Cookie: mstshash=name" or the token of "Cookie: msts=token". It returns
-// NoMatch for data that is not a connection request or has no cookie, and
-// NeedMore while the request is incomplete.
-func ParseRDPCookie(data []byte) (string, Result) {
+func rdpCookie(data []byte) (string, Result) {
 	if res := matchRDP(data); res != Match {
 		return "", res
 	}

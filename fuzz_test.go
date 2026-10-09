@@ -29,7 +29,7 @@ func FuzzProtocolMatchers(f *testing.F) {
 	matchers := []Matcher{PostgreSQL(), MQTT(), RDP(), OpenVPN(), SOCKS4(), SOCKS5(), SSH(), HTTP2Preface(), XMPP(), DNS()}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		checkFinal(t, data, func(b []byte) Result {
-			_, res := ParseRDPCookie(b)
+			_, res := rdpCookie(b)
 			return res
 		})
 		for _, m := range matchers {

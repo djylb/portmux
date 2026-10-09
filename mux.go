@@ -27,11 +27,13 @@ type Mux struct {
 
 	undelivered pendingSet
 	seq         atomic.Uint64 // orders routes added with equal priority
+	accepts     atomic.Uint64 // numbers the connections from Serve
 	slots       *slotLimit
 	perIP       pendingLimit
 	rate        atomic.Pointer[rateLimit]
+	entries     atomic.Pointer[map[string]*entryConfig] // entries with options of their own
 	bans        *banList
-	total       counters
+	total       stripedCounters
 
 	// mu guards listeners, orders changes of the routes and options, which
 	// are read without it.
@@ -41,8 +43,8 @@ type Mux struct {
 
 // listener is the state of a listener being served.
 type listener struct {
-	entry string
-	counters
+	entry  string
+	counts stripedCounters
 	// The token bucket of WithRateLimitPerListener, used by Serve alone.
 	tokens float64
 	last   time.Time
@@ -103,8 +105,15 @@ func (m *Mux) SetOptions(opts ...Option) {
 		}
 		m.rate.Store(l)
 	}
+	m.rebuildEntriesLocked()
 	// A higher pending limit lets a waiting Serve go on.
 	m.slots.signal()
+}
+
+// Config returns the settings of the Mux, as its options set them; see
+// Entry.Config for those of an entry with options of its own.
+func (m *Mux) Config() Config {
+	return m.opts.Load().config()
 }
 
 // Match adds an unnamed route with priority 0 for the matchers and returns
@@ -139,34 +148,6 @@ func (m *Mux) Route(name string) *Route {
 func (m *Mux) Routes() []*Route {
 	return slices.Clone(m.table.Load().order)
 }
-
-// Entry is a named group of the listeners a Mux serves, such as the public
-// HTTPS ports or the ports behind a load balancer. Routes can be limited to
-// entries with RouteConfig.Entries, so that the listeners and the services
-// behind them are configured apart: a service picks the entries it is offered
-// on. Matchers and resolvers see the entry of each connection, whatever the
-// addresses in a PROXY protocol header say.
-//
-// Entries need no setup: Mux.Entry returns a handle for any name, and the
-// empty name is the entry of Mux.Serve and Mux.ServeConn.
-type Entry struct {
-	m    *Mux
-	name string
-}
-
-// Entry returns the handle of the entry with the given name.
-func (m *Mux) Entry(name string) *Entry {
-	return &Entry{m: m, name: name}
-}
-
-// Name returns the entry's name.
-func (e *Entry) Name() string { return e.name }
-
-// Serve serves ln as a listener of the entry; see Mux.Serve.
-func (e *Entry) Serve(ln net.Listener) error { return e.m.serve(e.name, ln) }
-
-// ServeConn routes c as a connection of the entry; see Mux.ServeConn.
-func (e *Entry) ServeConn(c net.Conn) error { return e.m.serveOne(e.name, c) }
 
 // Serve accepts connections from ln until ln fails or the Mux is shut down,
 // and closes ln when it returns. Serve may run for several listeners at once;
@@ -213,14 +194,17 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 			continue
 		}
 		delay = 0
+		// Numbered in accept order, which the clock may not tell apart.
+		seq := m.accepts.Add(1)
+		stripe := uint8(seq % counterStripes)
 		// A connection counts as accepted once it is served or rejected, so
 		// that one waiting for a pending slot is not counted yet.
 		a, err := m.admit(c, l)
 		if err != nil {
 			ev := Event{Entry: entry, Remote: c.RemoteAddr(), Local: c.LocalAddr(), Err: err}
+			m.count(l, stripe, func(c *counters) { c.accepted.Add(1) })
+			m.reject(l, stripe, err)
 			_ = c.Close()
-			m.count(l, func(c *counters) { c.accepted.Add(1) })
-			m.reject(l, err)
 			m.observe(ev)
 			continue
 		}
@@ -231,8 +215,10 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 			}
 			return net.ErrClosed
 		}
-		m.count(l, func(c *counters) { c.accepted.Add(1) })
-		go m.serveAccepted(c, a, l)
+		m.count(l, stripe, func(c *counters) { c.accepted.Add(1) })
+		// The sniff timeout runs from here, so that the wait for a slot does
+		// not use it up.
+		go m.serveAccepted(c, a, l, arrival{start: time.Now(), seq: seq, stripe: stripe})
 	}
 }
 
@@ -245,11 +231,10 @@ type admission struct {
 // admit applies the listener's rate and the per-client rules to a connection
 // accepted by Serve.
 func (m *Mux) admit(c net.Conn, l *listener) (admission, error) {
-	o := m.opts.Load()
+	o, rate := m.settings(l.entry)
 	if o.listenerRate > 0 && !l.allow(o.listenerRate, o.listenerBurst, time.Now()) {
 		return admission{}, ErrRateLimited
 	}
-	rate := m.rate.Load()
 	if o.maxPendingPerIP <= 0 && rate == nil && o.banFailures <= 0 && m.bans.size.Load() == 0 {
 		return admission{}, nil
 	}
@@ -274,14 +259,14 @@ func (m *Mux) admit(c net.Conn, l *listener) (admission, error) {
 
 // serveAccepted serves a connection from Serve in its own goroutine, which
 // then runs the handler of its route, if any.
-func (m *Mux) serveAccepted(c net.Conn, a admission, l *listener) {
-	handler, conn, err := m.serveConn(c, l, l.entry)
+func (m *Mux) serveAccepted(c net.Conn, a admission, l *listener, at arrival) {
+	handler, conn, err := m.serveConn(c, l, l.entry, at)
 	if a.counted {
 		m.perIP.release(a.client)
 	}
 	m.slots.release()
-	if o := m.opts.Load(); err != nil && o.banFailures > 0 && a.client.IsValid() && banWorthy(err) {
-		m.bans.fail(a.client, m.bans.now(), o.banFailures, o.banWindow, o.banTime)
+	if o, _ := m.settings(l.entry); err != nil && o.banFailures > 0 && a.client.IsValid() && banWorthy(err) {
+		m.bans.fail(m.banKey(l.entry, a.client), m.bans.now(), o.banFailures, o.banWindow, o.banTime)
 	}
 	if handler != nil {
 		handler(conn)
@@ -305,8 +290,9 @@ func (m *Mux) serveOne(entry string, c net.Conn) error {
 		_ = c.Close()
 		return net.ErrClosed
 	}
-	m.total.accepted.Add(1)
-	handler, conn, err := m.serveConn(c, nil, entry)
+	at := arrival{start: time.Now(), stripe: newStripe()}
+	m.total.at(at.stripe).accepted.Add(1)
+	handler, conn, err := m.serveConn(c, nil, entry, at)
 	if handler != nil {
 		handler(conn)
 	}
@@ -324,7 +310,7 @@ func (m *Mux) Shutdown(ctx context.Context) error {
 	delay := time.Millisecond
 	t := time.NewTimer(delay)
 	defer t.Stop()
-	for m.total.pending.Load() > 0 {
+	for m.total.pending() > 0 {
 		select {
 		case <-ctx.Done():
 			_ = m.Close()

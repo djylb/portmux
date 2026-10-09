@@ -3,6 +3,7 @@ package portmux
 import (
 	"net"
 	"sync/atomic"
+	"time"
 )
 
 // Peek reads the first bytes of c until m matches or rules the connection
@@ -26,7 +27,7 @@ func Peek(c net.Conn, m Matcher, opts ...Option) (*Conn, error) {
 	}
 	o := newOptions(opts)
 	conn := &Conn{conn: c}
-	s := newSniffer(conn, &o)
+	s := newSniffer(conn, &o, time.Now())
 	defer s.release()
 	err := s.readProxyHeader(o.proxyPolicy)
 	if err == nil {

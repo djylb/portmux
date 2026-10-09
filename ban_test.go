@@ -70,29 +70,64 @@ func TestBanListBounds(t *testing.T) {
 	l := newBanList()
 	now := time.Duration(0)
 	a := netip.MustParseAddr("192.0.2.1")
-	l.fail(a, now, 3, time.Second, time.Minute)
-	l.fail(a, now+2*time.Second, 3, time.Second, time.Minute) // a new window
-	l.fail(a, now+2*time.Second, 3, time.Second, time.Minute)
+	l.fail(banKey{client: a}, now, 3, time.Second, time.Minute)
+	l.fail(banKey{client: a}, now+2*time.Second, 3, time.Second, time.Minute) // a new window
+	l.fail(banKey{client: a}, now+2*time.Second, 3, time.Second, time.Minute)
 	if l.banned(a, now+2*time.Second) {
 		t.Fatal("banned with failures in two windows")
 	}
-	l.fail(a, now+2*time.Second, 3, time.Second, time.Minute)
+	l.fail(banKey{client: a}, now+2*time.Second, 3, time.Second, time.Minute)
 	if !l.banned(a, now+2*time.Second) || l.banned(a, now+3*time.Minute) {
 		t.Fatal("ban period")
 	}
 	// Expired clients are swept, and the list stops growing when full.
 	for i := range maxBanClients + 100 {
 		ip := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
-		l.fail(ip, 10*time.Minute, 5, time.Second, time.Minute)
+		l.fail(banKey{client: ip}, 10*time.Minute, 5, time.Second, time.Minute)
 	}
 	if n := l.size.Load(); n > maxBanClients {
 		t.Fatalf("size %d", n)
 	}
 	for i := range rateSweepEvery * banShards {
 		ip := netip.AddrFrom4([4]byte{172, 16, byte(i >> 8), byte(i)})
-		l.fail(ip, time.Hour, 5, time.Second, time.Minute)
+		l.fail(banKey{client: ip}, time.Hour, 5, time.Second, time.Minute)
 	}
 	if n := l.size.Load(); n > maxBanClients/2 {
 		t.Fatalf("size %d after sweeping", n)
+	}
+}
+
+// TestBanListScopes counts the failures of an entry with its own rule apart
+// from the Mux's, each with its own window, and bans the client everywhere.
+func TestBanListScopes(t *testing.T) {
+	l := newBanList()
+	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
+	mux, own := banKey{client: a}, banKey{client: a, entry: "fast", own: true}
+	// Two failures toward the Mux's rule of three in ten minutes.
+	l.fail(mux, 0, 3, 10*time.Minute, time.Hour)
+	l.fail(mux, time.Second, 3, 10*time.Minute, time.Hour)
+	// Failures toward the entry's rule of three in a second, each in a window
+	// of its own, neither ban nor reset the Mux's count.
+	for i := range 4 {
+		l.fail(own, time.Duration(2+2*i)*time.Second, 3, time.Second, time.Hour)
+	}
+	if l.banned(a, 10*time.Second) {
+		t.Fatal("banned by failures in separate windows")
+	}
+	// Sweeps after failures with a short window keep the Mux's count.
+	for i := range rateSweepEvery * banShards {
+		ip := netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)})
+		l.fail(banKey{client: ip, entry: "fast", own: true}, time.Minute, 3, time.Second, time.Hour)
+	}
+	l.fail(mux, 2*time.Minute, 3, 10*time.Minute, time.Hour)
+	if !l.banned(a, 2*time.Minute) {
+		t.Fatal("not banned by the Mux's rule")
+	}
+	// The entry's rule bans the client as well.
+	for range 3 {
+		l.fail(banKey{client: b, entry: "fast", own: true}, time.Hour, 3, time.Second, time.Minute)
+	}
+	if !l.banned(b, time.Hour) || len(l.list(time.Hour)) != 2 {
+		t.Fatalf("bans %+v", l.list(time.Hour))
 	}
 }
