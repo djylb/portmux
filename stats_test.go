@@ -64,7 +64,9 @@ func TestObserver(t *testing.T) {
 	_, _ = c.Write([]byte("GET / HTTP/1.1\r\nHost: a\r\n\r\n"))
 	accept(t, web)
 	ev := <-events
-	if ev.Route != web || ev.Err != nil || ev.Sniffed != 27 || ev.Elapsed <= 0 || ev.Remote.String() != c.LocalAddr().String() {
+	// The monotonic clock of Windows ticks too coarsely to tell a loopback
+	// decision from none, so Elapsed may be zero.
+	if ev.Route != web || ev.Err != nil || ev.Sniffed != 27 || ev.Elapsed < 0 || ev.Remote.String() != c.LocalAddr().String() {
 		t.Fatalf("delivered event %+v", ev)
 	}
 	c = dial(t, m)

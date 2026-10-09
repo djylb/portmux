@@ -179,7 +179,9 @@ type Event struct {
 	// Err is why the connection was closed, or the Accept error; it is nil
 	// for a delivered connection.
 	Err error
-	// Elapsed is the time from accepting the connection to the decision.
+	// Elapsed is the time from accepting the connection to the decision, by
+	// the monotonic clock, whose ticks are coarse on some systems such as
+	// Windows.
 	Elapsed time.Duration
 	// Sniffed is the number of bytes read while matching, including a PROXY
 	// header.
