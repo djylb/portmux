@@ -257,10 +257,10 @@ func (m *Mux) admit(c net.Conn, l *listener) (admission, error) {
 	return a, nil
 }
 
-// serveAccepted serves a connection from Serve in its own goroutine, which
-// then runs the handler of its route, if any.
-func (m *Mux) serveAccepted(c net.Conn, a admission, l *listener, at arrival) {
-	handler, conn, err := m.serveConn(c, l, l.entry, at)
+// releaseAdmitted frees the pending slot and the pending count per client of
+// a connection accepted by Serve, and counts err, its failure if any, toward
+// banning the client.
+func (m *Mux) releaseAdmitted(l *listener, a admission, err error) {
 	if a.counted {
 		m.perIP.release(a.client)
 	}
@@ -268,6 +268,12 @@ func (m *Mux) serveAccepted(c net.Conn, a admission, l *listener, at arrival) {
 	if o, _ := m.settings(l.entry); err != nil && o.banFailures > 0 && a.client.IsValid() && banWorthy(err) {
 		m.bans.fail(m.banKey(l.entry, a.client), m.bans.now(), o.banFailures, o.banWindow, o.banTime)
 	}
+}
+
+// serveAccepted serves a connection from Serve in its own goroutine, which
+// then runs the handler of its route, if any.
+func (m *Mux) serveAccepted(c net.Conn, a admission, l *listener, at arrival) {
+	handler, conn, _ := m.serveConn(c, l, a, l.entry, at)
 	if handler != nil {
 		handler(conn)
 	}
@@ -292,7 +298,7 @@ func (m *Mux) serveOne(entry string, c net.Conn) error {
 	}
 	at := arrival{start: time.Now(), stripe: newStripe()}
 	m.total.at(at.stripe).accepted.Add(1)
-	handler, conn, err := m.serveConn(c, nil, entry, at)
+	handler, conn, err := m.serveConn(c, nil, admission{}, entry, at)
 	if handler != nil {
 		handler(conn)
 	}

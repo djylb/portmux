@@ -14,9 +14,9 @@ func TestSetOptionsWhileServing(t *testing.T) {
 	serve(t, m)
 
 	_, _ = dial(t, m).Write([]byte("A"))
-	waitPending(t, m.Mux, 1)
-	// The slot is taken by a matched connection, so the next one waits
-	// until the limit is raised.
+	// The slot is taken by a matched connection, which cannot be evicted, so
+	// the next one waits until the limit is raised.
+	waitUntil(t, "the first connection is matched", func() bool { return stuck.Matched() == 1 })
 	_, _ = dial(t, m).Write([]byte("A"))
 	time.Sleep(50 * time.Millisecond)
 	if st := m.Stats(); st.Accepted != 1 {

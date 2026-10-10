@@ -534,9 +534,9 @@ func TestMaxPendingWaitsWhenNothingIsEvictable(t *testing.T) {
 	serve(t, m)
 
 	_, _ = dial(t, m).Write([]byte("A"))
-	waitPending(t, m.Mux, 1)
 	// The only pending connection is matched, so it is not evicted: the next
 	// one waits for the slot, which frees when the first one times out.
+	waitUntil(t, "the first connection is matched", func() bool { return stuck.Matched() == 1 })
 	start := time.Now()
 	c := dial(t, m)
 	_, _ = c.Write([]byte("AB"))

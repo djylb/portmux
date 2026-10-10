@@ -254,12 +254,12 @@ func TestRejectRouteClosesBeforeReading(t *testing.T) {
 func TestBusyRouteDoesNotBlockOthers(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option(), WithMaxQueuedPerRoute(1))
-	m.Match(Prefix("A")) // its server never accepts
+	busy := m.Match(Prefix("A")) // its server never accepts
 	other := m.Match(Prefix("B"))
 	serve(t, m)
 
 	_, _ = dial(t, m).Write([]byte("A"))
-	waitPending(t, m.Mux, 1)
+	waitUntil(t, "a connection waits for the busy route", func() bool { return busy.Info().Queued == 1 })
 	c := dial(t, m)
 	_, _ = c.Write([]byte("A"))
 	expectClosed(t, c)

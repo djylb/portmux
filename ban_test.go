@@ -66,6 +66,28 @@ func TestBanPerIP(t *testing.T) {
 	expectFailure("GET", ErrBanned)
 }
 
+// TestBanAppliesAtOnce checks that a failure that bans the client counts
+// before the client sees its connection closed, so that the client cannot
+// slip in by connecting again at once.
+func TestBanAppliesAtOnce(t *testing.T) {
+	m := startMux(t, WithBanPerIP(1, time.Minute, time.Minute))
+	m.Match(Prefix("GET")) // its server never accepts
+	serve(t, m)
+
+	for i := range uint64(20) {
+		c := dial(t, m)
+		_, _ = c.Write([]byte("XX"))
+		expectClosed(t, c)
+		c = dial(t, m)
+		_, _ = c.Write([]byte("GET"))
+		expectClosed(t, c)
+		if st := m.Stats(); st.Banned != i+1 || st.Delivered != 0 || st.Pending != 0 {
+			t.Fatalf("round %d: stats %+v", i, st)
+		}
+		m.Unban(netip.MustParseAddr("127.0.0.1"))
+	}
+}
+
 func TestBanListBounds(t *testing.T) {
 	l := newBanList()
 	now := time.Duration(0)

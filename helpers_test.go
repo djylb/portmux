@@ -181,6 +181,16 @@ func (l *errorLog) wait(t *testing.T) error {
 }
 
 // expectClosed checks that the peer closes c without sending data.
+// waitUntil waits until cond holds, failing the test after a timeout.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !cond(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting until %s", what)
+		}
+	}
+}
+
 func expectClosed(t *testing.T, c net.Conn) {
 	t.Helper()
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))

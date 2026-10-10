@@ -81,11 +81,11 @@ type arrival struct {
 }
 
 // serveConn matches c and delivers it. Connections from Serve come with their
-// listener, which counts them; they are reported to the error handler and may
-// be evicted while undecided. For a route with a handler, serveConn returns
-// the handler instead of calling it, so that the caller first releases what
-// counts the connection as pending.
-func (m *Mux) serveConn(c net.Conn, l *listener, entry string, at arrival) (handler func(*Conn), conn *Conn, err error) {
+// listener, which counts them, and their admission; they are reported to the
+// error handler and may be evicted while undecided. For a route with a
+// handler, serveConn returns the handler instead of calling it, so that the
+// connection no longer counts as pending while the handler runs.
+func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at arrival) (handler func(*Conn), conn *Conn, err error) {
 	stripe := at.stripe
 	conn = &Conn{conn: c, entry: entry, stripe: stripe}
 	m.count(l, stripe, func(c *counters) { c.pending.Add(1) })
@@ -124,6 +124,13 @@ func (m *Mux) serveConn(c net.Conn, l *listener, entry string, at arrival) (hand
 			}
 			c.pending.Add(-1)
 		})
+		// The pending slot and the client's pending count are freed, and a
+		// failure counted toward a ban, before the client sees the
+		// connection closed, so that a client that connects again at once
+		// is held to the limits and bans that this connection leaves.
+		if l != nil {
+			m.releaseAdmitted(l, a, err)
+		}
 		if delivered {
 			ev.Route = conn.route
 		} else {
