@@ -40,8 +40,10 @@ type Hello struct {
 	// Version is the legacy_version field. TLS 1.3 clients send 0x0303 here
 	// and list their real versions in SupportedVersions.
 	Version uint16
-	// ECH reports an Encrypted Client Hello extension. ServerName is then the
-	// public name of the outer hello, not the name the client wants.
+	// ECH reports an encrypted_client_hello extension. Browsers send one
+	// with random content, a GREASE ECH, when they have no ECH configuration
+	// for the server; only with a real one is ServerName the public name of
+	// the outer hello rather than the name the client wants.
 	ECH      bool
 	prepared bool // whether name is set
 }
@@ -71,7 +73,8 @@ func (h *Hello) MaxVersion() uint16 {
 
 // IsGREASE reports whether v is one of the reserved values that clients send
 // to keep servers tolerant, 0x0a0a, 0x1a1a and so on (RFC 8701), in the
-// lists of versions, cipher suites, extensions and groups.
+// lists of versions, cipher suites, extensions, groups and signature
+// algorithms.
 func IsGREASE(v uint16) bool {
 	return v&0x0f0f == 0x0a0a && v>>8 == v&0xff
 }

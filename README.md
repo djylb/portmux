@@ -316,7 +316,8 @@ func resolveSites(sites *hostmatch.Map[[2]*portmux.Route]) portmux.ResolveFunc {
 - `hostmatch.Map` looks a name up by the most specific pattern: the exact name,
   then the pattern with the most literal characters, then `*`. `LookupFunc`
   and `Matches` fall back to wider patterns for policies of your own. Lookups
-  take no lock and allocate nothing.
+  take no lock, and allocate nothing for lowercase names and those that
+  `Input` prepared.
 - `ResolveHosts` and `ResolveDomain` route TLS, HTTP/1.x and h2c by the name
   the client asks for. Paths are for the HTTP server behind the route.
 
@@ -431,7 +432,8 @@ func tighten(m *portmux.Mux) portmux.Config {
   `Entry.Config` the settings of an entry.
 - Clients are IPv4 addresses or IPv6 /64 networks of the TCP peer. Failed
   connections that count toward bans matched no route, timed out, hit a reject
-  route or sent an invalid PROXY header; `Mux.Ban` and `Unban` act by hand.
+  route or sent an invalid PROXY header or none where one is required;
+  `Mux.Ban` and `Unban` act by hand.
 - Rejected connections are reported with `ErrNoMatch`, `ErrRefused`,
   `ErrSniffTimeout`, `ErrDispatchTimeout`, `ErrEvicted`, `ErrPendingLimit`,
   `ErrRateLimited`, `ErrBanned`, `ErrRouteBusy`, `ErrRouteFull`,

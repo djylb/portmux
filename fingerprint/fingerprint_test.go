@@ -81,3 +81,23 @@ func TestJA3(t *testing.T) {
 		t.Fatal("JA3 filter")
 	}
 }
+
+// BenchmarkMatchJA4 runs a filter on a hello whose fingerprint it has and on
+// one whose first part already rules it out, as a reject list sees most.
+func BenchmarkMatchJA4(b *testing.B) {
+	h, err := tlshello.Parse(testutil.JA4Example())
+	if err != nil {
+		b.Fatal(err)
+	}
+	for name, f := range map[string]Filter{
+		"hit":  MatchJA4("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+		"miss": MatchJA4("t13d1715h2_5b57614c22b0_3d5424432f57"),
+	} {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				f.Match(h)
+			}
+		})
+	}
+}

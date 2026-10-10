@@ -167,10 +167,11 @@ func WithRateLimitPerListener(perSecond float64, burst int) EntryOption {
 
 // WithBanPerIP bans clients whose connections keep failing, as scanners'
 // do: once failures connections from Serve of one client matched no route,
-// timed out while sniffing, were refused by a reject route or sent an invalid
-// PROXY header within window, the client's connections are refused for d,
-// before any byte is read, and reported with ErrBanned. Connections that are
-// closed without sending anything, as health checks are, do not count.
+// timed out while sniffing, were refused by a reject route, or sent an invalid
+// PROXY header or none where one is required within window, the client's
+// connections are refused for d, before any byte is read, and reported with
+// ErrBanned. Connections that are closed without sending anything, as health
+// checks are, do not count.
 // Clients are counted as in WithMaxPendingPerIP; Mux.Ban and Mux.Bans manage
 // bans directly. A non-positive failures, the default, disables automatic
 // bans.

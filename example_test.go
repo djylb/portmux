@@ -132,8 +132,8 @@ func ExampleMux_Batch() {
 	m := portmux.New()
 	defer func() { _ = m.Close() }()
 
-	// A fallback with a low priority, then named routes for the admin site.
-	_, _ = m.Add(portmux.RouteConfig{Name: "fallback", Priority: -100, Matchers: []portmux.Matcher{portmux.Any()}})
+	// A fallback route, then named routes for the admin site.
+	_, _ = m.Add(portmux.RouteConfig{Name: "fallback", Fallback: true})
 	_, _ = m.Add(portmux.RouteConfig{Name: "admin-http", Matchers: []portmux.Matcher{portmux.HTTP1(portmux.Host("admin.example.com"))}})
 	_, _ = m.Add(portmux.RouteConfig{Name: "admin-tls", Matchers: []portmux.Matcher{portmux.TLS(portmux.SNI("admin.example.com"))}})
 
@@ -158,7 +158,7 @@ func ExampleMux_Batch() {
 	}
 	// Output:
 	// admin-http 0
-	// fallback -100
+	// fallback 0
 }
 
 // Terminate TLS on one route and match the protocol inside it with a second
@@ -212,7 +212,8 @@ func ExamplePeek() {
 				_ = conn.Close()
 				return
 			}
-			config, ok := configs[conn.ClientHello().ServerName]
+			// The name lowercased, as the configs are keyed.
+			config, ok := configs[conn.ClientHello().Name().String()]
 			if !ok {
 				_ = conn.Close()
 				return

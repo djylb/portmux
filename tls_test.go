@@ -48,3 +48,26 @@ func TestTLSMatcher(t *testing.T) {
 	check(TLS(), data[:10], false, NeedMore)
 	check(TLS(), data[:10], true, NoMatch)
 }
+
+// TestMinTLSVersionNegotiation judges the version as servers negotiate it.
+func TestMinTLSVersionNegotiation(t *testing.T) {
+	tests := []struct {
+		name  string
+		hello tlshello.Hello
+		want  uint16 // the highest version accepted
+	}{
+		{"tls 1.3", tlshello.Hello{Version: tls.VersionTLS12, SupportedVersions: []uint16{0x2a2a, tls.VersionTLS13, tls.VersionTLS12}}, tls.VersionTLS13},
+		{"tls 1.2", tlshello.Hello{Version: tls.VersionTLS12}, tls.VersionTLS12},
+		{"tls 1.0", tlshello.Hello{Version: tls.VersionTLS10}, tls.VersionTLS10},
+		{"legacy 1.3 alone", tlshello.Hello{Version: tls.VersionTLS13}, tls.VersionTLS12},
+		{"unknown versions", tlshello.Hello{Version: tls.VersionTLS12, SupportedVersions: []uint16{0x0306, 0x0305, tls.VersionTLS11}}, tls.VersionTLS11},
+		{"only grease", tlshello.Hello{Version: tls.VersionTLS12, SupportedVersions: []uint16{0x3a3a}}, 0},
+	}
+	for _, tt := range tests {
+		for _, v := range []uint16{tls.VersionTLS10, tls.VersionTLS11, tls.VersionTLS12, tls.VersionTLS13} {
+			if got := MinTLSVersion(v).Match(&tt.hello); got != (v <= tt.want) {
+				t.Errorf("%s: MinTLSVersion(%#x) = %v", tt.name, v, got)
+			}
+		}
+	}
+}

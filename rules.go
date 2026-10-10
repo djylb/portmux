@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"regexp"
+	"regexp/syntax"
 	"strconv"
 	"strings"
 	"time"
@@ -37,11 +38,32 @@ type ParseError struct {
 	Text   string
 	Offset int // byte offset of the problem in Text
 	Msg    string
+	// Err is the error of a function of Names that failed, or nil.
+	Err error
 }
 
+// maxErrorContext bounds the bytes of the text that a ParseError quotes on
+// each side of its offset.
+const maxErrorContext = 40
+
 func (e *ParseError) Error() string {
-	return fmt.Sprintf("portmux: matcher %q: %s at offset %d", e.Text, e.Msg, e.Offset)
+	text := e.Text
+	if len(text) > 2*maxErrorContext {
+		lo := min(max(e.Offset-maxErrorContext, 0), len(text))
+		hi := min(lo+2*maxErrorContext, len(text))
+		text = text[lo:hi]
+		if lo > 0 {
+			text = "..." + text
+		}
+		if hi < len(e.Text) {
+			text += "..."
+		}
+	}
+	return fmt.Sprintf("portmux: matcher %q: %s at offset %d", text, e.Msg, e.Offset)
 }
+
+// Unwrap returns the error of a function of Names, or nil.
+func (e *ParseError) Unwrap() error { return e.Err }
 
 // ParseMatcher parses a matcher from the text that matchers describe
 // themselves with, as in
@@ -53,6 +75,10 @@ func (e *ParseError) Error() string {
 // equal matcher. Strings are Go string literals; prefixes, ports, durations
 // and versions are written bare. names, which may be nil, supplies the
 // matchers and filters of your own.
+//
+// Calls nest at most 100 deep, and regular expressions are limited to about
+// 1000 instructions, so that a rule cannot exhaust the stack or make each
+// connection cost much; build larger ones in code.
 func ParseMatcher(text string, names *Names) (Matcher, error) {
 	p := &parser{text: text, names: names}
 	if names == nil {
@@ -77,8 +103,19 @@ type node struct {
 type parser struct {
 	text  string
 	pos   int
+	depth int // calls being parsed
 	names *Names
 }
+
+const (
+	// maxParseDepth bounds the nesting of calls, which the parser and the
+	// descriptions of the matchers follow recursively.
+	maxParseDepth = 100
+	// maxRuleRegexpSize bounds the size of a regular expression in rule
+	// text, about its number of instructions, which its cost per byte
+	// follows.
+	maxRuleRegexpSize = 1000
+)
 
 func (p *parser) fail(pos int, format string, args ...any) error {
 	return &ParseError{Text: p.text, Offset: pos, Msg: fmt.Sprintf(format, args...)}
@@ -127,6 +164,10 @@ func (p *parser) node() (*node, error) {
 		return n, nil
 	}
 	n.call = true
+	if p.depth++; p.depth > maxParseDepth {
+		return nil, p.fail(start, "calls nested deeper than %d", maxParseDepth)
+	}
+	defer func() { p.depth-- }()
 	p.pos++
 	for {
 		if p.skipSpace(); p.pos < len(p.text) && p.text[p.pos] == ')' && len(n.args) == 0 {
@@ -166,8 +207,11 @@ func (p *parser) matcher(n *node) (Matcher, error) {
 	}
 	if !n.call {
 		m, ok := p.names.Matchers[n.text]
-		if !ok {
+		switch {
+		case !ok:
 			return nil, p.fail(n.pos, "unknown matcher %s", n.text)
+		case m == nil:
+			return nil, p.fail(n.pos, "matcher %s is nil", n.text)
 		}
 		return Named(n.text, m), nil
 	}
@@ -223,7 +267,7 @@ func (p *parser) matcher(n *node) (Matcher, error) {
 			return nil, err
 		}
 		d, err := time.ParseDuration(n.args[0].text)
-		if err != nil || n.args[0].call {
+		if err != nil || n.args[0].call || n.args[0].str {
 			return nil, p.fail(n.args[0].pos, "invalid duration")
 		}
 		return Silent(d), nil
@@ -281,8 +325,13 @@ func custom[T any](p *parser, n *node, funcs map[string]func(args ...string) (T,
 		return zero, err
 	}
 	v, err := build(args...)
-	if err != nil {
-		return zero, p.fail(n.pos, "%s: %v", n.text, err)
+	switch {
+	case err != nil:
+		e := p.fail(n.pos, "%s: %v", n.text, err).(*ParseError)
+		e.Err = err
+		return zero, e
+	case any(v) == nil:
+		return zero, p.fail(n.pos, "%s returned no %s", n.text, kind)
 	}
 	return v, nil
 }
@@ -290,8 +339,11 @@ func custom[T any](p *parser, n *node, funcs map[string]func(args ...string) (T,
 func (p *parser) httpFilter(n *node) (HTTPFilter, error) {
 	if !n.call && !n.str {
 		f, ok := p.names.HTTPFilters[n.text]
-		if !ok {
+		switch {
+		case !ok:
 			return nil, p.fail(n.pos, "unknown HTTP filter %s", n.text)
+		case f == nil:
+			return nil, p.fail(n.pos, "HTTP filter %s is nil", n.text)
 		}
 		return namedFilter[*httphead.Request]{name: n.text, f: f}, nil
 	}
@@ -357,8 +409,11 @@ func (p *parser) httpFilter(n *node) (HTTPFilter, error) {
 func (p *parser) tlsFilter(n *node) (TLSFilter, error) {
 	if !n.call && !n.str {
 		f, ok := p.names.TLSFilters[n.text]
-		if !ok {
+		switch {
+		case !ok:
 			return nil, p.fail(n.pos, "unknown TLS filter %s", n.text)
+		case f == nil:
+			return nil, p.fail(n.pos, "TLS filter %s is nil", n.text)
 		}
 		return namedFilter[*tlshello.Hello]{name: n.text, f: f}, nil
 	}
@@ -392,7 +447,7 @@ func (p *parser) tlsFilter(n *node) (TLSFilter, error) {
 			return nil, err
 		}
 		v, ok := parseVersion(n.args[0].text)
-		if !ok || n.args[0].call {
+		if !ok || n.args[0].call || n.args[0].str {
 			return nil, p.fail(n.args[0].pos, "invalid TLS version")
 		}
 		return MinTLSVersion(v), nil
@@ -452,11 +507,18 @@ func each[T any](args []*node, parse func(*node) (T, error)) ([]T, error) {
 func (p *parser) count(n *node, lo, hi int) error {
 	switch {
 	case len(n.args) < lo:
-		return p.fail(n.pos, "%s needs %d arguments", n.text, lo)
+		return p.fail(n.pos, "%s needs %s", n.text, arguments(lo))
 	case hi >= 0 && len(n.args) > hi:
-		return p.fail(n.pos, "%s takes %d arguments", n.text, hi)
+		return p.fail(n.pos, "%s takes %s", n.text, arguments(hi))
 	}
 	return nil
+}
+
+func arguments(n int) string {
+	if n == 1 {
+		return "1 argument"
+	}
+	return strconv.Itoa(n) + " arguments"
 }
 
 func (p *parser) str(n *node) (string, error) {
@@ -471,11 +533,42 @@ func (p *parser) regexp(n *node) (*regexp.Regexp, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The size is estimated on the parsed expression, before compiling it
+	// spends it.
+	parsed, err := syntax.Parse(s, syntax.Perl)
+	if err != nil {
+		return nil, p.fail(n.pos, "%v", err)
+	}
+	if regexpSize(parsed) > maxRuleRegexpSize {
+		return nil, p.fail(n.pos, "regular expression larger than %d instructions", maxRuleRegexpSize)
+	}
 	re, err := regexp.Compile(s)
 	if err != nil {
 		return nil, p.fail(n.pos, "%v", err)
 	}
 	return re, nil
+}
+
+// regexpSize estimates the instructions of re with its repetitions written
+// out, stopping just above maxRuleRegexpSize.
+func regexpSize(re *syntax.Regexp) int {
+	size := 1
+	switch re.Op {
+	case syntax.OpLiteral:
+		size = len(re.Rune)
+	case syntax.OpRepeat:
+		times := re.Max
+		if times < 0 {
+			times = re.Min + 1
+		}
+		return min(max(times, 1)*regexpSize(re.Sub[0]), maxRuleRegexpSize+1)
+	}
+	for _, sub := range re.Sub {
+		if size += regexpSize(sub); size > maxRuleRegexpSize {
+			break
+		}
+	}
+	return min(size, maxRuleRegexpSize+1)
 }
 
 func (p *parser) int(n *node, maxValue int) (int, error) {
