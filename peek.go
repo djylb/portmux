@@ -2,6 +2,7 @@ package portmux
 
 import (
 	"net"
+	"slices"
 	"sync/atomic"
 	"time"
 )
@@ -29,12 +30,29 @@ func Peek(c net.Conn, m Matcher, opts ...Option) (*Conn, error) {
 	conn := &Conn{conn: c}
 	s := newSniffer(conn, &o, time.Now())
 	defer s.release()
-	err := s.readProxyHeader(o.proxyPolicy)
+	var tables atomic.Pointer[table]
+	tables.Store(peekTable(m))
+	err := s.readProxyHeader(o.proxyPolicy, &tables)
 	if err == nil {
-		var tables atomic.Pointer[table]
-		tables.Store(newTable(routeSet{routes: map[*Route]routeState{{}: {matchers: []Matcher{m}}}}))
 		_, err = s.match(&tables, o.maxSniffBytes)
 	}
 	s.handOver(nil)
+	conn.dropEmpty()
 	return conn, err
+}
+
+// peekRoute is the route of the tables of Peek, which deliver nowhere.
+var peekRoute = new(Route)
+
+// peekTable returns a table with one rule of m, built without the
+// configuration that a Mux keeps.
+func peekTable(m Matcher) *table {
+	rs := &ruleSet{rules: []rule{{route: peekRoute, matchers: []Matcher{m}}}}
+	reportSilences(rs.rules[0].matchers, func(d time.Duration) {
+		if !slices.Contains(rs.silences, d) {
+			rs.silences = append(rs.silences, d)
+		}
+	})
+	slices.Sort(rs.silences)
+	return &table{other: rs}
 }

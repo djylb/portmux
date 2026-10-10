@@ -2,6 +2,7 @@ package portmux
 
 import (
 	"errors"
+	"math"
 	"net"
 	"net/netip"
 	"sync"
@@ -96,8 +97,7 @@ func newBanList() *banList {
 func (l *banList) now() time.Duration { return time.Since(l.epoch) }
 
 func (l *banList) shard(client netip.Addr) *banShard {
-	b := client.As16()
-	return &l.shards[(b[15]^b[13]^b[11]^b[7])%banShards]
+	return &l.shards[shardOf(client, banShards)]
 }
 
 // banned reports whether client is banned at now.
@@ -147,8 +147,16 @@ func (l *banList) fail(key banKey, now time.Duration, failures int, window, d ti
 		}
 		e = b
 	}
-	e.until = now + d
+	e.until = banEnd(now, d)
 	sh.clients[ban] = e
+}
+
+// banEnd returns now+d, or the largest time for a ban too long to add.
+func banEnd(now, d time.Duration) time.Duration {
+	if d > math.MaxInt64-now {
+		return math.MaxInt64
+	}
+	return now + d
 }
 
 // track makes room for a new record in sh and reports whether there was
@@ -167,6 +175,12 @@ func (l *banList) set(key banKey, now, d time.Duration) bool {
 	sh := l.shard(key.client)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
+	// Bans set by hand are swept here too, so that they do not pile up when
+	// no failures are counted.
+	if sh.checks++; sh.checks >= rateSweepEvery {
+		sh.checks = 0
+		l.sweep(sh, now)
+	}
 	e, ok := sh.clients[key]
 	was := ok && e.until > now
 	switch {
@@ -174,7 +188,7 @@ func (l *banList) set(key banKey, now, d time.Duration) bool {
 		if !ok {
 			l.size.Add(1)
 		}
-		sh.clients[key] = banEntry{start: now, until: now + d}
+		sh.clients[key] = banEntry{start: now, until: banEnd(now, d)}
 	case ok:
 		delete(sh.clients, key)
 		l.size.Add(-1)
@@ -193,12 +207,14 @@ func (l *banList) sweep(sh *banShard, now time.Duration) {
 	}
 }
 
-// list returns the banned clients with the end of their ban.
+// list returns the banned clients with the end of their ban, and forgets the
+// records that sweep would.
 func (l *banList) list(now time.Duration) []Ban {
 	var bans []Ban
 	for i := range l.shards {
 		sh := &l.shards[i]
 		sh.mu.Lock()
+		l.sweep(sh, now)
 		for key, e := range sh.clients {
 			if e.until > now {
 				bans = append(bans, Ban{Client: clientPrefix(key.client), Until: l.epoch.Add(e.until)})

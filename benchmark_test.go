@@ -174,7 +174,7 @@ func BenchmarkHostRoutes(b *testing.B) {
 					HTTP1(Host(fmt.Sprintf("h%d.Example.com", i)), NoneOf(PathPrefix("/internal/")), Header("X-Kind")),
 				}}
 			}
-			t := newTable(s)
+			t := newTable(s, nil)
 			data := []byte(fmt.Sprintf("GET /api HTTP/1.1\r\nHost: H%d.example.com:443\r\nUser-Agent: x\r\nX-Kind: a\r\n\r\n", n-1))
 			dead := make([]bool, n)
 			b.ReportAllocs()

@@ -3,6 +3,7 @@ package portmux
 import (
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"testing"
@@ -151,5 +152,34 @@ func TestBanListScopes(t *testing.T) {
 	}
 	if !l.banned(b, time.Hour) || len(l.list(time.Hour)) != 2 {
 		t.Fatalf("bans %+v", l.list(time.Hour))
+	}
+}
+
+// TestExpiredBansAreForgotten checks that bans set by hand are forgotten once
+// they ended, also when no failures are counted.
+func TestExpiredBansAreForgotten(t *testing.T) {
+	l := newBanList()
+	const n = 100000
+	for i := range n {
+		ip := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
+		l.set(banKey{client: ip}, time.Duration(i)*time.Millisecond, time.Second)
+	}
+	if size := l.size.Load(); size > n/4 {
+		t.Fatalf("size %d after %d bans of a second over %v", size, n, n*time.Millisecond)
+	}
+	if bans := l.list(n*time.Millisecond + time.Second); len(bans) != 0 || l.size.Load() != 0 {
+		t.Fatalf("%d bans, size %d after every ban ended", len(bans), l.size.Load())
+	}
+}
+
+// TestBanForever bans for the longest duration, which must not wrap around.
+func TestBanForever(t *testing.T) {
+	m := New(WithBanPerIP(1, time.Minute, math.MaxInt64))
+	defer func() { _ = m.Close() }()
+	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
+	m.Ban(a, math.MaxInt64)
+	m.bans.fail(banKey{client: b}, m.bans.now(), 1, time.Minute, math.MaxInt64)
+	if !m.bans.banned(a, m.bans.now()) || !m.bans.banned(b, m.bans.now()) || len(m.Bans()) != 2 {
+		t.Fatalf("bans %+v", m.Bans())
 	}
 }

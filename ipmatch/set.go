@@ -59,7 +59,8 @@ func NewSet(prefixes ...netip.Prefix) *Set {
 		}
 		merged = append(merged, r)
 	}
-	ps.list, ps.ranges = nil, slices.Clip(merged)
+	// A copy, so that the ranges before merging are not kept.
+	ps.list, ps.ranges = nil, slices.Clone(merged)
 	return ps
 }
 

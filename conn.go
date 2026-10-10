@@ -63,9 +63,20 @@ func (c *Conn) Read(p []byte) (int, error) {
 			c.mu.Unlock()
 			return n, nil
 		}
+		c.releaseLocked() // nothing to replay
 		c.mu.Unlock()
 	}
 	return c.conn.Read(p)
+}
+
+// dropEmpty returns the read buffer of a connection that has no bytes to
+// replay, so that a client that sent nothing yet holds none.
+func (c *Conn) dropEmpty() {
+	c.mu.Lock()
+	if len(c.pending) == 0 {
+		c.releaseLocked()
+	}
+	c.mu.Unlock()
 }
 
 // WriteTo writes the replayed bytes and then copies the rest of the stream to

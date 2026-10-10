@@ -40,8 +40,10 @@ type Hello struct {
 	// Version is the legacy_version field. TLS 1.3 clients send 0x0303 here
 	// and list their real versions in SupportedVersions.
 	Version uint16
-	// ECH reports an Encrypted Client Hello extension. ServerName is then the
-	// public name of the outer hello, not the name the client wants.
+	// ECH reports an encrypted_client_hello extension. Browsers send one
+	// with random content, a GREASE ECH, when they have no ECH configuration
+	// for the server; only with a real one is ServerName the public name of
+	// the outer hello rather than the name the client wants.
 	ECH      bool
 	prepared bool // whether name is set
 }
@@ -71,7 +73,8 @@ func (h *Hello) MaxVersion() uint16 {
 
 // IsGREASE reports whether v is one of the reserved values that clients send
 // to keep servers tolerant, 0x0a0a, 0x1a1a and so on (RFC 8701), in the
-// lists of versions, cipher suites, extensions and groups.
+// lists of versions, cipher suites, extensions, groups and signature
+// algorithms.
 func IsGREASE(v uint16) bool {
 	return v&0x0f0f == 0x0a0a && v>>8 == v&0xff
 }
@@ -228,6 +231,10 @@ func parseBody(body []byte) (*Hello, error) {
 	}
 	var typesBuf [32]uint16
 	types := typesBuf[:0]
+	// Duplicates are looked for in types while it fits typesBuf, and then in
+	// a set of every type, so that a hello with thousands of extensions costs
+	// time in proportion to its size.
+	var seen *[1 << 16 / 64]uint64
 	var groups, schemes, versions cursor
 	for len(exts) > 0 {
 		typ, ok := exts.u16()
@@ -235,7 +242,21 @@ func parseBody(body []byte) (*Hello, error) {
 			return nil, ErrInvalid
 		}
 		data, ok := exts.u16Prefixed()
-		if !ok || slices.Contains(types, typ) {
+		if !ok {
+			return nil, ErrInvalid
+		}
+		if seen == nil && len(types) == len(typesBuf) {
+			seen = new([1 << 16 / 64]uint64)
+			for _, t := range types {
+				seen[t/64] |= 1 << (t % 64)
+			}
+		}
+		if seen != nil {
+			if seen[typ/64]&(1<<(typ%64)) != 0 {
+				return nil, ErrInvalid
+			}
+			seen[typ/64] |= 1 << (typ % 64)
+		} else if slices.Contains(types, typ) {
 			return nil, ErrInvalid
 		}
 		types = append(types, typ)

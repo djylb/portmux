@@ -53,25 +53,43 @@ type sniFilter struct {
 func (f sniFilter) Match(h *tlshello.Hello) bool { return f.hosts.MatchName(h.Name()) }
 
 // SNIRegexp accepts ClientHellos whose server name, lowercased, matches re.
-// ClientHellos without SNI never match.
+// ClientHellos without SNI, or with a name that has bytes that no DNS name or
+// IP address has, never match.
 func SNIRegexp(re *regexp.Regexp) TLSFilter {
-	return newRegexpFilter("SNIRegexp", "", re, func(h *tlshello.Hello, yield func(string) bool) {
-		if n := h.Name(); n.Valid() && n.String() != "" {
-			yield(n.String())
-		}
+	return newRegexpFilter("SNIRegexp", re, func(h *tlshello.Hello, re *regexp.Regexp) bool {
+		n := h.Name()
+		return n.Valid() && n.String() != "" && re.MatchString(n.String())
 	})
 }
 
 // MinTLSVersion accepts ClientHellos that offer at least version v, such as
-// tls.VersionTLS12, judged by MaxVersion. It turns away clients that only
-// speak older versions.
+// tls.VersionTLS12, judged as servers negotiate: by the highest version of
+// supported_versions up to TLS 1.3 or, without that extension, by
+// legacy_version up to TLS 1.2. It turns away clients that only speak older
+// versions.
 func MinTLSVersion(v uint16) TLSFilter {
 	return minVersionFilter(v)
 }
 
 type minVersionFilter uint16
 
-func (f minVersionFilter) Match(h *tlshello.Hello) bool { return h.MaxVersion() >= uint16(f) }
+func (f minVersionFilter) Match(h *tlshello.Hello) bool { return negotiableVersion(h) >= uint16(f) }
+
+// negotiableVersion returns the highest version that a server can agree on
+// with the client (RFC 8446, Section 4.2.1), or zero for none.
+func negotiableVersion(h *tlshello.Hello) uint16 {
+	const tls12, tls13 = 0x0303, 0x0304
+	if len(h.SupportedVersions) == 0 {
+		return min(h.Version, tls12)
+	}
+	top := uint16(0)
+	for _, v := range h.SupportedVersions {
+		if v <= tls13 && v > top {
+			top = v // GREASE values are all above TLS 1.3
+		}
+	}
+	return top
+}
 
 func (f minVersionFilter) String() string { return "MinTLSVersion(" + versionName(uint16(f)) + ")" }
 

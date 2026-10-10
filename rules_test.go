@@ -3,8 +3,10 @@ package portmux
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +36,7 @@ func TestParseMatcherRoundTrip(t *testing.T) {
 			Query("v", "1", "2"), Query("debug"), WebSocket(),
 			AllOf(AnyOf(Host("b"), NoneOf(Path("/admin"))))),
 		HTTP2(Header("content-type", "application/grpc")),
+		HTTP1(HeaderRegexp("", regexp.MustCompile(`x`))), Regexp(regexp.MustCompile(`x`), math.MaxInt),
 		TLS(SNI("a", "*.b"), SNIRegexp(regexp.MustCompile(`^x`)), ALPN("h2"), MinTLSVersion(0x0303), MinTLSVersion(0x0300),
 			NoneOf(SNI("c"))),
 	}
@@ -122,6 +125,8 @@ func TestParseMatcherErrors(t *testing.T) {
 		{`Not()`, 0},
 		{`Not(Any(), Any())`, 0},
 		{`Silent(soon)`, 7},
+		{`Silent("1s")`, 7},
+		{`TLS(MinTLSVersion("1.2"))`, 18},
 		{`RemoteIP(10.0.0.300/8)`, 9},
 		{`LocalPort(70000)`, 10},
 		{`Regexp("(", 4)`, 7},
@@ -202,5 +207,62 @@ func TestParseMatcherFuncs(t *testing.T) {
 		if _, err := ParseMatcher(text, names); !errors.As(err, &pe) || pe.Offset != offset {
 			t.Errorf("%s: %v, want offset %d", text, err, offset)
 		}
+	}
+}
+
+// TestParseMatcherLimits checks that rule text cannot exhaust the stack or
+// make connections costly, and that errors on long text stay short.
+func TestParseMatcherLimits(t *testing.T) {
+	nested := func(depth int) string {
+		return strings.Repeat("Not(", depth) + "Any()" + strings.Repeat(")", depth)
+	}
+	if _, err := ParseMatcher(nested(maxParseDepth-1), nil); err != nil {
+		t.Fatalf("depth %d: %v", maxParseDepth, err)
+	}
+	deep := nested(500000)
+	_, err := ParseMatcher(deep, nil)
+	var pe *ParseError
+	if !errors.As(err, &pe) || pe.Offset != 4*maxParseDepth || len(err.Error()) > 300 {
+		t.Fatalf("deep nesting: %.300v", err)
+	}
+	for _, re := range []string{`(?s).{1000}.{1000}z`, `(a{100}){100}`, strings.Repeat("x", 2000)} {
+		if _, err := ParseMatcher(`Regexp("`+re+`", 100)`, nil); !errors.As(err, &pe) || pe.Offset != 7 {
+			t.Errorf("%.30s: %v", re, err)
+		}
+	}
+	if _, err := ParseMatcher(`HTTP1(PathRegexp("^/(api|static)/v[0-9]+/.{1,64}$"))`, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestParseMatcherBadNames reports entries of Names that are nil or build
+// nothing, and keeps the errors of the functions.
+func TestParseMatcherBadNames(t *testing.T) {
+	errNo := errors.New("no such country")
+	names := &Names{
+		Matchers:    map[string]Matcher{"none": nil},
+		HTTPFilters: map[string]HTTPFilter{"none": nil},
+		TLSFilters:  map[string]TLSFilter{"none": nil},
+		MatcherFuncs: map[string]func(args ...string) (Matcher, error){
+			"Nothing": func(...string) (Matcher, error) { return nil, nil },
+			"Country": func(...string) (Matcher, error) { return nil, errNo },
+		},
+		TLSFilterFuncs: map[string]func(args ...string) (TLSFilter, error){
+			"Nothing": func(...string) (TLSFilter, error) { return nil, nil },
+		},
+	}
+	for text, offset := range map[string]int{
+		`none`: 0, `HTTP1(none)`: 6, `TLS(none)`: 4, `Nothing()`: 0, `Not(Nothing())`: 4, `TLS(Nothing())`: 4,
+	} {
+		var pe *ParseError
+		if _, err := ParseMatcher(text, names); !errors.As(err, &pe) || pe.Offset != offset {
+			t.Errorf("%s: %v, want offset %d", text, err, offset)
+		}
+	}
+	if _, err := ParseMatcher(`Country("XX")`, names); !errors.Is(err, errNo) {
+		t.Fatalf("Country: %v", err)
+	}
+	if _, err := ParseMatcher(`Not()`, nil); err == nil || !strings.Contains(err.Error(), "needs 1 argument at") {
+		t.Fatalf("Not(): %v", err)
 	}
 }

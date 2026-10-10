@@ -30,6 +30,17 @@ func TestJA4(t *testing.T) {
 	if got := JA4(noSchemes); got != "t13d1516h2_8daaf6152771_6d807ffa2a79" {
 		t.Fatalf("JA4 without signature algorithms = %s", got)
 	}
+	// GREASE signature algorithms are ignored, as GREASE values are
+	// everywhere else.
+	greased := *h
+	greased.SignatureSchemes = append([]uint16{0x2a2a}, h.SignatureSchemes...)
+	if got := JA4(&greased); got != want {
+		t.Fatalf("JA4 with a GREASE signature algorithm = %s, want %s", got, want)
+	}
+	greased.SignatureSchemes = []uint16{0x3a3a}
+	if got := JA4(&greased); got != JA4(noSchemes) {
+		t.Fatalf("JA4 with only GREASE signature algorithms = %s, want %s", got, JA4(noSchemes))
+	}
 	tests := []struct {
 		name string
 		h    *tlshello.Hello
@@ -68,5 +79,25 @@ func TestJA3(t *testing.T) {
 	}
 	if !MatchJA3(want).Match(h) || fmt.Sprint(MatchJA3(want)) != `JA3("`+want+`")` {
 		t.Fatal("JA3 filter")
+	}
+}
+
+// BenchmarkMatchJA4 runs a filter on a hello whose fingerprint it has and on
+// one whose first part already rules it out, as a reject list sees most.
+func BenchmarkMatchJA4(b *testing.B) {
+	h, err := tlshello.Parse(testutil.JA4Example())
+	if err != nil {
+		b.Fatal(err)
+	}
+	for name, f := range map[string]Filter{
+		"hit":  MatchJA4("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+		"miss": MatchJA4("t13d1715h2_5b57614c22b0_3d5424432f57"),
+	} {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				f.Match(h)
+			}
+		})
 	}
 }

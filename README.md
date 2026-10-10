@@ -221,11 +221,17 @@ func moveAdmin(m *portmux.Mux, host string) error {
 - A `Reject` route closes what it matches; with address matchers it does so
   before reading. A `Fallback` route takes, after every other route, what they
   all ruled out and what stayed undecided until the sniff timeout.
+- Matchers rule out what they cannot parse or find ambiguous, such as a
+  request with two Host fields or a path that servers resolve differently, so
+  a reject route does not see it and later routes may take it. Where reject
+  routes guard the others, list what is allowed rather than what is not, and
+  make the fallback a reject route too.
 - `MaxConns` limits the connections a route has open at once.
 - Routes can be added, changed with `SetMatchers`, `SetPriority`,
   `SetEntries` and `SetMaxConns`, and removed with `Close` at any time.
   `Batch` applies several changes at once, and `Batch.Routes` previews the
-  order.
+  order. Each change rebuilds the routing table, so make many changes, such
+  as loading thousands of routes, in one `Batch`.
 - Undecided connections use the current routes for every decision;
   connections waiting for a removed route's `Accept` are matched again.
 
@@ -316,7 +322,8 @@ func resolveSites(sites *hostmatch.Map[[2]*portmux.Route]) portmux.ResolveFunc {
 - `hostmatch.Map` looks a name up by the most specific pattern: the exact name,
   then the pattern with the most literal characters, then `*`. `LookupFunc`
   and `Matches` fall back to wider patterns for policies of your own. Lookups
-  take no lock and allocate nothing.
+  take no lock, and allocate nothing for lowercase names and those that
+  `Input` prepared.
 - `ResolveHosts` and `ResolveDomain` route TLS, HTTP/1.x and h2c by the name
   the client asks for. Paths are for the HTTP server behind the route.
 
@@ -431,7 +438,8 @@ func tighten(m *portmux.Mux) portmux.Config {
   `Entry.Config` the settings of an entry.
 - Clients are IPv4 addresses or IPv6 /64 networks of the TCP peer. Failed
   connections that count toward bans matched no route, timed out, hit a reject
-  route or sent an invalid PROXY header; `Mux.Ban` and `Unban` act by hand.
+  route or sent an invalid PROXY header or none where one is required;
+  `Mux.Ban` and `Unban` act by hand.
 - Rejected connections are reported with `ErrNoMatch`, `ErrRefused`,
   `ErrSniffTimeout`, `ErrDispatchTimeout`, `ErrEvicted`, `ErrPendingLimit`,
   `ErrRateLimited`, `ErrBanned`, `ErrRouteBusy`, `ErrRouteFull`,
@@ -457,16 +465,16 @@ reason. `Mux.Bans` lists the banned clients.
 
 ## Security
 
-| Threat                                              | Handling                                                                    |
-|-----------------------------------------------------|-----------------------------------------------------------------------------|
-| Scans, garbage, data too short and then silence     | Ruled out at the first impossible byte; sniff timeout; bans                 |
-| Floods of idle or slow connections                  | The pending limit, evicting the oldest undecided connection                 |
-| Floods from one client or from many                 | Rate and pending limits per client, rate limit per listener                 |
-| Heads in tiny pieces, many TLS records, HPACK bombs | Incremental parsing; bounded head and header sizes                          |
-| Ambiguous requests and names                        | Duplicate Host headers or SNI names, folded headers and names with `@` fail |
-| Spoofed client addresses                            | PROXY headers only from peers the policy trusts                             |
-| A stalled server on one route                       | Queue limit and dispatch timeout per route                                  |
-| Known scanner TLS libraries                         | A reject route with `TLS(fingerprint.MatchJA4(...))`                        |
+| Threat                                              | Handling                                                                                        |
+|-----------------------------------------------------|-------------------------------------------------------------------------------------------------|
+| Scans, garbage, data too short and then silence     | Ruled out at the first impossible byte; sniff timeout; bans                                     |
+| Floods of idle or slow connections                  | The pending limit, evicting the oldest undecided connection                                     |
+| Floods from one client or from many                 | Rate and pending limits per client, rate limit per listener                                     |
+| Heads in tiny pieces, many TLS records, HPACK bombs | Incremental parsing; bounded head and header sizes                                              |
+| Ambiguous requests and names                        | Duplicate Host headers or SNI names, folded headers, control characters and names with `@` fail |
+| Spoofed client addresses                            | PROXY headers only from peers the policy trusts                                                 |
+| A stalled server on one route                       | Queue limit and dispatch timeout per route                                                      |
+| Known scanner TLS libraries                         | A reject route with `TLS(fingerprint.MatchJA4(...))`                                            |
 
 portmux sees established TCP connections only: SYN floods are for the kernel,
 and delivered connections are the servers' to limit.

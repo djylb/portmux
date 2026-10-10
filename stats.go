@@ -29,15 +29,15 @@ func (m *Mux) Snapshot() Snapshot {
 		snap.Routes[i] = r.info(t)
 	}
 	m.mu.Lock()
-	for ln, l := range m.listeners {
-		snap.Listeners = append(snap.Listeners, ListenerInfo{Entry: l.entry, Addr: ln.Addr(), Stats: l.counts.stats()})
+	for _, l := range m.listeners {
+		snap.Listeners = append(snap.Listeners, ListenerInfo{Entry: l.entry, Addr: l.addr, Stats: l.counts.stats()})
 	}
 	m.mu.Unlock()
 	slices.SortFunc(snap.Listeners, func(a, b ListenerInfo) int {
 		if c := strings.Compare(a.Entry, b.Entry); c != 0 {
 			return c
 		}
-		return strings.Compare(a.Addr.String(), b.Addr.String())
+		return strings.Compare(addrString(a.Addr), addrString(b.Addr))
 	})
 	snap.Stats = m.Stats()
 	return snap

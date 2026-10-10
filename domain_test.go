@@ -192,17 +192,21 @@ func TestInputPeerAddr(t *testing.T) {
 func BenchmarkResolverHosts(b *testing.B) {
 	for _, n := range []int{10, 1000, 100000} {
 		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			// The targets are routes of the table, as in a Mux.
 			var domains domainTable
+			s := routeSet{routes: map[*Route]routeState{{resolve: domains.resolve, seq: uint64(n)}: {}}}
 			for i := range n {
-				domains.set(fmt.Sprintf("h%d.example.com", i), &Route{name: fmt.Sprint(i)})
+				r := &Route{name: fmt.Sprint(i), seq: uint64(i)}
+				domains.set(fmt.Sprintf("h%d.example.com", i), r)
+				s.routes[r] = routeState{}
 			}
-			t := newTable(routeSet{routes: map[*Route]routeState{{resolve: domains.resolve}: {}}})
+			t := newTable(s, nil)
 			data := []byte(fmt.Sprintf("GET /api HTTP/1.1\r\nHost: h%d.example.com:443\r\nUser-Agent: x\r\n\r\n", n-1))
-			dead := make([]bool, 1)
+			dead := make([]bool, len(t.other.rules))
 			b.ReportAllocs()
 			for b.Loop() {
 				in := &Input{data: data}
-				dead[0] = false
+				clear(dead)
 				if r, _, res := t.other.evaluate(dead, in); res != Match || r == nil {
 					b.Fatal(res)
 				}
@@ -241,6 +245,12 @@ func TestResolverIsOrderedWithRules(t *testing.T) {
 		Resolve:  domains.resolve,
 	})
 	routes["web"] = add(RouteConfig{Name: "web", Matchers: []Matcher{HTTP1()}})
+	// The targets match nothing themselves, so connections do not try them.
+	for _, e := range m.table.Load().other.rules {
+		if e.route == targetA || e.route == targetB {
+			t.Fatalf("target %q is tried as a rule", e.route.name)
+		}
+	}
 	got := collect(routes)
 	request := func(host string) string { return "GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n" }
 
@@ -306,6 +316,7 @@ func TestResolveDomain(t *testing.T) {
 
 	for data, want := range map[string]string{
 		request("www.example.com:8080"): "site",
+		request("www.example.com.."):    "rest", // one trailing dot is ignored, as by Domain
 		request("a.b.example.com"):      "wild",
 		request("self.example.com"):     "domains",
 		request("example.org"):          "rest",
@@ -336,6 +347,7 @@ func TestRequestedName(t *testing.T) {
 		string(testutil.HelloRecord(nil)):                {"", Match},
 		"GET / HTTP/1.1\r\nHost: H.example:8080\r\n\r\n": {"h.example", Match},
 		"GET / HTTP/1.1\r\nHost: a@b\r\n\r\n":            {"", NoMatch},
+		"GET / HTTP/1.1\r\nHost: :80\r\n\r\n":            {"", NoMatch}, // not a request without a Host
 		"GET / HTTP/1.1\r\n":                             {"", NeedMore},
 		"SSH-2.0-x\r\n":                                  {"", NoMatch},
 	} {

@@ -80,10 +80,10 @@ func (h *Set) Match(host string) bool {
 // MatchName reports whether a prepared name matches one of the patterns.
 func (h *Set) MatchName(n Name) bool {
 	switch {
-	case n.name == "":
-		return h.empty
 	case !n.valid:
 		return false
+	case n.name == "":
+		return h.empty
 	case h.any:
 		return true
 	}

@@ -119,6 +119,19 @@ func TestParseCrafted(t *testing.T) {
 			t.Errorf("%s: ServerName = %q, want %q", tt.name, h.ServerName, tt.sni)
 		}
 	}
+	// Duplicates are found among many extensions too.
+	var many []byte
+	for i := range uint16(100) {
+		many = append(many, testutil.Ext(0x1000+i, nil)...)
+	}
+	if _, err := Parse(testutil.HelloRecord(many)); err != nil {
+		t.Fatalf("100 extensions: %v", err)
+	}
+	for _, dup := range []uint16{0x1000, 0x101f, 0x1020, 0x1063} {
+		if _, err := Parse(testutil.HelloRecord(append(slices.Clip(many), testutil.Ext(dup, nil)...))); outcome(err) != "invalid" {
+			t.Errorf("duplicate %#x after 100 extensions: %v", dup, err)
+		}
+	}
 	// Bytes in the handshake body after the hello make it invalid.
 	rec := testutil.HelloRecord(nil)
 	rec = append(rec, 0)
@@ -183,6 +196,23 @@ func TestHelloFields(t *testing.T) {
 
 func BenchmarkParse(b *testing.B) {
 	data := testutil.ClientHelloBytes(b, &tls.Config{ServerName: "www.example.com", NextProtos: []string{"h2", "http/1.1"}, InsecureSkipVerify: true})
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := Parse(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkParseManyExtensions parses a hello with as many empty extensions
+// as one record holds, which costs time in proportion to its size.
+func BenchmarkParseManyExtensions(b *testing.B) {
+	var exts []byte
+	for i := range uint16(4000) {
+		exts = append(exts, testutil.Ext(0x1000+i, nil)...)
+	}
+	data := testutil.HelloRecord(exts)
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	for b.Loop() {

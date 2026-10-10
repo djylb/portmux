@@ -59,7 +59,10 @@ func TestParse(t *testing.T) {
 		{"patch", "PATCH /x HTTP/1.1\r\nHost: h\r\n\r\n", "request", "PATCH", "h", "/x"},
 		{"extension method", "PROPFIND /dav HTTP/1.1\r\nHost: h\r\n\r\n", "request", "PROPFIND", "h", "/dav"},
 		{"escaped path", "GET /a%20b HTTP/1.1\r\nHost: h\r\n\r\n", "request", "GET", "h", "/a b"},
-		{"absolute form", "GET http://abs.example/p HTTP/1.1\r\nHost: other\r\n\r\n", "request", "GET", "abs.example", "/p"},
+		{"absolute form", "GET http://abs.example/p HTTP/1.1\r\nHost: ABS.example:80\r\n\r\n", "request", "GET", "abs.example", "/p"},
+		{"absolute form and another host", "GET http://abs.example/p HTTP/1.1\r\nHost: other\r\n\r\n", "invalid", "", "", ""},
+		{"line breaks first", "\r\n\r\nGET /x HTTP/1.1\r\nHost: h\r\n\r\n", "request", "GET", "h", "/x"},
+		{"too many line breaks first", "\r\n\r\n\r\nGET /x HTTP/1.1\r\n\r\n", "invalid", "", "", ""},
 		{"connect", "CONNECT target.example:443 HTTP/1.1\r\nHost: target.example:443\r\n\r\n", "request", "CONNECT", "target.example:443", ""},
 		{"options star", "OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n", "request", "OPTIONS", "h", "*"},
 		{"duplicate host", "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", "invalid", "", "", ""},
@@ -70,6 +73,10 @@ func TestParse(t *testing.T) {
 		{"double space", "GET  / HTTP/1.1\r\n", "invalid", "", "", ""},
 		{"relative target", "GET a/b HTTP/1.1\r\n\r\n", "invalid", "", "", ""},
 		{"bad header line", "GET / HTTP/1.1\r\nno colon\r\n\r\n", "invalid", "", "", ""},
+		{"tab and obs-text in a value", "GET / HTTP/1.1\r\nHost: h\r\nX: a\tb\xff\r\n\r\n", "request", "GET", "h", "/"},
+		{"bare CR in a value", "GET / HTTP/1.1\r\nX: a\rHost: evil\r\nHost: good\r\n\r\n", "invalid", "", "", ""},
+		{"NUL in host", "GET / HTTP/1.1\r\nHost: good\x00evil\r\n\r\n", "invalid", "", "", ""},
+		{"DEL in a value", "GET / HTTP/1.1\r\nX: a\x7f\r\n\r\n", "invalid", "", "", ""},
 		{"tls record", "\x16\x03\x01\x02\x00", "invalid", "", "", ""},
 		{"long method", strings.Repeat("A", maxMethodLen+1), "invalid", "", "", ""},
 		{"headers incomplete", "GET / HTTP/1.1\r\nHost: h\r\n", "incomplete", "", "", ""},
@@ -123,7 +130,8 @@ func TestPathIsResolved(t *testing.T) {
 		"/a/./b":             "/a/b",
 		"/public/../admin/x": "/admin/x",
 		"//admin//x":         "/admin/x",
-		"/%2e%2e/admin/":     "/admin/",
+		"/a%2Fb/c":           "/a/b/c",
+		"/x;jsessionid=1":    "/x;jsessionid=1",
 		"/../../etc":         "/etc",
 		"/x/":                "/x/",
 		"/":                  "/",
@@ -142,6 +150,16 @@ func TestPathIsResolved(t *testing.T) {
 	}
 	if req, err := Parse([]byte("GET /a?x=1&y=%20 HTTP/1.1\r\n\r\n")); err != nil || req.Query().Get("y") != " " {
 		t.Errorf("query: %+v, %v", req, err)
+	}
+	// Paths that servers resolve differently are invalid.
+	for _, target := range []string{
+		"/admin/..%2Fpublic", "/admin/%2e%2e/public", "/admin/x%2F..%2F..%2Fpublic", "/%2e/x",
+		"/public/..;/admin", "/public/.;x/admin", "/;x/admin", "/public\\..\\admin", "/a%5Cb",
+		"/public#/../admin", "/p?x=1#&admin=1", "/a/%zz", "http://h/a/%2e%2e/b",
+	} {
+		if _, err := Parse([]byte("GET " + target + " HTTP/1.1\r\nHost: h\r\n\r\n")); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: %v", target, err)
+		}
 	}
 }
 

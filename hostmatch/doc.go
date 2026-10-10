@@ -5,6 +5,7 @@
 //
 // Names compare case-insensitively and without a trailing dot, and names
 // with bytes that no DNS name or IP address has match no pattern. Normalize
-// prepares a name once for many matches, and SplitHost removes the port of an
-// HTTP Host value. The package uses only the standard library.
+// prepares a name once for many matches, NormalizeHost does so for an HTTP
+// Host value, and SplitHost removes its port. The package uses only the
+// standard library.
 package hostmatch

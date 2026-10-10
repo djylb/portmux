@@ -11,8 +11,13 @@ type Name struct {
 }
 
 // Normalize prepares host, a bare name or IP address without a port, for
-// matching; see SplitHost for HTTP Host values.
+// matching; see NormalizeHost for HTTP Host values. A host that is only a dot
+// is invalid, rather than the empty name of a ClientHello or request without
+// one.
 func Normalize(host string) Name {
+	if host == "." {
+		return Name{}
+	}
 	host = strings.TrimSuffix(host, ".")
 	valid := true
 	upper := false
@@ -75,6 +80,31 @@ func glob(pattern, name string) bool {
 		}
 	}
 	return pi == len(pattern)
+}
+
+// NormalizeHost prepares an HTTP Host value or URL authority for matching:
+// its name as SplitHost returns it, normalized. A value with a port or
+// brackets but without a name, such as ":80" or "[]", is invalid, rather than
+// the empty name of a request without a Host, and so are values that servers
+// read differently: brackets around anything but an IPv6 literal, or followed
+// by anything but a port, and several colons without brackets.
+func NormalizeHost(host string) Name {
+	// Servers disagree on what is meant when brackets hold no IPv6 literal
+	// or are followed by more than a port, and on "a.example:80:80", which
+	// nginx and Express take for a.example and net/http does not.
+	if strings.HasPrefix(host, "[") {
+		end := strings.IndexByte(host, ']')
+		if end < 0 || strings.IndexByte(host[1:end], ':') < 0 || end+1 < len(host) && host[end+1] != ':' {
+			return Name{}
+		}
+	} else if strings.Count(host, ":") > 1 {
+		return Name{}
+	}
+	name := SplitHost(host)
+	if name == "" && host != "" {
+		return Name{}
+	}
+	return Normalize(name)
 }
 
 // SplitHost returns the name of an HTTP Host value or URL authority, without

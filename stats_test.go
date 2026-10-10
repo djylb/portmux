@@ -1,6 +1,7 @@
 package portmux
 
 import (
+	"crypto/tls"
 	"errors"
 	"net"
 	"testing"
@@ -112,5 +113,29 @@ func TestStats(t *testing.T) {
 	st := m.Stats()
 	if st.Accepted != 2 || st.Delivered != 1 || st.Rejected != 1 || route.Matched() != 1 {
 		t.Fatalf("stats %+v, route delivered %d", st, route.Matched())
+	}
+}
+
+// TestSnapshotWithNestedListener serves a route of the Mux, wrapped for TLS,
+// as a listener of another entry, whose address is the route's own: Snapshot
+// and Addr do not wait for themselves.
+func TestSnapshotWithNestedListener(t *testing.T) {
+	m := startMux(t)
+	route := m.Match(TLS())
+	serve(t, m)
+	go func() { _ = m.Entry("inner").Serve(tls.NewListener(route, &tls.Config{})) }()
+	waitServing(t, m.Mux, 2)
+	done := make(chan Snapshot, 1)
+	go func() { done <- m.Snapshot() }()
+	select {
+	case snap := <-done:
+		if len(snap.Listeners) != 2 {
+			t.Fatalf("listeners %+v", snap.Listeners)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Snapshot blocks")
+	}
+	if a := route.Addr().String(); a != m.Addr().String()+","+m.Addr().String() {
+		t.Fatalf("Addr = %s", a)
 	}
 }

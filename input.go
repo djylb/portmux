@@ -33,6 +33,35 @@ type Input struct {
 	req2  *httphead.Request
 	h2    httphead.HTTP2Scanner
 	h2P   parseState
+
+	// memo keeps the decisions of the first Regexp matchers that decided,
+	// which do not change, so that a matcher that waits for more bytes in
+	// the same route does not run their expressions again on every read.
+	memo  [4]memoEntry
+	nmemo int
+}
+
+type memoEntry struct {
+	m   *regexpMatcher
+	res Result
+}
+
+// recalled returns the decision that m made on the input, if it was kept.
+func (in *Input) recalled(m *regexpMatcher) (Result, bool) {
+	for _, e := range in.memo[:in.nmemo] {
+		if e.m == m {
+			return e.res, true
+		}
+	}
+	return NoMatch, false
+}
+
+// remember keeps the decision of m, while there is room.
+func (in *Input) remember(m *regexpMatcher, res Result) {
+	if in.nmemo < len(in.memo) {
+		in.memo[in.nmemo] = memoEntry{m, res}
+		in.nmemo++
+	}
 }
 
 // parseState is the result of a protocol parser on the input so far.
@@ -75,6 +104,7 @@ func (in *Input) SetBytes(data []byte, final bool) {
 		in.hello, in.tls, in.tlsP = nil, tlshello.Scanner{}, parseState{}
 		in.req, in.http, in.httpP = nil, httphead.Scanner{}, parseState{}
 		in.req2, in.h2, in.h2P = nil, httphead.HTTP2Scanner{}, parseState{}
+		in.nmemo = 0
 	}
 	in.data, in.final = data, final
 }

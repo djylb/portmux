@@ -39,11 +39,16 @@ type Mux struct {
 	// are read without it.
 	mu        sync.Mutex
 	listeners map[net.Listener]*listener
+	serving   sync.WaitGroup // Serve calls, which Shutdown waits for
 }
 
 // listener is the state of a listener being served.
 type listener struct {
-	entry  string
+	entry string
+	// addr is the listener's address, taken once outside m.mu, since a
+	// listener such as a route of the same Mux wrapped for TLS looks it up
+	// with m.mu.
+	addr   net.Addr
 	counts stripedCounters
 	// The token bucket of WithRateLimitPerListener, used by Serve alone.
 	tokens float64
@@ -81,16 +86,17 @@ func New(opts ...Option) *Mux {
 	if o.rate > 0 {
 		m.rate.Store(newRateLimit(o.rate, o.rateBurst))
 	}
-	m.table.Store(newTable(routeSet{}))
+	m.table.Store(newTable(routeSet{}, nil))
 	return m
 }
 
 // SetOptions changes options while the Mux serves; options that are not
 // given keep their values. Limits apply to the connections accepted from then
 // on, and connections being matched keep the timeouts and sizes they started
-// with. Lowering WithMaxPending closes nothing: Serve waits until enough
-// pending connections are gone. A new WithRateLimitPerIP starts every client
-// with a full bucket.
+// with. Lowering WithMaxPending closes nothing at once: for each connection it
+// accepts over the limit, Serve evicts the oldest undecided one, as at the
+// limit, and waits until enough pending connections are gone. A new
+// WithRateLimitPerIP starts every client with a full bucket.
 func (m *Mux) SetOptions(opts ...Option) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -128,7 +134,9 @@ func (m *Mux) Match(matchers ...Matcher) *Route {
 	return r
 }
 
-// Add adds a route.
+// Add adds a route. Each change of the routes rebuilds what connections are
+// matched against, in time that grows with the number of routes, so add many
+// routes at once with Batch.
 func (m *Mux) Add(cfg RouteConfig) (*Route, error) {
 	var r *Route
 	err := m.Batch(func(b *Batch) error {
@@ -165,11 +173,12 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 	if ln == nil {
 		panic("portmux: nil listener")
 	}
-	l := &listener{entry: entry}
+	l := &listener{entry: entry, addr: ln.Addr()}
 	if !m.addListener(ln, l) {
 		_ = ln.Close()
 		return net.ErrClosed
 	}
+	defer m.serving.Done()
 	defer m.removeListener(ln)
 
 	var delay time.Duration
@@ -215,7 +224,12 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 			}
 			return net.ErrClosed
 		}
-		m.count(l, stripe, func(c *counters) { c.accepted.Add(1) })
+		// Pending from here, so that Shutdown, which waits for this loop
+		// to stop, waits for the connection too.
+		m.count(l, stripe, func(c *counters) {
+			c.pending.Add(1)
+			c.accepted.Add(1)
+		})
 		// The sniff timeout runs from here, so that the wait for a slot does
 		// not use it up.
 		go m.serveAccepted(c, a, l, arrival{start: time.Now(), seq: seq, stripe: stripe})
@@ -282,22 +296,28 @@ func (m *Mux) serveAccepted(c net.Conn, a admission, l *listener, at arrival) {
 // ServeConn matches c and hands it to a route, in the calling goroutine. It
 // returns nil once a route accepted c; for a route with a handler, it calls
 // the handler and returns when the handler returns. Otherwise it closes c and
-// returns the reason, which is not passed to the error handler. Connections
-// passed to ServeConn do not count against the pending limits. The sniff
-// timeout and silence checks rely on c supporting read deadlines. c belongs
-// to the entry with the empty name; Entry routes connections of other
+// returns the reason, which the observer of WithObserver also receives.
+// Connections passed to ServeConn do not count against the pending limits.
+// The sniff timeout and silence checks rely on c supporting read deadlines. c
+// belongs to the entry with the empty name; Entry routes connections of other
 // entries.
 func (m *Mux) ServeConn(c net.Conn) error {
 	return m.serveOne("", c)
 }
 
 func (m *Mux) serveOne(entry string, c net.Conn) error {
+	at := arrival{start: time.Now(), stripe: newStripe()}
+	// Pending before the check, so that Shutdown, which stops taking
+	// connections before it waits for pending ones, either waits for this one
+	// or makes the check fail.
+	counts := m.total.at(at.stripe)
+	counts.pending.Add(1)
 	if m.quitting() {
+		counts.pending.Add(-1)
 		_ = c.Close()
 		return net.ErrClosed
 	}
-	at := arrival{start: time.Now(), stripe: newStripe()}
-	m.total.at(at.stripe).accepted.Add(1)
+	counts.accepted.Add(1)
 	handler, conn, err := m.serveConn(c, nil, admission{}, entry, at)
 	if handler != nil {
 		handler(conn)
@@ -313,6 +333,18 @@ func (m *Mux) serveOne(entry string, c net.Conn) error {
 // must still be running. Shutdown does not wait for handlers to return.
 func (m *Mux) Shutdown(ctx context.Context) error {
 	stopErr := m.stop()
+	// Serve loops finish the connection they accepted last.
+	served := make(chan struct{})
+	go func() {
+		m.serving.Wait()
+		close(served)
+	}()
+	select {
+	case <-served:
+	case <-ctx.Done():
+		_ = m.Close()
+		return ctx.Err()
+	}
 	delay := time.Millisecond
 	t := time.NewTimer(delay)
 	defer t.Stop()
@@ -387,6 +419,7 @@ func (m *Mux) addListener(ln net.Listener, l *listener) bool {
 		return false
 	}
 	m.listeners[ln] = l
+	m.serving.Add(1)
 	return true
 }
 
@@ -403,14 +436,15 @@ func (m *Mux) addr(entries []string) net.Addr {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	addrs := make(listenAddrs, 0, len(m.listeners))
-	for ln, l := range m.listeners {
+	for _, l := range m.listeners {
 		if len(entries) == 0 || slices.Contains(entries, l.entry) {
-			addrs = append(addrs, ln.Addr())
+			addrs = append(addrs, l.addr)
 		}
 	}
 	if len(addrs) == 1 {
 		return addrs[0]
 	}
+	slices.SortFunc(addrs, func(a, b net.Addr) int { return strings.Compare(addrString(a), addrString(b)) })
 	return addrs
 }
 
@@ -422,9 +456,17 @@ func (a listenAddrs) Network() string { return "portmux" }
 func (a listenAddrs) String() string {
 	s := make([]string, len(a))
 	for i, addr := range a {
-		s[i] = addr.String()
+		s[i] = addrString(addr)
 	}
 	return strings.Join(s, ",")
+}
+
+// addrString returns the text of an address, which may be nil.
+func addrString(a net.Addr) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
 }
 
 // acquireSlot takes a pending slot for a new connection. At the limit it

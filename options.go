@@ -167,10 +167,11 @@ func WithRateLimitPerListener(perSecond float64, burst int) EntryOption {
 
 // WithBanPerIP bans clients whose connections keep failing, as scanners'
 // do: once failures connections from Serve of one client matched no route,
-// timed out while sniffing, were refused by a reject route or sent an invalid
-// PROXY header within window, the client's connections are refused for d,
-// before any byte is read, and reported with ErrBanned. Connections that are
-// closed without sending anything, as health checks are, do not count.
+// timed out while sniffing, were refused by a reject route, or sent an invalid
+// PROXY header or none where one is required within window, the client's
+// connections are refused for d, before any byte is read, and reported with
+// ErrBanned. Connections that are closed without sending anything, as health
+// checks are, do not count.
 // Clients are counted as in WithMaxPendingPerIP; Mux.Ban and Mux.Bans manage
 // bans directly. A non-positive failures, the default, disables automatic
 // bans.
@@ -211,7 +212,12 @@ func WithObserver(fn func(Event)) Option {
 // header is removed from the stream before matching, and its addresses
 // replace those of the delivered Conn. Peek calls the policy with the empty
 // entry. A missing required header is reported with proxyproto.ErrNoHeader,
-// an invalid one with an error wrapping proxyproto.ErrMalformed.
+// an invalid one with an error wrapping proxyproto.ErrMalformed. An optional
+// header is taken to be missing when the client sends nothing until a Silent
+// check or the sniff timeout, so that Silent routes, and routes that decide
+// without bytes such as those with Always, still take clients that wait for
+// the server; the latter only at the sniff timeout, so give their entries a
+// policy of Required or Ignore.
 //
 // Use this option rather than a proxyproto.Listener in front of the Mux: the
 // header is then read within the sniff timeout and the pending limits, and

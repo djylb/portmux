@@ -3,6 +3,7 @@ package portmux
 import (
 	"encoding/binary"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +35,9 @@ func TestPostgreSQL(t *testing.T) {
 	matchAll(t, m, pgMessage(pgSSLRequest, ""), 8, Match)
 	matchAll(t, m, pgMessage(pgGSSENCRequest, ""), 8, Match)
 	matchAll(t, m, pgMessage(pgCancelRequest, "\x00\x00\x00\x01\x00\x00\x00\x02"), 8, Match)
+	pid := "\x00\x00\x00\x01"
+	matchAll(t, m, pgMessage(pgCancelRequest, pid+string(make([]byte, 32))), 8, Match) // protocol 3.2 key
+	matchAll(t, m, pgMessage(pgCancelRequest, pid+string(make([]byte, 257))), 8, NoMatch)
 	matchAll(t, m, pgMessage(3<<16, "user\x00postgres\x00\x00"), 8, Match)
 	matchAll(t, m, pgMessage(3<<16|2, "user\x00postgres\x00\x00"), 8, Match) // protocol 3.2
 
@@ -129,6 +133,8 @@ func TestXMPP(t *testing.T) {
 	matchAll(t, m, []byte(other), len(other), NoMatch)
 	matchAll(t, m, []byte("<?xml version='1.0'?><html>"), len("<?xml version='1.0'?><h"), NoMatch)
 	matchAll(t, m, []byte("<html>"), 2, NoMatch)
+	long := "<stream:stream xmlns='jabber:client' to='" + strings.Repeat("a", maxXMPPHeader) + "'>"
+	matchAll(t, m, []byte(long), maxXMPPHeader, NoMatch)
 	matchAll(t, m, []byte("GET"), 1, NoMatch)
 }
 
@@ -137,13 +143,19 @@ func TestDNS(t *testing.T) {
 	// A query for example.com A with the AD bit, as dig sends it.
 	q := []byte("\x00\x1d\x12\x34\x00\x20\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01")
 	matchAll(t, m, q, 14, Match)
+	// Other messages are ruled out at their first byte that differs.
 	response := append([]byte(nil), q...)
 	response[4] |= 0x80
-	matchAll(t, m, response, 14, NoMatch)
+	matchAll(t, m, response, 5, NoMatch)
 	twoQuestions := append([]byte(nil), q...)
 	twoQuestions[7] = 2
-	matchAll(t, m, twoQuestions, 14, NoMatch)
-	matchAll(t, m, []byte("GET / HTTP/1.1\r\n"), 14, NoMatch)
+	matchAll(t, m, twoQuestions, 8, NoMatch)
+	answer := append([]byte(nil), q...)
+	answer[9] = 1
+	matchAll(t, m, answer, 10, NoMatch)
+	matchAll(t, m, []byte("GET / HTTP/1.1\r\n"), 5, NoMatch)
+	// A PostgreSQL SSL request, after which the client waits.
+	matchAll(t, m, pgMessage(pgSSLRequest, ""), 2, NoMatch)
 }
 
 func TestRDPCookie(t *testing.T) {

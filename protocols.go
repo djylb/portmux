@@ -106,7 +106,8 @@ func matchPostgreSQL(b []byte) Result {
 	case code == pgSSLRequest || code == pgGSSENCRequest:
 		return matchIf(n == 8)
 	case code == pgCancelRequest:
-		return matchIf(n == 16)
+		// The secret key takes 4 bytes, or up to 256 since protocol 3.2.
+		return matchIf(n >= 16 && n <= 12+256)
 	case code>>16 == 3:
 		return matchIf(n > 8 && n <= pgMaxStartupSize)
 	}
@@ -204,12 +205,25 @@ func matchIf(ok bool) Result {
 // XMPP matches XMPP clients and servers by the stream header they open with,
 // an optional XML declaration and a stream:stream element in the jabber:client
 // or jabber:server namespace, or that of a component. It decides once the
-// stream element is complete.
+// stream element is complete, and rules out a stream header longer than 2 KiB.
 func XMPP() Matcher {
 	return binaryMatcher{name: "XMPP", match: matchXMPP}
 }
 
+// maxXMPPHeader bounds the declaration and stream element that XMPP looks at,
+// so that a header sent a byte at a time is not scanned again at length on
+// every read.
+const maxXMPPHeader = 2 << 10
+
 func matchXMPP(b []byte) Result {
+	res := matchXMPPHeader(b[:min(len(b), maxXMPPHeader)])
+	if res == NeedMore && len(b) >= maxXMPPHeader {
+		return NoMatch
+	}
+	return res
+}
+
+func matchXMPPHeader(b []byte) Result {
 	const decl, stream = "<?xml", "<stream:stream"
 	switch {
 	case len(b) == 0:
@@ -239,22 +253,33 @@ func matchXMPP(b []byte) Result {
 }
 
 // DNS matches DNS queries over TCP by their length prefix and header: a
-// standard query with one question and no answers. It decides after the
-// fourteen bytes of the length and the header.
+// standard query with one question and no answers. It matches after the
+// fourteen bytes of the length and the header, and rules other protocols out
+// at their first byte that a query does not have, so that short messages of
+// clients that then wait, such as a PostgreSQL SSL request, are not held
+// back.
 func DNS() Matcher {
 	return binaryMatcher{name: "DNS", match: matchDNS}
 }
 
 func matchDNS(b []byte) Result {
+	// A message of at least 17 bytes, a query (QR clear) with opcode QUERY, a
+	// reserved Z bit clear and no response code, as clients send, with one
+	// question and no answer or authority records.
+	if len(b) >= 2 && binary.BigEndian.Uint16(b) < 17 ||
+		len(b) >= 5 && b[4]&0xf8 != 0 ||
+		len(b) >= 6 && b[5]&0x4f != 0 {
+		return NoMatch
+	}
+	for i, want := range [...]byte{0, 1, 0, 0, 0, 0} {
+		if 6+i < len(b) && b[6+i] != want {
+			return NoMatch
+		}
+	}
 	if len(b) < 14 {
 		return NeedMore
 	}
-	n := binary.BigEndian.Uint16(b)
-	flags := binary.BigEndian.Uint16(b[4:])
-	qd, an, ns := binary.BigEndian.Uint16(b[6:]), binary.BigEndian.Uint16(b[8:]), binary.BigEndian.Uint16(b[10:])
-	// A query (QR clear) with opcode QUERY, a reserved Z bit clear and no
-	// response code, as clients send.
-	return matchIf(n >= 17 && flags&0xf840 == 0 && flags&0x000f == 0 && qd == 1 && an == 0 && ns == 0)
+	return Match
 }
 
 func rdpCookie(data []byte) (string, Result) {

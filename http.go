@@ -97,7 +97,9 @@ func hasPathPrefix(path, prefix string) bool {
 	if !strings.HasPrefix(path, prefix) {
 		return false
 	}
-	return len(path) == len(prefix) || strings.HasSuffix(prefix, "/") || path[len(prefix)] == '/'
+	// ';' starts the parameters of the last segment, which Tomcat and Jetty
+	// remove.
+	return len(path) == len(prefix) || strings.HasSuffix(prefix, "/") || path[len(prefix)] == '/' || path[len(prefix)] == ';'
 }
 
 // Query accepts requests whose query string has the parameter with one of
@@ -135,64 +137,66 @@ func (f queryFilter) String() string {
 // HostRegexp accepts requests whose host, lowercased and without its port,
 // matches re. Hosts with bytes that no DNS name or IP address has never match.
 func HostRegexp(re *regexp.Regexp) HTTPFilter {
-	return newRegexpFilter("HostRegexp", "", re, func(r *httphead.Request, yield func(string) bool) {
-		if n := r.Name(); n.Valid() && n.String() != "" {
-			yield(n.String())
-		}
+	return newRegexpFilter("HostRegexp", re, func(r *httphead.Request, re *regexp.Regexp) bool {
+		n := r.Name()
+		return n.Valid() && n.String() != "" && re.MatchString(n.String())
 	})
 }
 
 // PathRegexp accepts requests whose path, decoded and resolved as Path is,
 // matches re.
 func PathRegexp(re *regexp.Regexp) HTTPFilter {
-	return newRegexpFilter("PathRegexp", "", re, func(r *httphead.Request, yield func(string) bool) {
-		yield(r.Path)
+	return newRegexpFilter("PathRegexp", re, func(r *httphead.Request, re *regexp.Regexp) bool {
+		return re.MatchString(r.Path)
 	})
 }
 
 // HeaderRegexp accepts requests with a field of the given name whose value
 // matches re. Every field of that name is tried.
 func HeaderRegexp(name string, re *regexp.Regexp) HTTPFilter {
-	return newRegexpFilter("HeaderRegexp", name, re, func(r *httphead.Request, yield func(string) bool) {
-		for v := range r.Values(name) {
-			if !yield(v) {
-				return
-			}
-		}
-	})
-}
-
-// regexpFilter matches the values that a request yields with a regular
-// expression.
-type regexpFilter[T any] struct {
-	name   string
-	arg    string // a header name, or empty
-	re     *regexp.Regexp
-	values func(T, func(string) bool)
-}
-
-func newRegexpFilter[T any](name, arg string, re *regexp.Regexp, values func(T, func(string) bool)) regexpFilter[T] {
 	if re == nil {
 		panic("portmux: nil regexp")
 	}
-	return regexpFilter[T]{name: name, arg: arg, re: re, values: values}
+	return headerRegexpFilter{name: name, re: re}
 }
 
-func (f regexpFilter[T]) Match(v T) bool {
-	found := false
-	f.values(v, func(s string) bool {
-		found = f.re.MatchString(s)
-		return !found
-	})
-	return found
+type headerRegexpFilter struct {
+	name string
+	re   *regexp.Regexp
 }
 
-func (f regexpFilter[T]) String() string {
-	if f.arg != "" {
-		return call(f.name, []string{f.arg, f.re.String()}, quote)
+func (f headerRegexpFilter) Match(r *httphead.Request) bool {
+	for v := range r.Values(f.name) {
+		if f.re.MatchString(v) {
+			return true
+		}
 	}
-	return call(f.name, []string{f.re.String()}, quote)
+	return false
 }
+
+func (f headerRegexpFilter) String() string {
+	return call("HeaderRegexp", []string{f.name, f.re.String()}, quote)
+}
+
+// regexpFilter matches a value of a request or hello with a regular
+// expression. match is given the expression rather than the values one by
+// one, so that matching allocates nothing.
+type regexpFilter[T any] struct {
+	name  string
+	re    *regexp.Regexp
+	match func(T, *regexp.Regexp) bool
+}
+
+func newRegexpFilter[T any](name string, re *regexp.Regexp, match func(T, *regexp.Regexp) bool) regexpFilter[T] {
+	if re == nil {
+		panic("portmux: nil regexp")
+	}
+	return regexpFilter[T]{name: name, re: re, match: match}
+}
+
+func (f regexpFilter[T]) Match(v T) bool { return f.match(v, f.re) }
+
+func (f regexpFilter[T]) String() string { return call(f.name, []string{f.re.String()}, quote) }
 
 func (f listFilter) String() string { return call(f.name, f.values, quote) }
 

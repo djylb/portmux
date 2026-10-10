@@ -617,6 +617,7 @@ func TestProxyProtocolOptionalAndNone(t *testing.T) {
 	}))
 	proxyLine := m.Match(Prefix("PROXY "))
 	bridge := m.Match(Prefix("TST"))
+	silent := m.Match(Silent(20 * time.Millisecond))
 	serve(t, m)
 	setMode := func(v proxyproto.Policy) {
 		mu.Lock()
@@ -635,6 +636,13 @@ func TestProxyProtocolOptionalAndNone(t *testing.T) {
 	_, _ = c.Write(append(v2, "TST"...))
 	if got := accept(t, bridge); got.RemoteAddr().String() != "192.0.2.1:40000" {
 		t.Fatalf("RemoteAddr = %v", got.RemoteAddr())
+	}
+	// A client that waits for the server sends no header either, and goes
+	// to the silent route rather than waiting for one until the sniff
+	// timeout.
+	dial(t, m)
+	if got := accept(t, silent); got.ProxyHeader() != nil {
+		t.Fatal("header from a silent client")
 	}
 
 	setMode(proxyproto.Ignore)
@@ -799,4 +807,34 @@ func TestNewPanics(t *testing.T) {
 	m := startMux(t)
 	expectPanic("nil listener", func() { _ = m.Serve(nil) })
 	expectPanic("nil matcher", func() { m.Match(Any(), nil) })
+}
+
+// TestMaxSniffBytesAfterProxyHeader checks that matchers see at most the
+// sniff limit after a PROXY header, whose read may take more bytes, and that
+// the connection still replays all of them.
+func TestMaxSniffBytesAfterProxyHeader(t *testing.T) {
+	header := proxyproto.V2Header(&net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 40000}, &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443})
+	data := append(header, bytes.Repeat([]byte("x"), 1000)...)
+	m := New(WithMaxSniffBytes(16), WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Required }))
+	defer func() { _ = m.Close() }()
+	seen := 0
+	replayed := 0
+	if _, err := m.Add(RouteConfig{Matchers: []Matcher{MatcherFunc(func(in *Input) Result {
+		seen = max(seen, len(in.Bytes()))
+		if !in.Final() {
+			return NeedMore
+		}
+		return Match
+	})}, Handler: func(c *Conn) {
+		replayed = len(c.Unread())
+		_ = c.Close()
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ServeConn(&memConn{data: data}); err != nil {
+		t.Fatal(err)
+	}
+	if seen != 16 || replayed != 1000 {
+		t.Fatalf("matchers saw %d bytes, the connection replays %d", seen, replayed)
+	}
 }
