@@ -3,6 +3,7 @@ package portmux
 import (
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"testing"
@@ -168,5 +169,17 @@ func TestExpiredBansAreForgotten(t *testing.T) {
 	}
 	if bans := l.list(n*time.Millisecond + time.Second); len(bans) != 0 || l.size.Load() != 0 {
 		t.Fatalf("%d bans, size %d after every ban ended", len(bans), l.size.Load())
+	}
+}
+
+// TestBanForever bans for the longest duration, which must not wrap around.
+func TestBanForever(t *testing.T) {
+	m := New(WithBanPerIP(1, time.Minute, math.MaxInt64))
+	defer func() { _ = m.Close() }()
+	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
+	m.Ban(a, math.MaxInt64)
+	m.bans.fail(banKey{client: b}, m.bans.now(), 1, time.Minute, math.MaxInt64)
+	if !m.bans.banned(a, m.bans.now()) || !m.bans.banned(b, m.bans.now()) || len(m.Bans()) != 2 {
+		t.Fatalf("bans %+v", m.Bans())
 	}
 }

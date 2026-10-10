@@ -23,6 +23,7 @@ var (
 // A Batch is only valid during the function passed to Mux.Batch.
 type Batch struct {
 	m     *Mux
+	base  *table   // the table that view was taken from
 	view  routeSet // the routes as they will be if the batch is applied
 	ops   []func(*routeSet) error
 	added []*Route
@@ -61,13 +62,14 @@ func (s *routeSet) clone() routeSet {
 // because another goroutine removed the route meanwhile, Batch applies
 // nothing and returns the error.
 func (m *Mux) Batch(fn func(b *Batch) error) error {
-	b := &Batch{m: m, view: m.table.Load().clone()}
+	base := m.table.Load()
+	b := &Batch{m: m, base: base, view: base.clone()}
 	err := fn(b)
 	b.done = true
 	var removed []*Route
 	closed := false
 	if err == nil {
-		removed, closed, err = m.apply(b.ops)
+		removed, closed, err = m.apply(b)
 	}
 	if err != nil || closed {
 		// Routes added to a closed Mux are closed at once.
@@ -262,15 +264,21 @@ func checkMatchers(matchers []Matcher) error {
 
 // apply replays a batch's changes on the current routes and installs the
 // result, or changes nothing when one of them fails. It returns the routes
-// that the changes removed and whether the Mux is closed.
-func (m *Mux) apply(ops []func(*routeSet) error) ([]*Route, bool, error) {
+// that the changes removed, including those the batch added and removed
+// again, and whether the Mux is closed.
+func (m *Mux) apply(b *Batch) ([]*Route, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur := m.table.Load()
-	s := cur.clone()
-	for _, op := range ops {
-		if err := op(&s); err != nil {
-			return nil, false, err
+	s := b.view
+	if cur != b.base {
+		// Changed since the batch began: its changes apply to the routes as
+		// they are now.
+		s = cur.clone()
+		for _, op := range b.ops {
+			if err := op(&s); err != nil {
+				return nil, false, err
+			}
 		}
 	}
 	var removed []*Route
@@ -279,7 +287,12 @@ func (m *Mux) apply(ops []func(*routeSet) error) ([]*Route, bool, error) {
 			removed = append(removed, r)
 		}
 	}
-	m.table.Store(newTable(s))
+	for _, r := range b.added {
+		if _, ok := s.routes[r]; !ok {
+			removed = append(removed, r)
+		}
+	}
+	m.table.Store(newTable(s, cur.orderAfter(&s, b.added)))
 	return removed, m.closed.Load(), nil
 }
 
@@ -287,29 +300,35 @@ func (m *Mux) apply(ops []func(*routeSet) error) ([]*Route, bool, error) {
 // then in the order they were added, with fallback routes last.
 func (s *routeSet) sorted() []*Route {
 	// The priorities are copied out, so that comparisons look nothing up.
-	type ranked struct {
-		r        *Route
-		priority int
-	}
-	list := make([]ranked, 0, len(s.routes))
+	list := make([]rankedRoute, 0, len(s.routes))
 	for r, st := range s.routes {
-		list = append(list, ranked{r, st.priority})
+		list = append(list, rankedRoute{r, st.priority})
 	}
-	slices.SortFunc(list, func(a, b ranked) int {
-		if a.r.fallback != b.r.fallback {
-			if a.r.fallback {
-				return 1
-			}
-			return -1
-		}
-		if c := cmp.Compare(b.priority, a.priority); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.r.seq, b.r.seq)
-	})
+	slices.SortFunc(list, compareRanked)
 	routes := make([]*Route, len(list))
 	for i, e := range list {
 		routes[i] = e.r
 	}
 	return routes
+}
+
+// rankedRoute is a route with its priority, for sorting.
+type rankedRoute struct {
+	r        *Route
+	priority int
+}
+
+// compareRanked orders routes by priority, highest first, then in the order
+// they were added, with fallback routes last.
+func compareRanked(a, b rankedRoute) int {
+	if a.r.fallback != b.r.fallback {
+		if a.r.fallback {
+			return 1
+		}
+		return -1
+	}
+	if c := cmp.Compare(b.priority, a.priority); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.r.seq, b.r.seq)
 }

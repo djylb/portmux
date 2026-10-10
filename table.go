@@ -19,17 +19,24 @@ type table struct {
 	fallbacks map[*Route]struct{}
 }
 
-// newTable builds the table of a configuration. Each route is visited once
-// per entry it applies to.
-func newTable(s routeSet) *table {
+// newTable builds the table of a configuration whose routes are in order,
+// matching order, or sorts them for a nil order. Each route that can match is
+// visited once per entry it applies to.
+func newTable(s routeSet, order []*Route) *table {
+	if order == nil {
+		order = s.sorted()
+	}
 	t := &table{
 		routeSet:  s,
-		order:     s.sorted(),
+		order:     order,
 		byEntry:   make(map[string]*ruleSet),
 		other:     &ruleSet{},
 		fallbacks: make(map[*Route]struct{}),
 	}
-	for _, st := range s.routes {
+	for r, st := range s.routes {
+		if !canMatch(r, st) {
+			continue
+		}
 		for _, name := range st.entries {
 			if t.byEntry[name] == nil {
 				t.byEntry[name] = &ruleSet{}
@@ -38,6 +45,9 @@ func newTable(s routeSet) *table {
 	}
 	for _, r := range t.order {
 		st := s.routes[r]
+		if !canMatch(r, st) {
+			continue
+		}
 		var silences []time.Duration
 		reportSilences(st.matchers, func(d time.Duration) { silences = append(silences, d) })
 		if len(st.entries) > 0 {
@@ -56,6 +66,49 @@ func newTable(s routeSet) *table {
 	}
 	t.other.finish(t)
 	return t
+}
+
+// canMatch reports whether a route takes part in matching: a route without
+// matchers or a resolver, other than a fallback, matches nothing and is only
+// reached through resolvers.
+func canMatch(r *Route, st routeState) bool {
+	return r.fallback || r.resolve != nil || len(st.matchers) > 0
+}
+
+// orderAfter returns the routes of s, which a change made from those of t,
+// in matching order: the routes whose priority is the same keep their order,
+// and the others, which are few in a change, are sorted in between them.
+func (t *table) orderAfter(s *routeSet, added []*Route) []*Route {
+	kept := make([]rankedRoute, 0, len(s.routes))
+	var moved []rankedRoute
+	for _, r := range t.order {
+		st, ok := s.routes[r]
+		switch {
+		case !ok:
+		case st.priority == t.routes[r].priority:
+			kept = append(kept, rankedRoute{r, st.priority})
+		default:
+			moved = append(moved, rankedRoute{r, st.priority})
+		}
+	}
+	for _, r := range added {
+		if st, ok := s.routes[r]; ok {
+			moved = append(moved, rankedRoute{r, st.priority})
+		}
+	}
+	if len(kept)+len(moved) != len(s.routes) {
+		return s.sorted()
+	}
+	slices.SortFunc(moved, compareRanked)
+	order := make([]*Route, 0, len(s.routes))
+	for len(kept) > 0 || len(moved) > 0 {
+		if len(moved) == 0 || len(kept) > 0 && compareRanked(kept[0], moved[0]) < 0 {
+			order, kept = append(order, kept[0].r), kept[1:]
+		} else {
+			order, moved = append(order, moved[0].r), moved[1:]
+		}
+	}
+	return order
 }
 
 // forEntry returns the rules for connections of an entry.
@@ -81,18 +134,13 @@ type rule struct {
 	matchers []Matcher
 }
 
-// add appends a route, added in matching order. The first fallback route is
-// the one in use. A route without matchers or a resolver matches nothing and
-// is only reached through resolvers, so it is left out: connections do not
-// try every target of a resolver.
+// add appends a route that can match, added in matching order. The first
+// fallback route is the one in use.
 func (rs *ruleSet) add(r *Route, matchers []Matcher, silences []time.Duration) {
 	if r.fallback {
 		if rs.fallback == nil {
 			rs.fallback = r
 		}
-		return
-	}
-	if len(matchers) == 0 && r.resolve == nil {
 		return
 	}
 	rs.rules = append(rs.rules, rule{route: r, matchers: matchers})

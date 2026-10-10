@@ -536,3 +536,35 @@ func TestRateLimitPerListener(t *testing.T) {
 	_, _ = dial(t, m).Write([]byte("GET"))
 	accept(t, web)
 }
+
+// TestShardsSpreadIPv6 spreads the first /64 networks of many /48s, whose
+// keys differ in a few bytes, over the shards of the rate limits and bans.
+func TestShardsSpreadIPv6(t *testing.T) {
+	var counts [rateShards]int
+	base := netip.MustParseAddr("2001:db8::").As16()
+	for i := range 4096 {
+		b := base
+		b[4], b[5] = byte(i>>8), byte(i)
+		client, _ := clientKey(net.TCPAddrFromAddrPort(netip.AddrPortFrom(netip.AddrFrom16(b), 1)))
+		counts[shardOf(client, rateShards)]++
+	}
+	for i, n := range counts {
+		if n < 4096/rateShards/2 {
+			t.Fatalf("shard %d holds %d of 4096 clients: %v", i, n, counts)
+		}
+	}
+}
+
+// TestQueuedWithoutLimit counts the connections that wait for Accept also
+// when their number is not limited.
+func TestQueuedWithoutLimit(t *testing.T) {
+	m := startMux(t, WithMaxQueuedPerRoute(0))
+	route := m.Match(Prefix("A")) // its server never accepts
+	serve(t, m)
+	for range 3 {
+		_, _ = dial(t, m).Write([]byte("A"))
+	}
+	waitUntil(t, "three connections wait for Accept", func() bool { return route.Info().Queued == 3 })
+	accept(t, route)
+	waitUntil(t, "two wait", func() bool { return route.Info().Queued == 2 })
+}

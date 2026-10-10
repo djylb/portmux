@@ -2,6 +2,7 @@ package portmux
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/netx/proxyproto"
 	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/internal/testutil"
 )
@@ -475,5 +477,68 @@ func TestCloseStopsMatchedHandOver(t *testing.T) {
 		if st := m.Stats(); st.Delivered != 0 || st.Open != 0 || st.Pending != 0 || st.Failed != 1 {
 			t.Fatalf("handler %v: stats %+v", handler, st)
 		}
+	}
+}
+
+// TestShutdownKeepsAcceptedConnections shuts down right after Serve accepted
+// a connection: Shutdown waits for it to be routed rather than closing it.
+func TestShutdownKeepsAcceptedConnections(t *testing.T) {
+	for range 100 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := New()
+		r := m.Match(Always())
+		got := make(chan *Conn, 1)
+		go func() {
+			if c, err := r.AcceptConn(); err == nil {
+				got <- c
+			}
+			close(got)
+		}()
+		served := make(chan error, 1)
+		go func() { served <- m.Serve(ln) }()
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for m.Stats().Accepted == 0 {
+			runtime.Gosched()
+		}
+		if err := m.Shutdown(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		dc, ok := <-got
+		if !ok {
+			t.Fatalf("connection closed by Shutdown, stats %+v", m.Stats())
+		}
+		_ = dc.Close()
+		_ = c.Close()
+		<-served
+	}
+}
+
+// TestDeliveredWithoutBytesHoldsNoBuffer delivers connections that sent only
+// a PROXY header, or nothing, to a route that needs no bytes: they keep no
+// read buffer.
+func TestDeliveredWithoutBytesHoldsNoBuffer(t *testing.T) {
+	header := proxyproto.V2Header(&net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 40000}, &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443})
+	m := New(WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Required }))
+	defer func() { _ = m.Close() }()
+	held := make(chan bool, 1)
+	if _, err := m.Add(RouteConfig{Matchers: []Matcher{Always()}, Handler: func(c *Conn) {
+		c.mu.Lock()
+		held <- c.buf != nil || !c.drained.Load()
+		c.mu.Unlock()
+		_ = c.Close()
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ServeConn(&memConn{data: header}); err != nil {
+		t.Fatal(err)
+	}
+	if <-held {
+		t.Fatal("a connection without bytes to replay holds its read buffer")
 	}
 }

@@ -230,7 +230,8 @@ func moveAdmin(m *portmux.Mux, host string) error {
 - Routes can be added, changed with `SetMatchers`, `SetPriority`,
   `SetEntries` and `SetMaxConns`, and removed with `Close` at any time.
   `Batch` applies several changes at once, and `Batch.Routes` previews the
-  order.
+  order. Each change rebuilds the routing table, so make many changes, such
+  as loading thousands of routes, in one `Batch`.
 - Undecided connections use the current routes for every decision;
   connections waiting for a removed route's `Accept` are matched again.
 

@@ -200,7 +200,7 @@ func BenchmarkResolverHosts(b *testing.B) {
 				domains.set(fmt.Sprintf("h%d.example.com", i), r)
 				s.routes[r] = routeState{}
 			}
-			t := newTable(s)
+			t := newTable(s, nil)
 			data := []byte(fmt.Sprintf("GET /api HTTP/1.1\r\nHost: h%d.example.com:443\r\nUser-Agent: x\r\n\r\n", n-1))
 			dead := make([]bool, len(t.other.rules))
 			b.ReportAllocs()

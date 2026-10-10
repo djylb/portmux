@@ -363,3 +363,65 @@ func TestConcurrentRouteChanges(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// TestBatchAddAndRemove closes a route that one batch adds and removes.
+func TestBatchAddAndRemove(t *testing.T) {
+	m := New()
+	defer func() { _ = m.Close() }()
+	var r *Route
+	err := m.Batch(func(b *Batch) error {
+		var err error
+		if r, err = b.Add(RouteConfig{Name: "brief", Matchers: []Matcher{Any()}}); err != nil {
+			return err
+		}
+		return b.Remove(r)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Accept(); !errors.Is(err, net.ErrClosed) || m.Route("brief") != nil {
+		t.Fatalf("Accept = %v", err)
+	}
+}
+
+// TestOrderAfterChanges checks the order that changes keep up to date against
+// a full sort, after random batches of additions, priority changes and
+// removals.
+func TestOrderAfterChanges(t *testing.T) {
+	m := New()
+	defer func() { _ = m.Close() }()
+	r := rand.New(rand.NewPCG(1, 2))
+	for range 300 {
+		err := m.Batch(func(b *Batch) error {
+			for range 1 + r.IntN(4) {
+				routes := b.Routes()
+				switch op := r.IntN(4); {
+				case op == 0 || len(routes) == 0:
+					cfg := RouteConfig{Priority: r.IntN(5), Fallback: r.IntN(8) == 0}
+					if !cfg.Fallback {
+						cfg.Matchers = []Matcher{Any()}
+					}
+					if _, err := b.Add(cfg); err != nil {
+						return err
+					}
+				case op == 1:
+					if err := b.Remove(routes[r.IntN(len(routes))]); err != nil {
+						return err
+					}
+				default:
+					if err := b.SetPriority(routes[r.IntN(len(routes))], r.IntN(5)); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tb := m.table.Load()
+		if want := tb.sorted(); !slices.Equal(tb.order, want) {
+			t.Fatalf("order %v, want %v", tb.order, want)
+		}
+	}
+}

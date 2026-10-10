@@ -2,6 +2,7 @@ package portmux
 
 import (
 	"errors"
+	"math"
 	"net"
 	"net/netip"
 	"sync"
@@ -96,8 +97,7 @@ func newBanList() *banList {
 func (l *banList) now() time.Duration { return time.Since(l.epoch) }
 
 func (l *banList) shard(client netip.Addr) *banShard {
-	b := client.As16()
-	return &l.shards[(b[15]^b[13]^b[11]^b[7])%banShards]
+	return &l.shards[shardOf(client, banShards)]
 }
 
 // banned reports whether client is banned at now.
@@ -147,8 +147,16 @@ func (l *banList) fail(key banKey, now time.Duration, failures int, window, d ti
 		}
 		e = b
 	}
-	e.until = now + d
+	e.until = banEnd(now, d)
 	sh.clients[ban] = e
+}
+
+// banEnd returns now+d, or the largest time for a ban too long to add.
+func banEnd(now, d time.Duration) time.Duration {
+	if d > math.MaxInt64-now {
+		return math.MaxInt64
+	}
+	return now + d
 }
 
 // track makes room for a new record in sh and reports whether there was
@@ -180,7 +188,7 @@ func (l *banList) set(key banKey, now, d time.Duration) bool {
 		if !ok {
 			l.size.Add(1)
 		}
-		sh.clients[key] = banEntry{start: now, until: now + d}
+		sh.clients[key] = banEntry{start: now, until: banEnd(now, d)}
 	case ok:
 		delete(sh.clients, key)
 		l.size.Add(-1)

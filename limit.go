@@ -1,6 +1,7 @@
 package portmux
 
 import (
+	"hash/maphash"
 	"net"
 	"net/netip"
 	"sync"
@@ -21,6 +22,17 @@ func clientKey(a net.Addr) (netip.Addr, bool) {
 		ip = netip.PrefixFrom(ip.WithZone(""), 64).Masked().Addr()
 	}
 	return ip, true
+}
+
+// shardSeed keys shardOf, so that clients cannot choose addresses that share
+// a shard.
+var shardSeed = maphash.MakeSeed()
+
+// shardOf spreads clients over n shards by all bytes of their address: the
+// keys of IPv6 clients are /64 networks, whose last bytes are all zero.
+func shardOf(client netip.Addr, n int) int {
+	b := client.As16()
+	return int(maphash.Bytes(shardSeed, b[:]) % uint64(n))
 }
 
 // slotLimit counts the undelivered connections from Serve for
@@ -139,8 +151,7 @@ func (l *rateLimit) allow(client netip.Addr) bool {
 }
 
 func (l *rateLimit) allowAt(client netip.Addr, now time.Duration) bool {
-	b := client.As16()
-	sh := &l.shards[(b[15]^b[13]^b[11]^b[7])%rateShards]
+	sh := &l.shards[shardOf(client, rateShards)]
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if sh.checks++; sh.checks >= rateSweepEvery {

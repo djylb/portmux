@@ -30,9 +30,8 @@ type sniffer struct {
 	armed    time.Time // read deadline currently set on the connection
 	silentAt time.Duration
 	table    *table
-	rules    *ruleSet // the table's rules for entry
-	dead     []bool
-	deadBuf  [16]bool
+	rules    *ruleSet    // the table's rules for entry
+	dead     []bool      // kept across uses of the sniffer
 	via      *Route      // the route that decided the match
 	timer    *time.Timer // dispatch timer, kept across uses of the sniffer
 	empty    int         // consecutive reads without bytes or error
@@ -69,9 +68,9 @@ func newSniffer(conn *Conn, opts *options, start time.Time) *sniffer {
 	return s
 }
 
-// release returns s to the pool, keeping its timer.
+// release returns s to the pool, keeping its timer and the room of dead.
 func (s *sniffer) release() {
-	*s = sniffer{timer: s.timer}
+	*s = sniffer{timer: s.timer, dead: s.dead[:0]}
 	snifferPool.Put(s)
 }
 
@@ -84,15 +83,15 @@ type arrival struct {
 	stripe uint8
 }
 
-// serveConn matches c and delivers it. Connections from Serve come with their
-// listener, which counts them, and their admission; they may be evicted while
-// undecided. For a route with a handler, serveConn returns the handler instead
-// of calling it, so that the connection no longer counts as pending while the
-// handler runs.
+// serveConn matches c, which the caller counted as pending, and delivers it.
+// Connections from Serve come with their listener, which counts them, and
+// their admission; they may be evicted while undecided. For a route with a
+// handler, serveConn returns the handler instead of calling it, so that the
+// connection no longer counts as pending while the handler runs.
 func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at arrival) (handler func(*Conn), conn *Conn, err error) {
 	stripe := at.stripe
 	conn = &Conn{conn: c, entry: entry, stripe: stripe}
-	m.count(l, stripe, func(c *counters) { c.pending.Add(1) })
+	// The caller counted the connection as pending.
 	o, _ := m.settings(entry)
 	s := newSniffer(conn, o, at.start)
 	s.seq = at.seq
@@ -201,12 +200,16 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 		conn.mux, conn.ln = m, l
 		conn.open.Store(true)
 		m.count(l, stripe, func(c *counters) { c.open.Add(1) })
+		// The buffer is dropped only once delivered: matched again, the
+		// connection still reads into it.
 		if r.handler != nil {
 			delivered = true
+			conn.dropEmpty()
 			return r.handler, conn, nil
 		}
 		if err = m.deliver(s, r); err == nil {
 			delivered = true
+			conn.dropEmpty()
 			return nil, conn, nil
 		}
 		conn.closeOpen()
@@ -288,7 +291,9 @@ func (s *sniffer) match(tables *atomic.Pointer[table], maxSniffBytes int) (*Rout
 		if t := tables.Load(); t != s.table {
 			s.useTable(t)
 		}
-		in.data = s.buf[s.off:]
+		// A read for the PROXY header may have taken bytes beyond the limit,
+		// which matchers do not see.
+		in.data = s.buf[s.off:min(len(s.buf), limit)]
 		eof := s.err != nil && errors.Is(s.err, io.EOF)
 		if eof && len(in.data) == 0 {
 			return nil, io.EOF
@@ -334,11 +339,11 @@ func (s *sniffer) match(tables *atomic.Pointer[table], maxSniffBytes int) (*Rout
 func (s *sniffer) useTable(t *table) {
 	s.table = t
 	s.rules = t.forEntry(s.in.entry)
-	if n := len(s.rules.rules); n <= len(s.deadBuf) {
-		s.dead = s.deadBuf[:n]
+	if n := len(s.rules.rules); n <= cap(s.dead) {
+		s.dead = s.dead[:n]
 		clear(s.dead)
 	} else {
-		s.dead = make([]bool, n)
+		s.dead = make([]bool, max(n, 16))[:n]
 	}
 }
 
@@ -447,12 +452,11 @@ func (m *Mux) deliver(s *sniffer, r *Route) error {
 		return nil
 	default:
 	}
-	if q := s.opts.maxQueued; q > 0 {
-		if r.queued.Add(1) > int64(q) {
-			r.queued.Add(-1)
-			return ErrRouteBusy
-		}
-		defer r.queued.Add(-1)
+	// Counted without a limit too, for RouteInfo.Queued.
+	queued := r.queued.Add(1)
+	defer r.queued.Add(-1)
+	if q := s.opts.maxQueued; q > 0 && queued > int64(q) {
+		return ErrRouteBusy
 	}
 	var timeout <-chan time.Time
 	if d := s.opts.dispatchTimeout; d > 0 {
