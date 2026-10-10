@@ -28,6 +28,9 @@ type Request struct {
 	// Path is the decoded path of the target, resolved as servers resolve it:
 	// "." and ".." segments and repeated slashes are removed, and a trailing
 	// slash is kept. Routes therefore see "/public/../admin/" as "/admin/".
+	// Requests whose path servers resolve differently, with a dot segment
+	// that is encoded or has ";" parameters, or with a backslash, and those
+	// with '#' in the target are invalid.
 	// It is empty for CONNECT requests and "*" for "OPTIONS *".
 	Path string
 	// Proto is "HTTP/1.0", "HTTP/1.1" or, for HTTP/2, "HTTP/2.0".
@@ -144,6 +147,9 @@ func Parse(data []byte) (*Request, error) {
 // space is rejected early.
 const maxMethodLen = 32
 
+// maxLeadingCRLF bounds the line breaks skipped before the request line.
+const maxLeadingCRLF = 4
+
 const (
 	scanMethod uint8 = iota
 	scanTarget
@@ -157,6 +163,7 @@ const (
 type Scanner struct {
 	pos         int // next byte to examine
 	lineStart   int // start of the current header line
+	methodStart int // after the line breaks before the request line
 	methodEnd   int
 	targetStart int
 	targetEnd   int
@@ -182,10 +189,15 @@ func (s *Scanner) Scan(data []byte) (*Request, error) {
 		case scanMethod:
 			switch {
 			case isTokenChar(c):
-				if s.pos++; s.pos > maxMethodLen {
+				if s.pos++; s.pos-s.methodStart > maxMethodLen {
 					return nil, ErrInvalid
 				}
-			case c == ' ' && s.pos > 0:
+			case (c == '\r' || c == '\n') && s.pos == s.methodStart && s.pos < maxLeadingCRLF:
+				// Line breaks before the request line are skipped, as RFC
+				// 9112, Section 2.2 asks and nginx and Node do.
+				s.pos++
+				s.methodStart = s.pos
+			case c == ' ' && s.pos > s.methodStart:
 				s.methodEnd = s.pos
 				s.pos++
 				s.targetStart = s.pos
@@ -280,7 +292,7 @@ func (s *Scanner) request(head []byte) (*Request, error) {
 	}
 	h := string(head)
 	r := &Request{
-		Method:     h[:s.methodEnd],
+		Method:     h[s.methodStart:s.methodEnd],
 		RequestURI: h[s.targetStart:s.targetEnd],
 		Proto:      h[s.targetEnd+1 : s.targetEnd+1+len("HTTP/1.1")],
 		fields:     h[s.fieldsStart:],
@@ -306,10 +318,18 @@ func (r *Request) finish() bool {
 		if r.Method != "CONNECT" {
 			return false
 		}
+	case strings.IndexByte(target, '#') >= 0:
+		// Clients send no fragment, and servers disagree on whether '#' ends
+		// the path and query, as nginx and Node take it, or is part of them,
+		// as net/http takes it.
+		return false
 	case target[0] == '/':
 		raw := target
-		if i := strings.IndexAny(raw, "?#"); i >= 0 {
+		if i := strings.IndexByte(raw, '?'); i >= 0 {
 			raw = raw[:i]
+		}
+		if ambiguousPath(raw) {
+			return false
 		}
 		if strings.IndexByte(raw, '%') >= 0 {
 			var err error
@@ -333,12 +353,50 @@ func (r *Request) finish() bool {
 			return false
 		}
 		if u.Host != "" {
+			// Servers that read the Host field, as Node and PHP do, would see
+			// another host than the target names.
+			if r.Host != "" && hostmatch.NormalizeHost(r.Host) != hostmatch.NormalizeHost(u.Host) {
+				return false
+			}
 			r.Host = u.Host
+		}
+		if ambiguousPath(u.EscapedPath()) {
+			return false
 		}
 		r.Path = cleanPath(u.Path)
 	}
 	r.name, r.prepared = hostmatch.NormalizeHost(r.Host), true
 	return true
+}
+
+// ambiguousPath reports whether an escaped path has a segment that servers
+// resolve differently: one that becomes "." or ".." only once decoded, split
+// at an encoded '/' or stripped of ";" parameters, an empty segment with
+// parameters before another segment, or a backslash. nginx, Apache and
+// Tomcat resolve such segments and IIS takes a backslash for a slash, while
+// net/http's ServeMux and Express match the segments as they are.
+func ambiguousPath(escaped string) bool {
+	if strings.IndexByte(escaped, '\\') >= 0 || strings.Contains(escaped, "%5C") || strings.Contains(escaped, "%5c") {
+		return true
+	}
+	for seg, rest, more := "", escaped, true; more; {
+		seg, rest, more = strings.Cut(rest, "/")
+		if seg == "." || seg == ".." || strings.IndexAny(seg, "%;") < 0 {
+			continue
+		}
+		decoded, err := url.PathUnescape(seg)
+		if err != nil {
+			return true
+		}
+		for piece, dRest, dMore := "", decoded, true; dMore; {
+			piece, dRest, dMore = strings.Cut(dRest, "/")
+			name, _, params := strings.Cut(piece, ";")
+			if name == "." || name == ".." || params && name == "" && (dMore || more) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // cleanPath resolves "." and ".." segments and repeated slashes as servers

@@ -102,7 +102,8 @@ func TestPathIsResolved(t *testing.T) {
 		"/a/./b":             "/a/b",
 		"/public/../admin/x": "/admin/x",
 		"//admin//x":         "/admin/x",
-		"/%2e%2e/admin/":     "/admin/",
+		"/a%2Fb/c":           "/a/b/c",
+		"/x;jsessionid=1":    "/x;jsessionid=1",
 		"/../../etc":         "/etc",
 		"/x/":                "/x/",
 		"/":                  "/",
@@ -147,6 +148,9 @@ func TestPathPrefixSegments(t *testing.T) {
 		{"/api/", "/api/v1", true},
 		{"/", "/anything", true},
 		{"", "/anything", true},
+		{"/admin", "/admin;jsessionid=1", true}, // parameters, as Tomcat strips them
+		{"/admin", "/admin;x/secret", true},
+		{"/adm", "/admin;x", false},
 	}
 	for _, tt := range tests {
 		if got := PathPrefix(tt.prefix).Match(parsedRequest(t, "h", tt.path)); got != tt.want {

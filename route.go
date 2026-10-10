@@ -35,7 +35,10 @@ type RouteConfig struct {
 	// Reject makes the route close the connections it matches, reported with
 	// ErrRefused, instead of delivering them; its Accept never returns a
 	// connection. With a high priority and address matchers it is a block
-	// list that closes connections before reading from them.
+	// list that closes connections before reading from them. Matchers rule
+	// out what they cannot parse or find ambiguous, such as a request with two
+	// Host fields, so a reject route does not see it: where reject routes
+	// guard the others, make the fallback a reject route too.
 	Reject bool
 	// Fallback makes the route take the connections that no other route
 	// matched, after all of them, whatever their priorities: those every

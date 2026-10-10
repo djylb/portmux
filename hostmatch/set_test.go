@@ -104,6 +104,12 @@ func TestNameValidation(t *testing.T) {
 	if !empty.MatchName(NormalizeHost("")) || NormalizeHost("[::1]:443").String() != "::1" || NormalizeHost("A.example:8080").String() != "a.example" {
 		t.Error("NormalizeHost of a valid host")
 	}
+	// Values that servers read differently are invalid.
+	for _, host := range []string{"a.example:80:80", "[a.example]", "[::1]junk", "[::1", "::1"} {
+		if n := NormalizeHost(host); n.Valid() {
+			t.Errorf("NormalizeHost(%q) = %q is valid", host, n)
+		}
+	}
 	if s := NewSet("*.example.com", ""); s.String() != `Set("*.example.com", "")` || len(s.Patterns()) != 2 {
 		t.Fatalf("String = %s", s)
 	}

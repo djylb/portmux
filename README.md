@@ -221,6 +221,11 @@ func moveAdmin(m *portmux.Mux, host string) error {
 - A `Reject` route closes what it matches; with address matchers it does so
   before reading. A `Fallback` route takes, after every other route, what they
   all ruled out and what stayed undecided until the sniff timeout.
+- Matchers rule out what they cannot parse or find ambiguous, such as a
+  request with two Host fields or a path that servers resolve differently, so
+  a reject route does not see it and later routes may take it. Where reject
+  routes guard the others, list what is allowed rather than what is not, and
+  make the fallback a reject route too.
 - `MaxConns` limits the connections a route has open at once.
 - Routes can be added, changed with `SetMatchers`, `SetPriority`,
   `SetEntries` and `SetMaxConns`, and removed with `Close` at any time.

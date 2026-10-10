@@ -263,7 +263,7 @@ func TestRequestAccessors(t *testing.T) {
 	if r.Name().String() != "api.example.com" || len(r.Query()) != 0 {
 		t.Fatalf("Name %v, Query %v", r.Name(), r.Query())
 	}
-	req, err := Parse([]byte("GET /p?a=1#f HTTP/1.1\r\nX: 1\r\nx: 2\r\nHost: h\r\n\r\n"))
+	req, err := Parse([]byte("GET /p?a=1 HTTP/1.1\r\nX: 1\r\nx: 2\r\nHost: h\r\n\r\n"))
 	if err != nil || req.Query().Get("a") != "1" {
 		t.Fatalf("%v, %v", req, err)
 	}

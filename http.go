@@ -97,7 +97,9 @@ func hasPathPrefix(path, prefix string) bool {
 	if !strings.HasPrefix(path, prefix) {
 		return false
 	}
-	return len(path) == len(prefix) || strings.HasSuffix(prefix, "/") || path[len(prefix)] == '/'
+	// ';' starts the parameters of the last segment, which Tomcat and Jetty
+	// remove.
+	return len(path) == len(prefix) || strings.HasSuffix(prefix, "/") || path[len(prefix)] == '/' || path[len(prefix)] == ';'
 }
 
 // Query accepts requests whose query string has the parameter with one of
