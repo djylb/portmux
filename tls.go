@@ -55,10 +55,9 @@ func (f sniFilter) Match(h *tlshello.Hello) bool { return f.hosts.MatchName(h.Na
 // SNIRegexp accepts ClientHellos whose server name, lowercased, matches re.
 // ClientHellos without SNI never match.
 func SNIRegexp(re *regexp.Regexp) TLSFilter {
-	return newRegexpFilter("SNIRegexp", "", re, func(h *tlshello.Hello, yield func(string) bool) {
-		if n := h.Name(); n.Valid() && n.String() != "" {
-			yield(n.String())
-		}
+	return newRegexpFilter("SNIRegexp", re, func(h *tlshello.Hello, re *regexp.Regexp) bool {
+		n := h.Name()
+		return n.Valid() && n.String() != "" && re.MatchString(n.String())
 	})
 }
 

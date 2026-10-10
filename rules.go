@@ -213,7 +213,7 @@ func (p *parser) matcher(n *node) (Matcher, error) {
 		if err != nil {
 			return nil, err
 		}
-		size, err := p.int(n.args[1], 1<<30)
+		size, err := p.int(n.args[1], maxRegexpBytes)
 		if err != nil {
 			return nil, err
 		}

@@ -124,7 +124,8 @@ func Or(matchers ...Matcher) Matcher {
 	return orMatcher(checkedMatchers(matchers))
 }
 
-// Not inverts m: Match becomes NoMatch and NoMatch becomes Match.
+// Not inverts m: Match becomes NoMatch and NoMatch becomes Match, also when m
+// still needs more of an input that is final.
 func Not(m Matcher) Matcher {
 	if m == nil {
 		panic("portmux: nil matcher")
@@ -178,6 +179,9 @@ func (n notMatcher) Match(in *Input) Result {
 	case Match:
 		return NoMatch
 	case NeedMore:
+		if in.final {
+			return Match // m does not match, as the routes count it
+		}
 		return NeedMore
 	default:
 		return Match
@@ -258,15 +262,19 @@ func (p prefixMatcher) String() string {
 	return call(p.name, p.prefixes, quote)
 }
 
+// maxRegexpBytes bounds the n of Regexp, as ParseMatcher reads it.
+const maxRegexpBytes = 1 << 30
+
 // Regexp matches connections whose first n bytes match re. It waits for n
 // bytes, or for fewer when the client sends no more or the sniff limit is
-// reached, and then decides once; anchor re with ^ to match from the first
-// byte. Prefix is cheaper for fixed strings.
+// reached, and then decides once, running re once per connection however
+// often the routes ask again; anchor re with ^ to match from the first byte.
+// Prefix is cheaper for fixed strings.
 func Regexp(re *regexp.Regexp, n int) Matcher {
 	if re == nil {
 		panic("portmux: nil regexp")
 	}
-	return regexpMatcher{re: re, n: max(n, 1)}
+	return &regexpMatcher{re: re, n: min(max(n, 1), maxRegexpBytes)}
 }
 
 type regexpMatcher struct {
@@ -274,14 +282,19 @@ type regexpMatcher struct {
 	n  int
 }
 
-func (m regexpMatcher) Match(in *Input) Result {
+func (m *regexpMatcher) Match(in *Input) Result {
 	if len(in.data) < m.n && !in.final {
 		return NeedMore
 	}
-	return matchIf(m.re.Match(in.data[:min(len(in.data), m.n)]))
+	if res, ok := in.recalled(m); ok {
+		return res
+	}
+	res := matchIf(m.re.Match(in.data[:min(len(in.data), m.n)]))
+	in.remember(m, res)
+	return res
 }
 
-func (m regexpMatcher) String() string {
+func (m *regexpMatcher) String() string {
 	return "Regexp(" + quote(m.re.String()) + ", " + strconv.Itoa(m.n) + ")"
 }
 

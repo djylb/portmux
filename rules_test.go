@@ -3,6 +3,7 @@ package portmux
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"regexp"
 	"testing"
@@ -34,6 +35,7 @@ func TestParseMatcherRoundTrip(t *testing.T) {
 			Query("v", "1", "2"), Query("debug"), WebSocket(),
 			AllOf(AnyOf(Host("b"), NoneOf(Path("/admin"))))),
 		HTTP2(Header("content-type", "application/grpc")),
+		HTTP1(HeaderRegexp("", regexp.MustCompile(`x`))), Regexp(regexp.MustCompile(`x`), math.MaxInt),
 		TLS(SNI("a", "*.b"), SNIRegexp(regexp.MustCompile(`^x`)), ALPN("h2"), MinTLSVersion(0x0303), MinTLSVersion(0x0300),
 			NoneOf(SNI("c"))),
 	}
