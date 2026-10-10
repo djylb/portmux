@@ -71,6 +71,8 @@ func inputOf(data []byte) *Input {
 
 // TestH2CRouting routes gRPC and plain HTTP/2 requests of cleartext
 // connections apart, and HTTP/1.1 elsewhere, through real clients.
+//
+//goland:noinspection HttpUrlsUsage
 func TestH2CRouting(t *testing.T) {
 	m := startMux(t)
 	grpc := m.Match(HTTP2(Header("content-type", "application/grpc")))

@@ -118,6 +118,7 @@ func TestRegexp(t *testing.T) {
 	}
 }
 
+//goland:noinspection HttpUrlsUsage
 func TestXMPP(t *testing.T) {
 	m := XMPP()
 	client := "<?xml version='1.0'?><stream:stream to='example.com' xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' version='1.0'>"

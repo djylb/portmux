@@ -315,6 +315,7 @@ func (r *Request) finish() bool {
 	case target == "*":
 		r.Path = "*"
 	case r.Method == "CONNECT":
+		//goland:noinspection HttpUrlsUsage
 		u, err := url.ParseRequestURI("http://" + target)
 		if err != nil || u.Host == "" {
 			return false

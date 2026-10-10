@@ -140,12 +140,18 @@ func BenchmarkLoopback(b *testing.B) {
 			closeNow(c)
 		}
 	}()
+	runClients(b, ln.Addr().String(), hello)
+}
+
+// runClients runs b's loop in parallel clients that each dial addr, send
+// hello and wait until the server closes the connection.
+func runClients(b *testing.B, addr string, hello []byte) {
 	b.ReportAllocs()
 	b.SetParallelism(4)
 	b.RunParallel(func(pb *testing.PB) {
 		buf := make([]byte, 1)
 		for pb.Next() {
-			c, err := net.Dial("tcp", ln.Addr().String())
+			c, err := net.Dial("tcp", addr)
 			if err != nil {
 				b.Error(err)
 				return
@@ -292,21 +298,7 @@ func BenchmarkDelivery(b *testing.B) {
 				}()
 			}
 			go func() { _ = m.Serve(ln) }()
-			b.ReportAllocs()
-			b.SetParallelism(4)
-			b.RunParallel(func(pb *testing.PB) {
-				buf := make([]byte, 1)
-				for pb.Next() {
-					c, err := net.Dial("tcp", ln.Addr().String())
-					if err != nil {
-						b.Error(err)
-						return
-					}
-					_, _ = c.Write(hello)
-					_, _ = c.Read(buf) // returns when the server closes
-					_ = c.Close()
-				}
-			})
+			runClients(b, ln.Addr().String(), hello)
 		})
 	}
 }

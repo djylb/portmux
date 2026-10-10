@@ -20,6 +20,29 @@ func outcome(err error) string {
 	return err.Error()
 }
 
+// scanInPieces checks that what parse decides on a prefix of data holds for
+// all of it, and that scan, fed data in pieces of step%32+1 bytes, comes to
+// the same outcome as parse does at once. It returns both requests and the
+// error of parse.
+func scanInPieces(t *testing.T, data []byte, step uint8, parse, scan func([]byte) (*Request, error)) (want, got *Request, wantErr error) {
+	t.Helper()
+	want, wantErr = parse(data)
+	for i := range len(data) {
+		if _, err := parse(data[:i]); outcome(err) != "incomplete" && outcome(err) != outcome(wantErr) {
+			t.Fatalf("prefix of %d bytes: %v, whole: %v", i, err, wantErr)
+		}
+	}
+	err := io.ErrUnexpectedEOF
+	for n := 0; outcome(err) == "incomplete" && n < len(data); {
+		n = min(n+int(step%32)+1, len(data))
+		got, err = scan(data[:n])
+	}
+	if outcome(err) != outcome(wantErr) {
+		t.Fatalf("pieces of %d: %v, at once: %v", step%32+1, err, wantErr)
+	}
+	return want, got, wantErr
+}
+
 func TestParse(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -160,22 +183,8 @@ func FuzzParse(f *testing.F) {
 	f.Add([]byte("GET /%41 HTTP/1.1\r\nX: a\r\n folded\r\nHost:  h \r\n\r\n"), uint8(1))
 	f.Add([]byte(HTTP2Preface), uint8(5))
 	f.Fuzz(func(t *testing.T, data []byte, step uint8) {
-		want, wantErr := Parse(data)
-		for i := range len(data) {
-			if _, err := Parse(data[:i]); outcome(err) != "incomplete" && outcome(err) != outcome(wantErr) {
-				t.Fatalf("prefix of %d bytes: %v, whole: %v", i, err, wantErr)
-			}
-		}
 		var s Scanner
-		var got *Request
-		err := io.ErrUnexpectedEOF
-		for n := 0; outcome(err) == "incomplete" && n < len(data); {
-			n = min(n+int(step%32)+1, len(data))
-			got, err = s.Scan(data[:n])
-		}
-		if outcome(err) != outcome(wantErr) {
-			t.Fatalf("pieces of %d: %v, at once: %v", step%32+1, err, wantErr)
-		}
+		want, got, wantErr := scanInPieces(t, data, step, Parse, s.Scan)
 		if wantErr == nil && (got.Method != want.Method || got.Host != want.Host || got.Path != want.Path ||
 			got.RequestURI != want.RequestURI || got.fields != want.fields) {
 			t.Fatalf("pieces: %+v, at once: %+v", got, want)

@@ -63,7 +63,7 @@ func TestInputCachesParses(t *testing.T) {
 	}
 	in.data = append(data, "\r\n"...)
 	req, res := in.HTTPRequest()
-	if res != Match || req.Host != "h" {
+	if res != Match || req == nil || req.Host != "h" {
 		t.Fatalf("complete = %+v, %v", req, res)
 	}
 	again, _ := in.HTTPRequest()

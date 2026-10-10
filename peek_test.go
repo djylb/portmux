@@ -156,7 +156,7 @@ func TestNewInputParsesIncrementally(t *testing.T) {
 		t.Fatalf("complete head: %v", got)
 	}
 	req, res := in.HTTPRequest()
-	if res != Match || req.Path != "/a" || in.RemoteAddr() != remote {
+	if res != Match || req == nil || req.Path != "/a" || in.RemoteAddr() != remote {
 		t.Fatalf("request %+v %v", req, res)
 	}
 	// Shorter bytes start the parses over.

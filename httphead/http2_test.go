@@ -2,7 +2,6 @@ package httphead
 
 import (
 	"encoding/hex"
-	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -82,6 +81,7 @@ func TestHPACKInvalid(t *testing.T) {
 	}
 }
 
+//goland:noinspection HttpUrlsUsage
 func TestParseHTTP2(t *testing.T) {
 	req, _ := http.NewRequest("POST", "http://API.example.com:8080/svc/../v1/Method?x=1", nil)
 	req.Header.Set("Content-Type", "application/grpc")
@@ -119,28 +119,16 @@ func TestParseHTTP2(t *testing.T) {
 
 // FuzzParseHTTP2 checks that a decision made on a prefix never changes and
 // that a scanner fed in pieces agrees with ParseHTTP2.
+//
+//goland:noinspection HttpUrlsUsage
 func FuzzParseHTTP2(f *testing.F) {
 	req, _ := http.NewRequest("GET", "http://www.example.com/a?b=c", nil)
 	req.Header.Set("Content-Type", "application/grpc")
 	f.Add(testutil.H2CBytes(f, req), uint8(3))
 	f.Add([]byte(HTTP2Preface+"\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x0d\x01\x05\x00\x00\x00\x01\x82\x86\x84\x41\x8c\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff"), uint8(1))
 	f.Fuzz(func(t *testing.T, data []byte, step uint8) {
-		want, wantErr := ParseHTTP2(data)
-		for i := range len(data) {
-			if _, err := ParseHTTP2(data[:i]); outcome(err) != "incomplete" && outcome(err) != outcome(wantErr) {
-				t.Fatalf("prefix of %d bytes: %v, whole: %v", i, err, wantErr)
-			}
-		}
 		var s HTTP2Scanner
-		var got *Request
-		err := io.ErrUnexpectedEOF
-		for n := 0; outcome(err) == "incomplete" && n < len(data); {
-			n = min(n+int(step%32)+1, len(data))
-			got, err = s.Scan(data[:n])
-		}
-		if outcome(err) != outcome(wantErr) {
-			t.Fatalf("pieces: %v, at once: %v", err, wantErr)
-		}
+		want, got, wantErr := scanInPieces(t, data, step, ParseHTTP2, s.Scan)
 		if wantErr == nil && (got.Method != want.Method || got.Host != want.Host || got.Path != want.Path || got.fields != want.fields) {
 			t.Fatalf("pieces: %+v, at once: %+v", got, want)
 		}

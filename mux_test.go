@@ -114,6 +114,7 @@ func httpServer(t *testing.T, l net.Listener, name string) {
 	t.Cleanup(func() { _ = srv.Close() })
 }
 
+//goland:noinspection HttpUrlsUsage
 func TestHTTPServersOnRoutes(t *testing.T) {
 	m := startMux(t)
 	httpServer(t, m.Match(HTTP1(Host("api.example.com"), PathPrefix("/v1/"))), "api")

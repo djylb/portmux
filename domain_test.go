@@ -44,14 +44,14 @@ func (d *domainTable) lookup(name string) *Route {
 // domain would be.
 func (d *domainTable) resolve(in *Input) (*Route, Result) {
 	hello, tlsRes := in.ClientHello()
-	if tlsRes == Match {
+	if tlsRes == Match && hello != nil {
 		if r := d.lookup(hello.ServerName); r != nil {
 			return r, Match
 		}
 		return nil, NoMatch
 	}
 	req, httpRes := in.HTTPRequest()
-	if httpRes == Match {
+	if httpRes == Match && req != nil {
 		if r := d.lookup(hostmatch.SplitHost(req.Host)); r != nil {
 			return r, Match
 		}
@@ -403,6 +403,7 @@ func TestResolveHosts(t *testing.T) {
 	}
 }
 
+//goland:noinspection HttpUrlsUsage
 func TestDomainMatchesH2C(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://www.example.com/", nil)
 	data := testutil.H2CBytes(t, req)
