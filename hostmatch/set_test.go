@@ -93,6 +93,17 @@ func TestNameValidation(t *testing.T) {
 	if n := Normalize("WWW.Example.COM."); !n.Valid() || n.String() != "www.example.com" {
 		t.Fatalf("Normalize = %q, %v", n, n.Valid())
 	}
+	// A Host value without a name is not the empty name of a request without
+	// a Host.
+	empty := NewSet("", "*")
+	for _, host := range []string{":80", "[]", "[]:443", "."} {
+		if n := NormalizeHost(host); n.Valid() || empty.MatchName(n) {
+			t.Errorf("NormalizeHost(%q) = %q, valid %v", host, n, n.Valid())
+		}
+	}
+	if !empty.MatchName(NormalizeHost("")) || NormalizeHost("[::1]:443").String() != "::1" || NormalizeHost("A.example:8080").String() != "a.example" {
+		t.Error("NormalizeHost of a valid host")
+	}
 	if s := NewSet("*.example.com", ""); s.String() != `Set("*.example.com", "")` || len(s.Patterns()) != 2 {
 		t.Fatalf("String = %s", s)
 	}

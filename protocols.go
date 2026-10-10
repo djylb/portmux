@@ -205,12 +205,25 @@ func matchIf(ok bool) Result {
 // XMPP matches XMPP clients and servers by the stream header they open with,
 // an optional XML declaration and a stream:stream element in the jabber:client
 // or jabber:server namespace, or that of a component. It decides once the
-// stream element is complete.
+// stream element is complete, and rules out a stream header longer than 2 KiB.
 func XMPP() Matcher {
 	return binaryMatcher{name: "XMPP", match: matchXMPP}
 }
 
+// maxXMPPHeader bounds the declaration and stream element that XMPP looks at,
+// so that a header sent a byte at a time is not scanned again at length on
+// every read.
+const maxXMPPHeader = 2 << 10
+
 func matchXMPP(b []byte) Result {
+	res := matchXMPPHeader(b[:min(len(b), maxXMPPHeader)])
+	if res == NeedMore && len(b) >= maxXMPPHeader {
+		return NoMatch
+	}
+	return res
+}
+
+func matchXMPPHeader(b []byte) Result {
 	const decl, stream = "<?xml", "<stream:stream"
 	switch {
 	case len(b) == 0:

@@ -52,7 +52,7 @@ func (r *Request) Name() hostmatch.Name {
 	if r.prepared {
 		return r.name
 	}
-	return hostmatch.Normalize(hostmatch.SplitHost(r.Host))
+	return hostmatch.NormalizeHost(r.Host)
 }
 
 // Query returns the parameters of the target's query string. The map is
@@ -337,7 +337,7 @@ func (r *Request) finish() bool {
 		}
 		r.Path = cleanPath(u.Path)
 	}
-	r.name, r.prepared = hostmatch.Normalize(hostmatch.SplitHost(r.Host)), true
+	r.name, r.prepared = hostmatch.NormalizeHost(r.Host), true
 	return true
 }
 

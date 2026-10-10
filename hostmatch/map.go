@@ -30,7 +30,8 @@ import (
 // A Map is safe for concurrent use, and its zero value is an empty map
 // ready to use. Lookups take no lock; exact names and "*." patterns cost a few
 // map lookups whatever their number, while the other patterns with '*' are
-// tried one by one. Patterns can be set and deleted while lookups run.
+// tried one by one, and setting or deleting one of those copies them.
+// Patterns can be set and deleted while lookups run.
 type Map[V any] struct {
 	exact    sync.Map // name -> *hostEntry[V]
 	suffixes sync.Map // ".example.com" -> *hostEntry[V], for "*.example.com"

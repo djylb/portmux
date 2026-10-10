@@ -347,6 +347,7 @@ func TestRequestedName(t *testing.T) {
 		string(testutil.HelloRecord(nil)):                {"", Match},
 		"GET / HTTP/1.1\r\nHost: H.example:8080\r\n\r\n": {"h.example", Match},
 		"GET / HTTP/1.1\r\nHost: a@b\r\n\r\n":            {"", NoMatch},
+		"GET / HTTP/1.1\r\nHost: :80\r\n\r\n":            {"", NoMatch}, // not a request without a Host
 		"GET / HTTP/1.1\r\n":                             {"", NeedMore},
 		"SSH-2.0-x\r\n":                                  {"", NoMatch},
 	} {

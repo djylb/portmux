@@ -3,6 +3,7 @@ package portmux
 import (
 	"encoding/binary"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -132,6 +133,8 @@ func TestXMPP(t *testing.T) {
 	matchAll(t, m, []byte(other), len(other), NoMatch)
 	matchAll(t, m, []byte("<?xml version='1.0'?><html>"), len("<?xml version='1.0'?><h"), NoMatch)
 	matchAll(t, m, []byte("<html>"), 2, NoMatch)
+	long := "<stream:stream xmlns='jabber:client' to='" + strings.Repeat("a", maxXMPPHeader) + "'>"
+	matchAll(t, m, []byte(long), maxXMPPHeader, NoMatch)
 	matchAll(t, m, []byte("GET"), 1, NoMatch)
 }
 

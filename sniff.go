@@ -217,7 +217,8 @@ const maxProxyHeaderLen = 16 + 0xffff
 // proxyproto.ErrNoHeader, an invalid one with an error wrapping
 // proxyproto.ErrMalformed, and one cut short with io.ErrUnexpectedEOF. An
 // optional header is taken to be missing when the client stays silent until
-// a silence check of the routes in tables, which match then decides on.
+// a silence check of the routes in tables or the sniff deadline, which match
+// then decides on.
 func (s *sniffer) readProxyHeader(policy func(entry string, peer, local net.Addr) proxyproto.Policy, tables *atomic.Pointer[table]) error {
 	defer func() {
 		c := s.conn
@@ -252,7 +253,7 @@ func (s *sniffer) readProxyHeader(policy func(entry string, peer, local net.Addr
 			return err
 		}
 		if s.err != nil {
-			if rs != nil && s.silenceDue() {
+			if rs != nil && isTimeout(s.err) && len(s.buf) == 0 {
 				return nil // a client that waits for the server
 			}
 			if errors.Is(s.err, io.EOF) && len(s.buf) > 0 {

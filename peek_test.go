@@ -138,6 +138,14 @@ func TestPeekProxyHeaderAndSilence(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < 25*time.Millisecond {
 		t.Fatalf("decided after %v", elapsed)
 	}
+
+	// A client that waits for the server sends no optional header, also to
+	// a matcher that decides without bytes.
+	_, silent = pair(t)
+	optional := WithProxyProtocol(func(_ string, _, _ net.Addr) proxyproto.Policy { return proxyproto.Optional })
+	if conn, err := Peek(silent, Always(), optional, WithSniffTimeout(30*time.Millisecond)); err != nil || conn.ProxyHeader() != nil {
+		t.Fatalf("Peek with an optional header on a silent client = %v", err)
+	}
 }
 
 func TestNewInputParsesIncrementally(t *testing.T) {

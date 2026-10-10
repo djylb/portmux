@@ -213,7 +213,10 @@ func WithObserver(fn func(Event)) Option {
 // entry. A missing required header is reported with proxyproto.ErrNoHeader,
 // an invalid one with an error wrapping proxyproto.ErrMalformed. An optional
 // header is taken to be missing when the client sends nothing until a Silent
-// check, so that Silent routes still take clients that wait for the server.
+// check or the sniff timeout, so that Silent routes, and routes that decide
+// without bytes such as those with Always, still take clients that wait for
+// the server; the latter only at the sniff timeout, so give their entries a
+// policy of Required or Ignore.
 //
 // Use this option rather than a proxyproto.Listener in front of the Mux: the
 // header is then read within the sniff timeout and the pending limits, and
