@@ -5,7 +5,7 @@ connection — HTTP/1, h2c, TLS (SNI/ALPN/JA4), PROXY protocol, SSH, SOCKS,
 databases and custom prefixes — and routing them to separate `net.Listener`s
 or handlers. Routes, limits and options change while serving.
 
-Requires Go 1.25. Besides the standard library it uses only
+Requires Go 1.26. Besides the standard library it uses only
 [netx](https://github.com/djylb/netx) for PROXY protocol headers.
 
 ## Install

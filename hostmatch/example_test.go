@@ -2,6 +2,7 @@ package hostmatch_test
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/djylb/portmux/hostmatch"
 )
@@ -42,12 +43,7 @@ func ExampleMap_LookupFunc() {
 	sites.Set("*.example.com", []string{"/", "/static"})
 	serves := func(path string) func(string, []string) bool {
 		return func(_ string, paths []string) bool {
-			for _, p := range paths {
-				if p == path {
-					return true
-				}
-			}
-			return false
+			return slices.Contains(paths, path)
 		}
 	}
 	_, pattern, _ := sites.LookupFunc("www.example.com", serves("/api"))

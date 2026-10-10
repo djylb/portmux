@@ -165,7 +165,7 @@ func FuzzMap(f *testing.F) {
 	f.Fuzz(func(t *testing.T, patterns, host string) {
 		var m Map[string]
 		set := map[string]string{} // normalized pattern -> the last one set
-		for _, p := range strings.Split(patterns, "|") {
+		for p := range strings.SplitSeq(patterns, "|") {
 			m.Set(p, p)
 			set[parseHostPattern(p).String()] = p
 		}

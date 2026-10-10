@@ -1,5 +1,5 @@
 module github.com/djylb/portmux
 
-go 1.25
+go 1.26
 
-require github.com/djylb/netx v0.0.0-20261009181515-033d4841db7f
+require github.com/djylb/netx v0.0.0-20261009210723-2cf4cc2d39fb

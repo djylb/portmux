@@ -222,11 +222,11 @@ func matchXMPP(b []byte) Result {
 		return res
 	}
 	if bytes.HasPrefix(b, []byte(decl)) {
-		end := bytes.Index(b, []byte("?>"))
-		if end < 0 {
+		_, after, ok := bytes.Cut(b, []byte("?>"))
+		if !ok {
 			return NeedMore
 		}
-		rest = bytes.TrimLeft(b[end+2:], " \t\r\n")
+		rest = bytes.TrimLeft(after, " \t\r\n")
 		if res := matchPrefixes(rest, []string{stream}); res != Match {
 			return res
 		}
