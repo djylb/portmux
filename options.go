@@ -211,7 +211,9 @@ func WithObserver(fn func(Event)) Option {
 // header is removed from the stream before matching, and its addresses
 // replace those of the delivered Conn. Peek calls the policy with the empty
 // entry. A missing required header is reported with proxyproto.ErrNoHeader,
-// an invalid one with an error wrapping proxyproto.ErrMalformed.
+// an invalid one with an error wrapping proxyproto.ErrMalformed. An optional
+// header is taken to be missing when the client sends nothing until a Silent
+// check, so that Silent routes still take clients that wait for the server.
 //
 // Use this option rather than a proxyproto.Listener in front of the Mux: the
 // header is then read within the sniff timeout and the pending limits, and

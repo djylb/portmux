@@ -81,10 +81,10 @@ type arrival struct {
 }
 
 // serveConn matches c and delivers it. Connections from Serve come with their
-// listener, which counts them, and their admission; they are reported to the
-// error handler and may be evicted while undecided. For a route with a
-// handler, serveConn returns the handler instead of calling it, so that the
-// connection no longer counts as pending while the handler runs.
+// listener, which counts them, and their admission; they may be evicted while
+// undecided. For a route with a handler, serveConn returns the handler instead
+// of calling it, so that the connection no longer counts as pending while the
+// handler runs.
 func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at arrival) (handler func(*Conn), conn *Conn, err error) {
 	stripe := at.stripe
 	conn = &Conn{conn: c, entry: entry, stripe: stripe}
@@ -144,7 +144,7 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 	if m.closed.Load() {
 		return nil, conn, net.ErrClosed
 	}
-	if err = s.readProxyHeader(s.opts.proxyPolicy); err != nil {
+	if err = s.readProxyHeader(s.opts.proxyPolicy, &m.table); err != nil {
 		return nil, conn, err
 	}
 	for {
@@ -166,7 +166,10 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 			continue // removed while matching: match against the new routes
 		}
 		s.handOver(r)
-		m.undelivered.decided(s)
+		// A decided connection leaves the pending set, so that Close does not
+		// close it once it is delivered; until then Close reaches it through
+		// the done channel of its route.
+		m.undelivered.remove(s)
 		if s.evicted.Load() {
 			// Evicted while the last bytes were matched: the connection is
 			// already closed.
@@ -197,6 +200,11 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 		if !errors.Is(err, errRouteGone) {
 			return nil, conn, err
 		}
+		// Matched again, it may read again, which Close must interrupt.
+		m.undelivered.add(s, false)
+		if m.closed.Load() {
+			return nil, conn, net.ErrClosed
+		}
 	}
 }
 
@@ -207,8 +215,10 @@ const maxProxyHeaderLen = 16 + 0xffff
 // readProxyHeader reads a PROXY header when policy expects one, then sets
 // the addresses that matchers see. A missing header is reported with
 // proxyproto.ErrNoHeader, an invalid one with an error wrapping
-// proxyproto.ErrMalformed, and one cut short with io.ErrUnexpectedEOF.
-func (s *sniffer) readProxyHeader(policy func(entry string, peer, local net.Addr) proxyproto.Policy) error {
+// proxyproto.ErrMalformed, and one cut short with io.ErrUnexpectedEOF. An
+// optional header is taken to be missing when the client stays silent until
+// a silence check of the routes in tables, which match then decides on.
+func (s *sniffer) readProxyHeader(policy func(entry string, peer, local net.Addr) proxyproto.Policy, tables *atomic.Pointer[table]) error {
 	defer func() {
 		c := s.conn
 		s.in.remote, s.in.local, s.in.proxy = c.RemoteAddr(), c.LocalAddr(), c.proxy
@@ -221,6 +231,11 @@ func (s *sniffer) readProxyHeader(policy func(entry string, peer, local net.Addr
 	mode := policy(s.in.entry, c.RemoteAddr(), c.LocalAddr())
 	if mode == proxyproto.Ignore {
 		return nil
+	}
+	var rs *ruleSet
+	if mode == proxyproto.Optional {
+		s.useTable(tables.Load())
+		rs = s.rules
 	}
 	for {
 		h, n, err := proxyproto.Parse(s.buf)
@@ -237,12 +252,15 @@ func (s *sniffer) readProxyHeader(policy func(entry string, peer, local net.Addr
 			return err
 		}
 		if s.err != nil {
+			if rs != nil && s.silenceDue() {
+				return nil // a client that waits for the server
+			}
 			if errors.Is(s.err, io.EOF) && len(s.buf) > 0 {
 				return io.ErrUnexpectedEOF
 			}
 			return s.readErr()
 		}
-		s.read(maxProxyHeaderLen, nil)
+		s.read(maxProxyHeaderLen, rs)
 	}
 }
 

@@ -29,10 +29,10 @@ func Peek(c net.Conn, m Matcher, opts ...Option) (*Conn, error) {
 	conn := &Conn{conn: c}
 	s := newSniffer(conn, &o, time.Now())
 	defer s.release()
-	err := s.readProxyHeader(o.proxyPolicy)
+	var tables atomic.Pointer[table]
+	tables.Store(newTable(routeSet{routes: map[*Route]routeState{{}: {matchers: []Matcher{m}}}}))
+	err := s.readProxyHeader(o.proxyPolicy, &tables)
 	if err == nil {
-		var tables atomic.Pointer[table]
-		tables.Store(newTable(routeSet{routes: map[*Route]routeState{{}: {matchers: []Matcher{m}}}}))
 		_, err = s.match(&tables, o.maxSniffBytes)
 	}
 	s.handOver(nil)

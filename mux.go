@@ -282,10 +282,10 @@ func (m *Mux) serveAccepted(c net.Conn, a admission, l *listener, at arrival) {
 // ServeConn matches c and hands it to a route, in the calling goroutine. It
 // returns nil once a route accepted c; for a route with a handler, it calls
 // the handler and returns when the handler returns. Otherwise it closes c and
-// returns the reason, which is not passed to the error handler. Connections
-// passed to ServeConn do not count against the pending limits. The sniff
-// timeout and silence checks rely on c supporting read deadlines. c belongs
-// to the entry with the empty name; Entry routes connections of other
+// returns the reason, which the observer of WithObserver also receives.
+// Connections passed to ServeConn do not count against the pending limits.
+// The sniff timeout and silence checks rely on c supporting read deadlines. c
+// belongs to the entry with the empty name; Entry routes connections of other
 // entries.
 func (m *Mux) ServeConn(c net.Conn) error {
 	return m.serveOne("", c)

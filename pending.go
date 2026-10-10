@@ -7,11 +7,12 @@ import (
 // pendingShards is the number of independently locked parts of a pendingSet.
 const pendingShards = 16
 
-// pendingSet tracks every undelivered connection, so that Close can close
-// them. Undecided connections from Serve are kept in accept order, so that the
-// oldest one can be evicted when the pending limit is reached. A connection
-// is kept in the shard of its counter stripe, so connections handled at once
-// rarely share a lock.
+// pendingSet tracks every connection being matched, so that Close can close
+// them; a matched connection leaves it, and Close reaches it through its
+// route until it is delivered. Undecided connections from Serve are kept in
+// accept order, so that the oldest one can be evicted when the pending limit
+// is reached. A connection is kept in the shard of its counter stripe, so
+// connections handled at once rarely share a lock.
 type pendingSet struct {
 	shards [pendingShards]pendingShard
 }
@@ -19,7 +20,7 @@ type pendingSet struct {
 type pendingShard struct {
 	mu   sync.Mutex
 	idle sniffList // undecided connections from Serve, oldest first
-	busy sniffList // every other undelivered connection
+	busy sniffList // the other connections being matched
 }
 
 // sniffList is an intrusive doubly linked list of sniffers.
@@ -81,17 +82,6 @@ func (p *pendingSet) add(s *sniffer, evictable bool) {
 	if evictable {
 		sh.idle.insert(s)
 	} else {
-		sh.busy.push(s)
-	}
-	sh.mu.Unlock()
-}
-
-// decided marks s as matched, which protects it from eviction.
-func (p *pendingSet) decided(s *sniffer) {
-	sh := p.shard(s)
-	sh.mu.Lock()
-	if s.list == &sh.idle {
-		sh.idle.remove(s)
 		sh.busy.push(s)
 	}
 	sh.mu.Unlock()

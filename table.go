@@ -82,12 +82,17 @@ type rule struct {
 }
 
 // add appends a route, added in matching order. The first fallback route is
-// the one in use.
+// the one in use. A route without matchers or a resolver matches nothing and
+// is only reached through resolvers, so it is left out: connections do not
+// try every target of a resolver.
 func (rs *ruleSet) add(r *Route, matchers []Matcher, silences []time.Duration) {
 	if r.fallback {
 		if rs.fallback == nil {
 			rs.fallback = r
 		}
+		return
+	}
+	if len(matchers) == 0 && r.resolve == nil {
 		return
 	}
 	rs.rules = append(rs.rules, rule{route: r, matchers: matchers})

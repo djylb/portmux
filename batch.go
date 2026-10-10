@@ -286,18 +286,30 @@ func (m *Mux) apply(ops []func(*routeSet) error) ([]*Route, bool, error) {
 // sorted returns the routes in matching order: by priority, highest first,
 // then in the order they were added, with fallback routes last.
 func (s *routeSet) sorted() []*Route {
-	routes := slices.Collect(maps.Keys(s.routes))
-	slices.SortFunc(routes, func(a, b *Route) int {
-		if a.fallback != b.fallback {
-			if a.fallback {
+	// The priorities are copied out, so that comparisons look nothing up.
+	type ranked struct {
+		r        *Route
+		priority int
+	}
+	list := make([]ranked, 0, len(s.routes))
+	for r, st := range s.routes {
+		list = append(list, ranked{r, st.priority})
+	}
+	slices.SortFunc(list, func(a, b ranked) int {
+		if a.r.fallback != b.r.fallback {
+			if a.r.fallback {
 				return 1
 			}
 			return -1
 		}
-		if c := cmp.Compare(s.routes[b].priority, s.routes[a].priority); c != 0 {
+		if c := cmp.Compare(b.priority, a.priority); c != 0 {
 			return c
 		}
-		return cmp.Compare(a.seq, b.seq)
+		return cmp.Compare(a.r.seq, b.r.seq)
 	})
+	routes := make([]*Route, len(list))
+	for i, e := range list {
+		routes[i] = e.r
+	}
 	return routes
 }

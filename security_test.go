@@ -99,7 +99,7 @@ func TestEvictionSparesMatchedConnections(t *testing.T) {
 		sniffers[i] = &sniffer{conn: &Conn{conn: conns[i]}}
 		p.add(sniffers[i], i != 2) // the last one came from ServeConn
 	}
-	p.decided(sniffers[0])
+	p.remove(sniffers[0]) // matched connections leave the set
 	if !p.evictOldest() {
 		t.Fatal("nothing evicted")
 	}

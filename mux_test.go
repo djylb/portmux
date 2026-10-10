@@ -617,6 +617,7 @@ func TestProxyProtocolOptionalAndNone(t *testing.T) {
 	}))
 	proxyLine := m.Match(Prefix("PROXY "))
 	bridge := m.Match(Prefix("TST"))
+	silent := m.Match(Silent(20 * time.Millisecond))
 	serve(t, m)
 	setMode := func(v proxyproto.Policy) {
 		mu.Lock()
@@ -635,6 +636,13 @@ func TestProxyProtocolOptionalAndNone(t *testing.T) {
 	_, _ = c.Write(append(v2, "TST"...))
 	if got := accept(t, bridge); got.RemoteAddr().String() != "192.0.2.1:40000" {
 		t.Fatalf("RemoteAddr = %v", got.RemoteAddr())
+	}
+	// A client that waits for the server sends no header either, and goes
+	// to the silent route rather than waiting for one until the sniff
+	// timeout.
+	dial(t, m)
+	if got := accept(t, silent); got.ProxyHeader() != nil {
+		t.Fatal("header from a silent client")
 	}
 
 	setMode(proxyproto.Ignore)
