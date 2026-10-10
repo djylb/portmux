@@ -306,6 +306,7 @@ func TestResolveDomain(t *testing.T) {
 
 	for data, want := range map[string]string{
 		request("www.example.com:8080"): "site",
+		request("www.example.com.."):    "rest", // one trailing dot is ignored, as by Domain
 		request("a.b.example.com"):      "wild",
 		request("self.example.com"):     "domains",
 		request("example.org"):          "rest",

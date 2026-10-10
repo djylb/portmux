@@ -30,6 +30,17 @@ func TestJA4(t *testing.T) {
 	if got := JA4(noSchemes); got != "t13d1516h2_8daaf6152771_6d807ffa2a79" {
 		t.Fatalf("JA4 without signature algorithms = %s", got)
 	}
+	// GREASE signature algorithms are ignored, as GREASE values are
+	// everywhere else.
+	greased := *h
+	greased.SignatureSchemes = append([]uint16{0x2a2a}, h.SignatureSchemes...)
+	if got := JA4(&greased); got != want {
+		t.Fatalf("JA4 with a GREASE signature algorithm = %s, want %s", got, want)
+	}
+	greased.SignatureSchemes = []uint16{0x3a3a}
+	if got := JA4(&greased); got != JA4(noSchemes) {
+		t.Fatalf("JA4 with only GREASE signature algorithms = %s, want %s", got, JA4(noSchemes))
+	}
 	tests := []struct {
 		name string
 		h    *tlshello.Hello

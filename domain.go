@@ -82,7 +82,7 @@ func ResolveHosts[V any](hosts *hostmatch.Map[V], pick func(in *Input, pattern s
 			return nil, res
 		}
 		var target *Route
-		_, _, found := hosts.LookupFunc(n.String(), func(pattern string, v V) bool {
+		_, _, found := hosts.LookupNameFunc(n, func(pattern string, v V) bool {
 			var ok bool
 			target, ok = pick(in, pattern, v)
 			return ok

@@ -28,14 +28,18 @@ import (
 // bytes that no DNS name has match no pattern.
 //
 // A Map is safe for concurrent use, and its zero value is an empty map
-// ready to use. Lookups take no lock and cost a few map lookups whatever the
-// number of patterns, and patterns can be set and deleted while lookups run.
+// ready to use. Lookups take no lock; exact names and "*." patterns cost a few
+// map lookups whatever their number, while the other patterns with '*' are
+// tried one by one. Patterns can be set and deleted while lookups run.
 type Map[V any] struct {
 	exact    sync.Map // name -> *hostEntry[V]
 	suffixes sync.Map // ".example.com" -> *hostEntry[V], for "*.example.com"
-	mu       sync.Mutex
-	rest     atomic.Pointer[hostRest[V]] // the other patterns, replaced on change
-	n        atomic.Int64
+	// longest is the length of the longest suffix ever set, so that a lookup
+	// tries only the dots at which a suffix can start, however long the name.
+	longest atomic.Int64
+	mu      sync.Mutex
+	rest    atomic.Pointer[hostRest[V]] // the other patterns, replaced on change
+	n       atomic.Int64
 }
 
 // hostEntry is a pattern, as it compares, and its value.
@@ -104,6 +108,13 @@ func (m *Map[V]) Set(pattern string, v V) {
 			m.n.Add(1)
 		}
 	case patternSuffix:
+		// Raised before the suffix is stored, so that lookups that find it
+		// also try its dot.
+		for n := int64(len(p.key)); ; {
+			if cur := m.longest.Load(); cur >= n || m.longest.CompareAndSwap(cur, n) {
+				break
+			}
+		}
 		if _, loaded := m.suffixes.Swap(p.key, e); !loaded {
 			m.n.Add(1)
 		}
@@ -224,7 +235,13 @@ func (m *Map[V]) Lookup(host string) (v V, pattern string, ok bool) {
 // Matches without allocating; accept must not call methods of m that change
 // it.
 func (m *Map[V]) LookupFunc(host string, accept func(pattern string, v V) bool) (v V, pattern string, ok bool) {
-	m.walk(Normalize(host), func(p string, x V) bool {
+	return m.LookupNameFunc(Normalize(host), accept)
+}
+
+// LookupNameFunc is LookupFunc for a prepared name, which it does not prepare
+// again.
+func (m *Map[V]) LookupNameFunc(n Name, accept func(pattern string, v V) bool) (v V, pattern string, ok bool) {
+	m.walk(n, func(p string, x V) bool {
 		if accept(p, x) {
 			v, pattern, ok = x, p, true
 			return false
@@ -265,9 +282,10 @@ func (m *Map[V]) walk(n Name, yield func(string, V) bool) {
 		globs = r.globs
 	}
 	// Suffixes come longest first, from the first dot on; a glob comes before
-	// a suffix with fewer literal characters than it has.
+	// a suffix with fewer literal characters than it has. Dots further from
+	// the end than the longest suffix start none.
 	g := 0
-	for i := 1; i < len(n.name); i++ {
+	for i := max(1, len(n.name)-int(m.longest.Load())); i < len(n.name); i++ {
 		if n.name[i] != '.' {
 			continue
 		}

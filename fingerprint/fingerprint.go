@@ -40,8 +40,8 @@ func JA4(h *tlshello.Hello) string {
 	c := "000000000000"
 	if len(exts) > 0 {
 		in := hexList(exts)
-		if len(h.SignatureSchemes) > 0 {
-			in += "_" + hexList(h.SignatureSchemes)
+		if schemes := withoutGREASE(h.SignatureSchemes); len(schemes) > 0 {
+			in += "_" + hexList(schemes)
 		}
 		c = ja4Hash(in)
 	}

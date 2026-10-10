@@ -100,6 +100,51 @@ func TestMapConcurrent(t *testing.T) {
 	}
 }
 
+// TestMapLongNames looks up names with many labels, whose dots are tried as
+// the start of a suffix only as far from the end as the longest suffix.
+func TestMapLongNames(t *testing.T) {
+	var m Map[int]
+	long := strings.Repeat("a.", 8000) + "x.example.com"
+	if _, _, ok := m.Lookup(long); ok {
+		t.Fatal("match in an empty map")
+	}
+	m.Set("*.example.com", 1)
+	m.Set("*.a.a.a.x.example.com", 2)
+	m.Set("a*.x.example.com", 3)
+	for _, tt := range []struct {
+		name string
+		want int
+	}{
+		{long, 2},
+		{"ab.x.example.com", 3},
+		{"b.x.example.com", 1},
+	} {
+		if v, _, ok := m.Lookup(tt.name); !ok || v != tt.want {
+			t.Errorf("Lookup(%.20q) = %d, %v, want %d", tt.name, v, ok, tt.want)
+		}
+	}
+	// Deleting the longest suffix keeps the shorter ones.
+	m.Delete("*.a.a.a.x.example.com")
+	if v, _, _ := m.Lookup(long); v != 3 {
+		t.Errorf("after Delete: %d", v)
+	}
+}
+
+// BenchmarkMapLookupLongName looks up a name as long as the sniff limit
+// allows, with many labels: the cost follows the longest suffix, not the
+// name.
+func BenchmarkMapLookupLongName(b *testing.B) {
+	var m Map[int]
+	m.Set("*.example.com", 1)
+	name := strings.Repeat("a.", 8<<10) + "example.com"
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, _, ok := m.Lookup(name); !ok {
+			b.Fatal("no match")
+		}
+	}
+}
+
 func BenchmarkMapLookup(b *testing.B) {
 	for _, n := range []int{10, 100000} {
 		b.Run(fmt.Sprint(n), func(b *testing.B) {
