@@ -419,3 +419,61 @@ func TestSniffLimitIsClamped(t *testing.T) {
 		t.Fatalf("maxSniffBytes = %d", got)
 	}
 }
+
+// closeCountingConn is a memConn that counts its Close calls.
+type closeCountingConn struct {
+	memConn
+	closed int
+}
+
+func (c *closeCountingConn) Close() error { c.closed++; return nil }
+
+// TestCloseStopsMatchedHandOver closes the Mux right after a connection was
+// matched and left the pending set: it is passed neither to its handler nor
+// to Accept but closed, so that nothing is handed over after Close.
+func TestCloseStopsMatchedHandOver(t *testing.T) {
+	for _, handler := range []bool{true, false} {
+		m := New()
+		handled := false
+		cfg := RouteConfig{Matchers: []Matcher{Always()}}
+		if handler {
+			cfg.Handler = func(c *Conn) {
+				handled = true
+				_ = c.Close()
+			}
+		}
+		r, err := m.Add(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted := make(chan error, 1)
+		if !handler {
+			go func() {
+				c, err := r.Accept()
+				if err == nil {
+					_ = c.Close()
+				}
+				accepted <- err
+			}()
+			for r.Info().Accepting == 0 {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		closeMux := func() { _ = m.Close() }
+		leftPending.Store(&closeMux)
+		c := &closeCountingConn{}
+		err = m.ServeConn(c)
+		leftPending.Store(nil)
+		if !errors.Is(err, net.ErrClosed) || handled || c.closed != 1 {
+			t.Fatalf("handler %v: ServeConn = %v, handled %v, closed %d times", handler, err, handled, c.closed)
+		}
+		if !handler {
+			if err := <-accepted; !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("Accept = %v", err)
+			}
+		}
+		if st := m.Stats(); st.Delivered != 0 || st.Open != 0 || st.Pending != 0 || st.Failed != 1 {
+			t.Fatalf("handler %v: stats %+v", handler, st)
+		}
+	}
+}

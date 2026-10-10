@@ -47,6 +47,10 @@ type sniffer struct {
 // read buffer.
 var bufferTaken atomic.Pointer[func()]
 
+// leftPending is called, when tests set it, each time a matched connection
+// leaves the pending set.
+var leftPending atomic.Pointer[func()]
+
 // maxEmptyReads is how many reads in a row may return neither bytes nor an
 // error before the connection is treated as broken, as in bufio.
 const maxEmptyReads = 100
@@ -167,13 +171,22 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 		}
 		s.handOver(r)
 		// A decided connection leaves the pending set, so that Close does not
-		// close it once it is delivered; until then Close reaches it through
-		// the done channel of its route.
+		// close it once it is delivered.
 		m.undelivered.remove(s)
+		if f := leftPending.Load(); f != nil {
+			(*f)()
+		}
 		if s.evicted.Load() {
 			// Evicted while the last bytes were matched: the connection is
 			// already closed.
 			return nil, conn, ErrEvicted
+		}
+		// A connection that Close no longer reaches through the pending set
+		// is not handed over once Close began, and the done channels of the
+		// routes stop one that waits for Accept. One handed over is
+		// delivered before Close began.
+		if m.closed.Load() {
+			return nil, conn, net.ErrClosed
 		}
 		r.matched.Add(1)
 		if s.via != nil && s.via != r {
