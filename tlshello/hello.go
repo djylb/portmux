@@ -228,6 +228,10 @@ func parseBody(body []byte) (*Hello, error) {
 	}
 	var typesBuf [32]uint16
 	types := typesBuf[:0]
+	// Duplicates are looked for in types while it fits typesBuf, and then in
+	// a set of every type, so that a hello with thousands of extensions costs
+	// time in proportion to its size.
+	var seen *[1 << 16 / 64]uint64
 	var groups, schemes, versions cursor
 	for len(exts) > 0 {
 		typ, ok := exts.u16()
@@ -235,7 +239,21 @@ func parseBody(body []byte) (*Hello, error) {
 			return nil, ErrInvalid
 		}
 		data, ok := exts.u16Prefixed()
-		if !ok || slices.Contains(types, typ) {
+		if !ok {
+			return nil, ErrInvalid
+		}
+		if seen == nil && len(types) == len(typesBuf) {
+			seen = new([1 << 16 / 64]uint64)
+			for _, t := range types {
+				seen[t/64] |= 1 << (t % 64)
+			}
+		}
+		if seen != nil {
+			if seen[typ/64]&(1<<(typ%64)) != 0 {
+				return nil, ErrInvalid
+			}
+			seen[typ/64] |= 1 << (typ % 64)
+		} else if slices.Contains(types, typ) {
 			return nil, ErrInvalid
 		}
 		types = append(types, typ)

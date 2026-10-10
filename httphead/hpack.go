@@ -36,6 +36,7 @@ func newHPACKDecoder() *hpackDecoder {
 // decode calls emit for each field of a header block.
 func (d *hpackDecoder) decode(block []byte, emit func(hpackField)) error {
 	listSize := 0
+	fields := false // whether a field came yet
 	for len(block) > 0 {
 		b := block[0]
 		var f hpackField
@@ -55,6 +56,9 @@ func (d *hpackDecoder) decode(block []byte, emit func(hpackField)) error {
 			}
 			d.add(f)
 		case b&0xe0 == 0x20: // dynamic table size update
+			if fields {
+				return errHPACK // only at the start of a block (RFC 7541, Section 4.2)
+			}
 			var n uint64
 			if n, block, err = hpackInt(block, 5); err != nil {
 				return err
@@ -73,6 +77,7 @@ func (d *hpackDecoder) decode(block []byte, emit func(hpackField)) error {
 		if listSize += len(f.name) + len(f.value) + 32; listSize > hpackMaxHeaderList {
 			return errHPACK
 		}
+		fields = true
 		emit(f)
 	}
 	return nil

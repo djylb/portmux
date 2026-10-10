@@ -101,7 +101,9 @@ func (s *HTTP2Scanner) Scan(data []byte) (*Request, error) {
 				return nil, ErrInvalid
 			}
 		case s.stream != 0:
-			if typ != frameContinuation || stream != s.stream {
+			// The fragments are bounded too, so that empty CONTINUATION
+			// frames cannot grow the block without end.
+			if typ != frameContinuation || stream != s.stream || len(s.block) >= 2*http2MaxFrames {
 				return nil, ErrInvalid
 			}
 			s.block = append(s.block, start, end)
@@ -154,9 +156,10 @@ func (s *HTTP2Scanner) request(data []byte) (*Request, error) {
 		if !ok {
 			return
 		}
-		// Fields cannot hide line breaks or NUL from the filters
+		// Fields cannot hide line breaks or NUL from the filters, nor
+		// differ only in case from the names that they compare with
 		// (RFC 9113, Section 8.2.1).
-		if f.name == "" || strings.ContainsAny(f.name, "\r\n\x00") || strings.ContainsAny(f.value, "\r\n\x00") {
+		if !validHTTP2Field(f) {
 			ok = false
 			return
 		}
@@ -196,6 +199,9 @@ func (s *HTTP2Scanner) request(data []byte) (*Request, error) {
 	switch {
 	case err != nil, !ok, hosts > 1, r.Method == "":
 		return nil, ErrInvalid
+	case authority != "" && hosts == 1 && !strings.EqualFold(authority, host):
+		// A server may take either for the host (RFC 9113, Section 8.3.1).
+		return nil, ErrInvalid
 	case r.Method == "CONNECT":
 		if r.RequestURI != "" || scheme != "" || authority == "" {
 			return nil, ErrInvalid
@@ -214,4 +220,26 @@ func (s *HTTP2Scanner) request(data []byte) (*Request, error) {
 		return nil, ErrInvalid
 	}
 	return r, nil
+}
+
+// validHTTP2Field reports whether a field has a name without uppercase
+// letters, spaces and other bytes that names do not have, after the colon of
+// a pseudo-header field, and a value without control characters other than
+// tabs, as RFC 9113 requires and net/http checks.
+func validHTTP2Field(f hpackField) bool {
+	name := strings.TrimPrefix(f.name, ":")
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c <= ' ' || 'A' <= c && c <= 'Z' || c >= 0x7f {
+			return false
+		}
+	}
+	for i := 0; i < len(f.value); i++ {
+		if c := f.value[i]; c < ' ' && c != '\t' || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }

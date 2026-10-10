@@ -245,8 +245,9 @@ func (s *Scanner) Scan(data []byte) (*Request, error) {
 }
 
 // field validates one header line and records the Host value. Obsolete line
-// folding is rejected, as RFC 9112 allows, so that a folded Host value cannot
-// mean one thing here and another to the server.
+// folding is rejected, as RFC 9112 allows, and so are control characters in
+// values, as net/http rejects them, so that a folded value or one with a bare
+// CR cannot mean one thing here and another to the server.
 func (s *Scanner) field(line []byte) bool {
 	colon := bytes.IndexByte(line, ':')
 	if colon <= 0 {
@@ -254,6 +255,11 @@ func (s *Scanner) field(line []byte) bool {
 	}
 	for _, c := range line[:colon] {
 		if !isTokenChar(c) {
+			return false
+		}
+	}
+	for _, c := range line[colon+1:] {
+		if c < ' ' && c != '\t' || c == 0x7f {
 			return false
 		}
 	}

@@ -457,16 +457,16 @@ reason. `Mux.Bans` lists the banned clients.
 
 ## Security
 
-| Threat                                              | Handling                                                                    |
-|-----------------------------------------------------|-----------------------------------------------------------------------------|
-| Scans, garbage, data too short and then silence     | Ruled out at the first impossible byte; sniff timeout; bans                 |
-| Floods of idle or slow connections                  | The pending limit, evicting the oldest undecided connection                 |
-| Floods from one client or from many                 | Rate and pending limits per client, rate limit per listener                 |
-| Heads in tiny pieces, many TLS records, HPACK bombs | Incremental parsing; bounded head and header sizes                          |
-| Ambiguous requests and names                        | Duplicate Host headers or SNI names, folded headers and names with `@` fail |
-| Spoofed client addresses                            | PROXY headers only from peers the policy trusts                             |
-| A stalled server on one route                       | Queue limit and dispatch timeout per route                                  |
-| Known scanner TLS libraries                         | A reject route with `TLS(fingerprint.MatchJA4(...))`                        |
+| Threat                                              | Handling                                                                                        |
+|-----------------------------------------------------|-------------------------------------------------------------------------------------------------|
+| Scans, garbage, data too short and then silence     | Ruled out at the first impossible byte; sniff timeout; bans                                     |
+| Floods of idle or slow connections                  | The pending limit, evicting the oldest undecided connection                                     |
+| Floods from one client or from many                 | Rate and pending limits per client, rate limit per listener                                     |
+| Heads in tiny pieces, many TLS records, HPACK bombs | Incremental parsing; bounded head and header sizes                                              |
+| Ambiguous requests and names                        | Duplicate Host headers or SNI names, folded headers, control characters and names with `@` fail |
+| Spoofed client addresses                            | PROXY headers only from peers the policy trusts                                                 |
+| A stalled server on one route                       | Queue limit and dispatch timeout per route                                                      |
+| Known scanner TLS libraries                         | A reject route with `TLS(fingerprint.MatchJA4(...))`                                            |
 
 portmux sees established TCP connections only: SYN floods are for the kernel,
 and delivered connections are the servers' to limit.

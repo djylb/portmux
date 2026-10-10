@@ -65,6 +65,7 @@ func TestHPACKInvalid(t *testing.T) {
 		"huffman eos":        "4081ff",
 		"table size too big": "3fe21f",
 		"bad padding":        "418100",
+		"late size update":   "8220",
 	} {
 		if err := newHPACKDecoder().decode(unhex(t, block), func(hpackField) {}); err == nil {
 			t.Errorf("%s: no error", name)
@@ -78,6 +79,10 @@ func TestHPACKInvalid(t *testing.T) {
 	}
 	if err := d.decode(unhex(t, strings.Repeat("be", 100)), func(hpackField) {}); err == nil {
 		t.Fatal("header list beyond the limit")
+	}
+	// Size updates come first in a block.
+	if err := newHPACKDecoder().decode(unhex(t, "203fe11f82"), func(hpackField) {}); err != nil {
+		t.Fatalf("size updates before a field: %v", err)
 	}
 }
 
@@ -173,6 +178,11 @@ func TestParseHTTP2Frames(t *testing.T) {
 	for range http2MaxFrames {
 		updates = append(updates, frame(0x8, 0, 0, []byte{0, 0, 0, 1}))
 	}
+	empty := [][]byte{frame(frameHeaders, 0, 1, get)}
+	for range 2 * http2MaxFrames {
+		empty = append(empty, frame(frameContinuation, 0, 1, nil))
+	}
+	empty = append(empty, frame(frameContinuation, flagEndHeaders, 1, nil))
 	tests := []struct {
 		name, want string
 		data       []byte
@@ -202,6 +212,13 @@ func TestParseHTTP2Frames(t *testing.T) {
 		{"colon in a name", "invalid", conn(headers(0, 1, block(get, lit("x:y", "1"))))},
 		{"two hosts", "invalid", conn(headers(0, 1, block(lit(":method", "GET"), lit(":scheme", "http"), lit(":path", "/"), lit("host", "a"), lit("host", "b"))))},
 		{"host header", "request", conn(headers(0, 1, block(lit(":method", "GET"), lit(":scheme", "http"), lit(":path", "/"), lit("host", "c.example"))))},
+		{"host as authority", "request", conn(headers(0, 1, block(get, lit("host", "A.example"))))},
+		{"host other than authority", "invalid", conn(headers(0, 1, block(get, lit("host", "admin.internal"))))},
+		{"uppercase name", "invalid", conn(headers(0, 1, block(get, lit("X-Kind", "1"))))},
+		{"uppercase host", "invalid", conn(headers(0, 1, block(lit(":method", "GET"), lit(":scheme", "http"), lit(":path", "/"), lit("host", "a"), lit("HOST", "b"))))},
+		{"control character in a value", "invalid", conn(headers(0, 1, block(get, lit("x", "a\x01"))))},
+		{"tab in a value", "request", conn(headers(0, 1, block(get, lit("x", "a\tb"))))},
+		{"endless continuation", "invalid", conn(empty...)},
 		{"bad hpack", "invalid", conn(headers(0, 1, []byte{0x80}))},
 	}
 	for _, tt := range tests {
