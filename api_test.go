@@ -216,6 +216,17 @@ func TestRemoteIPFunc(t *testing.T) {
 	if s := (RemoteIPFunc(func(netip.Addr) bool { return false })).(interface{ String() string }).String(); s != "RemoteIPFunc(...)" {
 		t.Fatalf("String = %q", s)
 	}
+
+	// LocalIPFunc looks at the address the client connected to.
+	var local atomic.Value
+	in := NewInput(nil, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443})
+	m2 := LocalIPFunc(func(a netip.Addr) bool { local.Store(a); return a == netip.MustParseAddr("192.0.2.1") })
+	if m2.Match(in) != Match || local.Load() != netip.MustParseAddr("192.0.2.1") {
+		t.Fatal("LocalIPFunc does not match the local address")
+	}
+	if m2.Match(NewInput(nil, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 2)})) != NoMatch {
+		t.Fatal("LocalIPFunc matched another address")
+	}
 }
 
 type parsedKey struct{}

@@ -118,7 +118,7 @@ const (
 	maxRuleRegexpSize = 1000
 )
 
-func (p *parser) fail(pos int, format string, args ...any) error {
+func (p *parser) fail(pos int, format string, args ...any) *ParseError {
 	return &ParseError{Text: p.text, Offset: pos, Msg: fmt.Sprintf(format, args...)}
 }
 
@@ -328,7 +328,7 @@ func custom[T any](p *parser, n *node, funcs map[string]func(args ...string) (T,
 	v, err := build(args...)
 	switch {
 	case err != nil:
-		e := p.fail(n.pos, "%s: %v", n.text, err).(*ParseError)
+		e := p.fail(n.pos, "%s: %v", n.text, err)
 		e.Err = err
 		return zero, e
 	case any(v) == nil:
@@ -563,6 +563,11 @@ func regexpSize(re *syntax.Regexp) int {
 			times = re.Min + 1
 		}
 		return min(max(times, 1)*regexpSize(re.Sub[0]), maxRuleRegexpSize+1)
+	case syntax.OpNoMatch, syntax.OpEmptyMatch, syntax.OpCharClass, syntax.OpAnyCharNotNL,
+		syntax.OpAnyChar, syntax.OpBeginLine, syntax.OpEndLine, syntax.OpBeginText,
+		syntax.OpEndText, syntax.OpWordBoundary, syntax.OpNoWordBoundary, syntax.OpCapture,
+		syntax.OpStar, syntax.OpPlus, syntax.OpQuest, syntax.OpConcat, syntax.OpAlternate:
+		// One instruction, and those of the subexpressions below.
 	}
 	for _, sub := range re.Sub {
 		if size += regexpSize(sub); size > maxRuleRegexpSize {
