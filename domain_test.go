@@ -72,7 +72,7 @@ func TestResolverRoutesByDomain(t *testing.T) {
 	tunnelA := mustAdd(t, m, RouteConfig{Name: "tunnel-a"})
 	tunnelB := mustAdd(t, m, RouteConfig{Name: "tunnel-b"})
 	blocked := mustAdd(t, m, RouteConfig{Name: "blocked", Reject: true})
-	web := m.Match(HTTP1())
+	web := m.Listen(HTTP1())
 	serve(t, m)
 	domains.set("a.example.com", tunnelA)
 	domains.set("b.example.com", tunnelB)
@@ -125,7 +125,7 @@ func TestResolverEdgeCases(t *testing.T) {
 	closed := mustAdd(t, m, RouteConfig{Name: "closed"})
 	_ = closed.Close()
 	other := New()
-	foreign := other.Match(Any())
+	foreign := other.Listen(AnyBytes())
 	self := mustAdd(t, m, RouteConfig{Resolve: func(in *Input) (*Route, Result) {
 		switch {
 		case len(in.Bytes()) < 4:
@@ -139,7 +139,7 @@ func TestResolverEdgeCases(t *testing.T) {
 		}
 		return nil, Result(42) // an unknown result counts as NoMatch
 	}})
-	rest := m.Match(Any())
+	rest := m.Listen(AnyBytes())
 	serve(t, m)
 
 	_, _ = dial(t, m).Write([]byte("SELF"))
@@ -169,7 +169,7 @@ func TestInputPeerAddr(t *testing.T) {
 	type addrs struct{ remote, peer string }
 	seen := make(chan addrs, 1)
 	m := startMux(t, WithProxyProtocol(func(_ string, _, _ net.Addr) proxyproto.Policy { return proxyproto.Required }))
-	target := m.Match()
+	target := m.Listen()
 	mustAdd(t, m, RouteConfig{Resolve: func(in *Input) (*Route, Result) {
 		select {
 		case seen <- addrs{in.RemoteAddr().String(), in.PeerAddr().String()}:
@@ -303,7 +303,7 @@ func TestResolveDomain(t *testing.T) {
 	}
 	site, _ := m.Add(RouteConfig{Name: "site"})
 	wild, _ := m.Add(RouteConfig{Name: "wild"})
-	rest := m.Match(Any())
+	rest := m.Listen(AnyBytes())
 	hosts.Set("www.example.com", site)
 	hosts.Set("*.example.com", wild)
 	hosts.Set("self.example.com", nil)
@@ -389,7 +389,7 @@ func TestResolveHosts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rest := m.Match(Any())
+	rest := m.Listen(AnyBytes())
 	got := collect(map[string]*Route{"exact-tls": exactTLS, "wild-tls": wildTLS, "wild-http": wildHTTP, "sites": resolver, "rest": rest})
 	request := func(host string) string { return "GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n" }
 	hello := func(name string) string {
@@ -437,10 +437,10 @@ func TestRoutingByDomain(t *testing.T) {
 	m := New()
 	defer func() { _ = m.Close() }()
 	routes := map[string]*Route{
-		"admin":  m.Match(HTTP1(Host("admin.example.com")), TLS(SNI("admin.example.com"))),
-		"public": m.Match(HTTP1(Host("*.example.com"), NoneOf(Host("admin.example.com"), PathPrefix("/internal/")))),
-		"api":    m.Match(TLS(AllOf(SNI("*.example.com"), NoneOf(SNI("admin.example.com"))), AnyOf(ALPN("h2"), SNI("legacy.example.com")))),
-		"other":  m.Match(HTTP1(), TLS()),
+		"admin":  m.Listen(HTTP1(Host("admin.example.com")), TLS(SNI("admin.example.com"))),
+		"public": m.Listen(HTTP1(Host("*.example.com"), NoneOf(Host("admin.example.com"), PathPrefix("/internal/")))),
+		"api":    m.Listen(TLS(AllOf(SNI("*.example.com"), NoneOf(SNI("admin.example.com"))), AnyOf(ALPN("h2"), SNI("legacy.example.com")))),
+		"other":  m.Listen(HTTP1(), TLS()),
 	}
 	got := collect(routes)
 	request := func(host, path string) string {

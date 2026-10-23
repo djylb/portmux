@@ -19,14 +19,18 @@ import (
 // is nil when m matched, ErrNoMatch when it ruled the connection out, and
 // otherwise what stopped reading, such as ErrSniffTimeout or io.EOF.
 //
-// WithSniffTimeout, WithMaxSniffBytes and WithProxyProtocol apply; other
-// options are ignored. Silent works as in a Mux. Peek sets read deadlines on
-// c while reading and clears them before it returns.
-func Peek(c net.Conn, m Matcher, opts ...Option) (*Conn, error) {
+// The options are those of the sniffing: WithSniffTimeout, WithMaxSniffBytes
+// and WithProxyProtocol. Silent works as in a Mux. Peek sets read deadlines
+// on c while reading and clears them before it returns.
+func Peek(c net.Conn, m Matcher, opts ...PeekOption) (*Conn, error) {
 	if c == nil || m == nil {
 		panic("portmux: Peek needs a connection and a matcher")
 	}
-	o := newOptions(opts)
+	all := make([]Option, len(opts))
+	for i, opt := range opts {
+		all[i] = opt
+	}
+	o := newOptions(all)
 	conn := &Conn{conn: c}
 	s := newSniffer(conn, &o, time.Now())
 	defer s.release()

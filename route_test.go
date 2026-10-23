@@ -35,10 +35,10 @@ func mustAdd(t *testing.T, m *testMux, cfg RouteConfig) *Route {
 
 func TestPriorityOrdersRoutes(t *testing.T) {
 	m := startMux(t)
-	fallback := mustAdd(t, m, RouteConfig{Priority: -10, Matchers: []Matcher{Any()}})
+	fallback := mustAdd(t, m, RouteConfig{Priority: -10, Matchers: []Matcher{AnyBytes()}})
 	serve(t, m)
 	// Added later, but tried first because of its higher priority.
-	specific := m.Match(Prefix("A"))
+	specific := m.Listen(Prefix("A"))
 
 	send(t, m, "A")
 	accept(t, specific)
@@ -52,8 +52,8 @@ func TestPriorityOrdersRoutes(t *testing.T) {
 
 func TestEqualPriorityKeepsAddOrder(t *testing.T) {
 	m := startMux(t)
-	first := m.Match(Prefix("A"))
-	second := m.Match(Prefix("A"))
+	first := m.Listen(Prefix("A"))
+	second := m.Listen(Prefix("A"))
 	serve(t, m)
 
 	send(t, m, "A")
@@ -70,8 +70,8 @@ func TestEqualPriorityKeepsAddOrder(t *testing.T) {
 
 func TestSetMatchersKeepsListener(t *testing.T) {
 	m := startMux(t)
-	route := m.Match(Prefix("A"))
-	rest := m.Match(Any())
+	route := m.Listen(Prefix("A"))
+	rest := m.Listen(AnyBytes())
 	serve(t, m)
 
 	if err := route.SetMatchers(Prefix("B")); err != nil {
@@ -88,8 +88,8 @@ func TestSetMatchersKeepsListener(t *testing.T) {
 
 func TestPausedRoute(t *testing.T) {
 	m := startMux(t)
-	route := m.Match(Prefix("A"))
-	rest := m.Match(Any())
+	route := m.Listen(Prefix("A"))
+	rest := m.Listen(AnyBytes())
 	serve(t, m)
 
 	if err := route.SetMatchers(); err != nil {
@@ -165,7 +165,7 @@ func TestBatchIsAtomic(t *testing.T) {
 
 func TestFailedBatchChangesNothing(t *testing.T) {
 	m := startMux(t)
-	route := m.Match(Prefix("A"))
+	route := m.Listen(Prefix("A"))
 	serve(t, m)
 
 	var added *Route
@@ -173,7 +173,7 @@ func TestFailedBatchChangesNothing(t *testing.T) {
 	boom := errors.New("abort")
 	err := m.Batch(func(b *Batch) error {
 		kept = b
-		added, _ = b.Add(RouteConfig{Name: "new", Priority: 10, Matchers: []Matcher{Any()}})
+		added, _ = b.Add(RouteConfig{Name: "new", Priority: 10, Matchers: []Matcher{AnyBytes()}})
 		_ = b.SetMatchers(route, Prefix("B"))
 		_ = b.Remove(route)
 		return boom
@@ -187,7 +187,7 @@ func TestFailedBatchChangesNothing(t *testing.T) {
 	if _, err := added.Accept(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("route of a failed batch: Accept = %v", err)
 	}
-	if err := added.SetMatchers(Any()); !errors.Is(err, net.ErrClosed) {
+	if err := added.SetMatchers(AnyBytes()); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("SetMatchers on a discarded route = %v", err)
 	}
 	if _, err := kept.Add(RouteConfig{}); !errors.Is(err, errBatchDone) {
@@ -200,8 +200,8 @@ func TestFailedBatchChangesNothing(t *testing.T) {
 func TestBatchRejectsInvalidChanges(t *testing.T) {
 	m := startMux(t)
 	other := New()
-	foreign := other.Match(Any())
-	removed := m.Match(Any())
+	foreign := other.Listen(AnyBytes())
+	removed := m.Listen(AnyBytes())
 	_ = removed.Close()
 
 	err := m.Batch(func(b *Batch) error {
@@ -229,8 +229,8 @@ func TestBatchRejectsInvalidChanges(t *testing.T) {
 
 func TestRemovedRouteHandsPendingConnectionOn(t *testing.T) {
 	m := startMux(t)
-	idle := m.Match(Prefix("A"))
-	rest := m.Match(Any())
+	idle := m.Listen(Prefix("A"))
+	rest := m.Listen(AnyBytes())
 	serve(t, m)
 
 	send(t, m, "AB")
@@ -246,7 +246,7 @@ func TestRemovedRouteHandsPendingConnectionOn(t *testing.T) {
 
 func TestRouteChangeAppliesToUndecidedConnection(t *testing.T) {
 	m := startMux(t)
-	m.Match(HTTP1(Host("a.example")))
+	m.Listen(HTTP1(Host("a.example")))
 	serve(t, m)
 
 	c := send(t, m, "GET / HTTP/1.1\r\n")
@@ -263,7 +263,7 @@ func TestRouteChangeAppliesToUndecidedConnection(t *testing.T) {
 // closed.
 func TestConcurrentRouteChanges(t *testing.T) {
 	m := startMux(t, WithDispatchTimeout(time.Second))
-	stable := mustAdd(t, m, RouteConfig{Priority: -100, Matchers: []Matcher{Any()}})
+	stable := mustAdd(t, m, RouteConfig{Priority: -100, Matchers: []Matcher{AnyBytes()}})
 	serve(t, m)
 
 	var served sync.WaitGroup
@@ -371,7 +371,7 @@ func TestBatchAddAndRemove(t *testing.T) {
 	var r *Route
 	err := m.Batch(func(b *Batch) error {
 		var err error
-		if r, err = b.Add(RouteConfig{Name: "brief", Matchers: []Matcher{Any()}}); err != nil {
+		if r, err = b.Add(RouteConfig{Name: "brief", Matchers: []Matcher{AnyBytes()}}); err != nil {
 			return err
 		}
 		return b.Remove(r)
@@ -399,7 +399,7 @@ func TestOrderAfterChanges(t *testing.T) {
 				case op == 0 || len(routes) == 0:
 					cfg := RouteConfig{Priority: r.IntN(5), Fallback: r.IntN(8) == 0}
 					if !cfg.Fallback {
-						cfg.Matchers = []Matcher{Any()}
+						cfg.Matchers = []Matcher{AnyBytes()}
 					}
 					if _, err := b.Add(cfg); err != nil {
 						return err

@@ -10,10 +10,10 @@ import (
 	"time"
 )
 
-func TestBanPerIP(t *testing.T) {
+func TestBanPerClient(t *testing.T) {
 	log := newErrorLog()
-	m := startMux(t, log.option(), WithBanPerIP(2, time.Minute, time.Minute))
-	web := m.Match(Prefix("GET"))
+	m := startMux(t, log.option(), WithBanPerClient(2, time.Minute, time.Minute))
+	web := m.Listen(Prefix("GET"))
 	serve(t, m)
 
 	// Closing without sending, as health checks do, does not count.
@@ -71,8 +71,8 @@ func TestBanPerIP(t *testing.T) {
 // before the client sees its connection closed, so that the client cannot
 // slip in by connecting again at once.
 func TestBanAppliesAtOnce(t *testing.T) {
-	m := startMux(t, WithBanPerIP(1, time.Minute, time.Minute))
-	m.Match(Prefix("GET")) // its server never accepts
+	m := startMux(t, WithBanPerClient(1, time.Minute, time.Minute))
+	m.Listen(Prefix("GET")) // its server never accepts
 	serve(t, m)
 
 	for i := range uint64(20) {
@@ -174,7 +174,7 @@ func TestExpiredBansAreForgotten(t *testing.T) {
 
 // TestBanForever bans for the longest duration, which must not wrap around.
 func TestBanForever(t *testing.T) {
-	m := New(WithBanPerIP(1, time.Minute, math.MaxInt64))
+	m := New(WithBanPerClient(1, time.Minute, math.MaxInt64))
 	defer func() { _ = m.Close() }()
 	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
 	m.Ban(a, math.MaxInt64)

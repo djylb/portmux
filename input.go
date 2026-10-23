@@ -73,20 +73,6 @@ func (in *Input) SetValue(key, value any) {
 	in.values = append(in.values, inputValue{key, value})
 }
 
-// parsedName returns the server name of a parsed ClientHello or the host of
-// a parsed HTTP request, without parsing.
-func (in *Input) parsedName() string {
-	switch {
-	case in.hello != nil:
-		return in.hello.ServerName
-	case in.req != nil:
-		return in.req.Host
-	case in.req2 != nil:
-		return in.req2.Host
-	}
-	return ""
-}
-
 type memoEntry struct {
 	m   *regexpMatcher
 	res Result
@@ -180,6 +166,14 @@ func (in *Input) RemoteAddr() net.Addr {
 // protocol header when one was parsed.
 func (in *Input) LocalAddr() net.Addr {
 	return in.local
+}
+
+// Elapsed returns, during a check for silence, how long the connection has
+// been taken without sending anything: the checks run, for connections that
+// sent nothing, at the times that the Silencers among the matchers report.
+// At other calls it returns zero.
+func (in *Input) Elapsed() time.Duration {
+	return in.elapsed
 }
 
 // Entry returns the name of the entry the connection came through; see

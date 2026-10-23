@@ -11,12 +11,13 @@ import (
 )
 
 var (
-	errNilRoute       = errors.New("portmux: nil route")
-	errForeignRoute   = errors.New("portmux: route belongs to another Mux")
+	errNilRoute       = fmt.Errorf("%w: nil route", ErrInvalidRoute)
+	errForeignRoute   = fmt.Errorf("%w: the route belongs to another Mux", ErrInvalidRoute)
 	errBatchDone      = errors.New("portmux: Batch used after it returned")
-	errFallbackConfig = errors.New("portmux: a fallback route has no matchers and does not reject")
-	errResolveConfig  = errors.New("portmux: a resolver route neither rejects nor falls back")
-	errHandlerConfig  = errors.New("portmux: a reject route has no handler")
+	errFallbackConfig = fmt.Errorf("%w: a fallback route has no matchers", ErrInvalidRoute)
+	errResolveConfig  = fmt.Errorf("%w: a resolver route neither rejects nor falls back", ErrInvalidRoute)
+	errHandlerConfig  = fmt.Errorf("%w: a reject route has no handler", ErrInvalidRoute)
+	errNilMatcher     = fmt.Errorf("%w: nil matcher", ErrInvalidRoute)
 )
 
 // Batch collects route changes that a Mux applies together: a connection is
@@ -59,7 +60,8 @@ func (s *routeSet) clone() routeSet {
 
 // Batch calls fn with a Batch and applies its changes atomically when fn
 // returns nil. When fn returns an error, nothing is applied and the routes it
-// added are closed.
+// added are closed. After Close, Batch applies nothing and returns
+// net.ErrClosed.
 //
 // fn works on a snapshot of the routes and holds no lock, so it may call
 // other methods of the Mux. Its changes are applied on top of the routes as
@@ -72,17 +74,15 @@ func (m *Mux) Batch(fn func(b *Batch) error) error {
 	err := fn(b)
 	b.done = true
 	var removed []*Route
-	closed := false
 	if err == nil {
-		removed, closed, err = m.apply(b)
+		removed, err = m.apply(b)
 	}
-	if err != nil || closed {
-		// Routes added to a closed Mux are closed at once.
+	if err != nil {
+		// Routes of a batch not applied, such as one on a closed Mux, are
+		// closed at once.
 		for _, r := range b.added {
 			r.closeListener()
 		}
-	}
-	if err != nil {
 		return err
 	}
 	// The new table is published before removed listeners close, so
@@ -113,7 +113,7 @@ func (b *Batch) Add(cfg RouteConfig) (*Route, error) {
 	if err := checkMatchers(cfg.Matchers); err != nil {
 		return nil, err
 	}
-	if cfg.Fallback && (len(cfg.Matchers) > 0 || cfg.Reject) {
+	if cfg.Fallback && len(cfg.Matchers) > 0 {
 		return nil, errFallbackConfig
 	}
 	if cfg.Resolve != nil && (cfg.Reject || cfg.Fallback) {
@@ -275,7 +275,7 @@ func (b *Batch) check(r *Route) error {
 
 func checkMatchers(matchers []Matcher) error {
 	if slices.Contains(matchers, nil) {
-		return errors.New("portmux: nil matcher")
+		return errNilMatcher
 	}
 	return nil
 }
@@ -283,10 +283,13 @@ func checkMatchers(matchers []Matcher) error {
 // apply replays a batch's changes on the current routes and installs the
 // result, or changes nothing when one of them fails. It returns the routes
 // that the changes removed, including those the batch added and removed
-// again, and whether the Mux is closed.
-func (m *Mux) apply(b *Batch) ([]*Route, bool, error) {
+// again, or net.ErrClosed when the Mux is closed.
+func (m *Mux) apply(b *Batch) ([]*Route, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return nil, net.ErrClosed
+	}
 	cur := m.table.Load()
 	s := b.view
 	if cur != b.base {
@@ -295,7 +298,7 @@ func (m *Mux) apply(b *Batch) ([]*Route, bool, error) {
 		s = cur.clone()
 		for _, op := range b.ops {
 			if err := op(&s); err != nil {
-				return nil, false, err
+				return nil, err
 			}
 		}
 	}
@@ -311,7 +314,7 @@ func (m *Mux) apply(b *Batch) ([]*Route, bool, error) {
 		}
 	}
 	m.table.Store(newTable(s, cur.orderAfter(&s, b.added)))
-	return removed, m.closed.Load(), nil
+	return removed, nil
 }
 
 // sorted returns the routes in matching order: by priority, highest first,

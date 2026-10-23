@@ -4,6 +4,7 @@ import (
 	"maps"
 	"net"
 	"net/netip"
+	"slices"
 )
 
 // Entry is a named group of the listeners a Mux serves, such as the public
@@ -26,6 +27,29 @@ func (m *Mux) Entry(name string) *Entry {
 	return &Entry{m: m, name: name}
 }
 
+// Entries returns, sorted, the names of the entries that routes are limited
+// to, that have options of their own or whose listeners the Mux serves. A
+// name passed to Mux.Entry that is none of them, such as a misspelt one, has
+// nothing of its own: its connections take the routes and options of every
+// entry, which a program can check for when it configures the entries.
+func (m *Mux) Entries() []string {
+	names := make(map[string]bool)
+	for name := range m.table.Load().byEntry {
+		names[name] = true
+	}
+	if entries := m.entries.Load(); entries != nil {
+		for name := range *entries {
+			names[name] = true
+		}
+	}
+	m.mu.Lock()
+	for _, l := range m.listeners {
+		names[l.entry] = true
+	}
+	m.mu.Unlock()
+	return slices.Sorted(maps.Keys(names))
+}
+
 // Name returns the entry's name.
 func (e *Entry) Name() string { return e.name }
 
@@ -40,11 +64,11 @@ func (e *Entry) ServeConn(c net.Conn) error { return e.m.serveOne(e.name, c) }
 // changes to the Mux's other options still apply. They take effect as
 // Mux.SetOptions does.
 //
-// An entry with its own WithRateLimitPerIP keeps buckets of its own, and one
-// with its own WithBanPerIP counts the failures of its clients apart; other
+// An entry with its own WithRateLimitPerClient keeps buckets of its own, and one
+// with its own WithBanPerClient counts the failures of its clients apart; other
 // entries share those of the Mux. A ban refuses the client on every entry.
 // The per-client pending counts and the connections queued for a route,
-// which the entry's WithMaxPendingPerIP and WithMaxQueuedPerRoute limit, are
+// which the entry's WithMaxPendingPerClient and WithMaxQueued limit, are
 // those of all entries.
 func (e *Entry) SetOptions(opts ...EntryOption) {
 	m := e.m
@@ -63,13 +87,32 @@ func (e *Entry) SetOptions(opts ...EntryOption) {
 	m.setEntryConfigLocked(e.name, m.newEntryConfig(old, set))
 }
 
-// ResetOptions drops the options set for the entry, which then follows the
-// options of the Mux.
-func (e *Entry) ResetOptions() {
+// ResetOptions drops options set for the entry, whose settings then follow
+// the options of the Mux again: the settings of the options given, whatever
+// their values, as in ResetOptions(WithSniffTimeout(0)), or every setting
+// without any.
+func (e *Entry) ResetOptions(opts ...EntryOption) {
 	m := e.m
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.setEntryConfigLocked(e.name, nil)
+	old := m.entryConfig(e.name)
+	if old == nil {
+		return
+	}
+	set := old.set
+	if len(opts) == 0 {
+		set = [numEntrySettings]func(*options){}
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			set[opt.setting()] = nil
+		}
+	}
+	if !slices.ContainsFunc(set[:], func(f func(*options)) bool { return f != nil }) {
+		m.setEntryConfigLocked(e.name, nil)
+		return
+	}
+	m.setEntryConfigLocked(e.name, m.newEntryConfig(old, set))
 }
 
 // Config returns the settings that apply to the connections of the entry:
@@ -89,7 +132,7 @@ type entryConfig struct {
 	ownBan  bool                             // whether failures are counted apart
 }
 
-// settings returns the options and the buckets of WithRateLimitPerIP for
+// settings returns the options and the buckets of WithRateLimitPerClient for
 // the connections of an entry.
 func (m *Mux) settings(entry string) (*options, *rateLimit) {
 	if c := m.entryConfig(entry); c != nil {
@@ -128,7 +171,7 @@ func (m *Mux) newEntryConfig(old *entryConfig, set [numEntrySettings]func(*optio
 		}
 	}
 	o.normalize()
-	c := &entryConfig{set: set, opts: &o, ownRate: set[settingRateLimitPerIP] != nil, ownBan: set[settingBanPerIP] != nil}
+	c := &entryConfig{set: set, opts: &o, ownRate: set[settingRateLimitPerClient] != nil, ownBan: set[settingBanPerClient] != nil}
 	switch {
 	case !c.ownRate || o.rate <= 0:
 	case old != nil && old.rate != nil && old.opts.rate == o.rate && old.opts.rateBurst == o.rateBurst:

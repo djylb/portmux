@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,9 +99,13 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 	s.seq = at.seq
 	m.undelivered.add(s, l != nil)
 	delivered := false
+	// held reports that the connection holds the pending slot and the
+	// client's pending count of its admission; it gives them back once
+	// matched, so that one that waits for Accept holds neither.
+	held := l != nil
 	defer func() {
 		if p := recover(); p != nil {
-			err = fmt.Errorf("portmux: matcher panicked: %v", p)
+			err = &PanicError{Value: p, Stack: debug.Stack()}
 		}
 		m.undelivered.remove(s)
 		if s.evicted.Load() && err != nil {
@@ -108,7 +114,9 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 		observed := s.opts.observer != nil
 		var ev Event
 		if observed {
-			ev = Event{Entry: entry, Err: err, Elapsed: time.Since(s.start), Sniffed: len(s.buf), Name: s.in.parsedName()}
+			ev = Event{Entry: entry, Err: err, Elapsed: time.Since(s.start), Sniffed: len(s.buf)}
+			ev.Name = requestedName(s.in.hello, s.in.req, s.in.req2)
+			ev.ClientHello, ev.HTTPRequest, ev.HTTP2Request = s.in.hello, s.in.req, s.in.req2
 			ev.Remote, ev.Local = conn.RemoteAddr(), conn.LocalAddr()
 		}
 		s.release()
@@ -132,7 +140,7 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 		// connection closed, so that a client that connects again at once
 		// is held to the limits and bans that this connection leaves.
 		if l != nil {
-			ev.Banned = m.releaseAdmitted(l, a, err)
+			ev.Banned = m.releaseAdmitted(l, a, held, err)
 		}
 		if delivered {
 			ev.Route = conn.route
@@ -186,6 +194,12 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 			}
 			continue // removed while matching: match against the new routes
 		}
+		if s.via != r {
+			// A resolver chose r: it must serve the connection's entry.
+			if st := m.table.Load().routes[r]; len(st.entries) > 0 && !slices.Contains(st.entries, entry) {
+				return nil, conn, ErrEntryMismatch
+			}
+		}
 		s.handOver(r)
 		// A decided connection leaves the pending set, so that Close does not
 		// close it once it is delivered.
@@ -214,7 +228,7 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 		}
 		st := m.table.Load().routes[r]
 		if !r.tryOpen(st.maxConns) {
-			return nil, conn, ErrRouteFull
+			return nil, conn, ErrConnLimit
 		}
 		conn.mux, conn.ln = m, l
 		conn.open.Store(true)
@@ -225,6 +239,15 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 			delivered = true
 			conn.dropEmpty()
 			return r.handler, conn, nil
+		}
+		if held {
+			// Matched, the connection waits only for its route, which
+			// MaxQueued and the dispatch timeout bound: holding its slot
+			// would let routes that the same Mux serves, such as one
+			// nested inside TLS, take every slot while they wait for
+			// their own connections, which need slots too.
+			m.freeAdmitted(&a)
+			held = false
 		}
 		if err = m.deliver(s, r, st); err == nil {
 			delivered = true
@@ -452,8 +475,9 @@ func (s *sniffer) handOver(r *Route) {
 		c.req = in.req
 	}
 	if in.h2P.res == Match {
-		c.req = in.req2
+		c.req2 = in.req2
 	}
+	c.values = slices.Clone(in.values) // nil, without allocating, when none were set
 }
 
 // deliver hands the connection to r's Accept, with the queue limit and the
@@ -478,7 +502,7 @@ func (m *Mux) deliver(s *sniffer, r *Route, st routeState) error {
 	queued := r.queued.Add(1)
 	defer r.queued.Add(-1)
 	if q > 0 && queued > int64(q) {
-		return ErrRouteBusy
+		return ErrQueueFull
 	}
 	var timeout <-chan time.Time
 	if d > 0 {

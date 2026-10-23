@@ -58,7 +58,7 @@ func TestListenerStats(t *testing.T) {
 func TestObserver(t *testing.T) {
 	events := make(chan Event, 8)
 	m := startMux(t, WithObserver(func(ev Event) { events <- ev }))
-	web := m.Match(HTTP1())
+	web := m.Listen(HTTP1())
 	serve(t, m)
 
 	c := dial(t, m)
@@ -98,7 +98,7 @@ func TestObserver(t *testing.T) {
 
 func TestStats(t *testing.T) {
 	m := startMux(t)
-	route := m.Match(Prefix("A"))
+	route := m.Listen(Prefix("A"))
 	serve(t, m)
 
 	_, _ = dial(t, m).Write([]byte("A"))
@@ -121,7 +121,7 @@ func TestStats(t *testing.T) {
 // and Addr do not wait for themselves.
 func TestSnapshotWithNestedListener(t *testing.T) {
 	m := startMux(t)
-	route := m.Match(TLS())
+	route := m.Listen(TLS())
 	serve(t, m)
 	go func() { _ = m.Entry("inner").Serve(tls.NewListener(route, &tls.Config{})) }()
 	waitServing(t, m.Mux, 2)

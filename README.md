@@ -49,11 +49,11 @@ func main() {
 	m := portmux.New()
 
 	// Routes with equal priority are tried in the order they were added.
-	agents := m.Match(portmux.Prefix("AGENT/1\n"))
-	admin := m.Match(portmux.TLS(portmux.SNI("admin.example.com")))
-	site := m.Match(portmux.TLS())
-	web := m.Match(portmux.HTTP1())
-	ssh := m.Match(portmux.SSH(), portmux.Silent(2*time.Second))
+	agents := m.Listen(portmux.Prefix("AGENT/1\n"))
+	admin := m.Listen(portmux.TLS(portmux.SNI("admin.example.com")))
+	site := m.Listen(portmux.TLS())
+	web := m.Listen(portmux.HTTP1())
+	ssh := m.Listen(portmux.SSH(), portmux.Silent(2*time.Second))
 
 	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
 	if err != nil {
@@ -117,9 +117,10 @@ func forward(l net.Listener, addr string) {
 | `OpenVPN()`, `XMPP()`, `DNS()`                | OpenVPN over TCP, XMPP streams, DNS over TCP               |
 | `HTTP2Preface()`                              | The h2c connection preface alone                           |
 | `Silent(d)`                                   | Clients that sent nothing for d, as server-first protocols |
-| `RemoteIP(prefixes...)`                       | Client addresses                                           |
-| `LocalIP(prefixes...)`, `LocalPort(ports...)` | The address or port the client connected to                |
-| `Any()`, `Always()`                           | Any client that sent a byte; every connection, unread      |
+| `RemoteIP(prefixes...)`, `RemoteIPFunc(fn)`   | Client addresses, from a fixed or a changing list          |
+| `LocalIP(prefixes...)`, `LocalIPFunc(fn)`     | The address the client connected to                        |
+| `LocalPort(ports...)`                         | The port the client connected to                           |
+| `AnyBytes()`, `Always()`                      | Any client that sent a byte; every connection, unread      |
 | `And`, `Or`, `Not`                            | Combinations, nested in any way                            |
 | `MatcherFunc`, `Named(name, m)`               | Your own logic, with a description for `Snapshot`          |
 
@@ -138,7 +139,8 @@ func forward(l net.Listener, addr string) {
 - Each protocol is parsed once per connection, incrementally, however many
   routes look at it.
 - Address matchers and `Silent` decide without bytes, which routes protocols in
-  which the server speaks first.
+  which the server speaks first. A matcher of your own that waits for
+  silence implements `Silencer` and reads `Input.Elapsed`.
 
 A matcher of your own reads what is known about the connection from an
 `Input`:
@@ -167,17 +169,17 @@ of your own can keep its state between calls on one connection with
 ```go
 func combine(m *portmux.Mux, office netip.Prefix) {
 	// Every subdomain except two, and nothing under /internal/.
-	m.Match(portmux.HTTP1(
+	m.Listen(portmux.HTTP1(
 		portmux.Host("*.example.com"),
 		portmux.NoneOf(portmux.Host("admin.example.com", "db.example.com"), portmux.PathPrefix("/internal/")),
 	))
 	// (api.example.com AND /v1/) OR status.example.com.
-	m.Match(portmux.HTTP1(portmux.AnyOf(
+	m.Listen(portmux.HTTP1(portmux.AnyOf(
 		portmux.AllOf(portmux.Host("api.example.com"), portmux.PathPrefix("/v1/")),
 		portmux.Host("status.example.com"),
 	)))
 	// The admin site over TLS 1.2 or newer, from the office only.
-	m.Match(portmux.And(
+	m.Listen(portmux.And(
 		portmux.RemoteIP(office),
 		portmux.TLS(portmux.SNI("admin.example.com"), portmux.MinTLSVersion(tls.VersionTLS12)),
 	))
@@ -260,7 +262,7 @@ func serveEntries(m *portmux.Mux) error {
 		return err
 	}
 	// The public port gets stricter limits than the others.
-	m.Entry("web").SetOptions(portmux.WithSniffTimeout(5*time.Second), portmux.WithBanPerIP(10, time.Minute, time.Hour))
+	m.Entry("web").SetOptions(portmux.WithSniffTimeout(5*time.Second), portmux.WithBanPerClient(10, time.Minute, time.Hour))
 
 	for entry, addr := range map[string]string{"web": ":443", "web-alt": ":8443", "tcp-9000": ":9000"} {
 		ln, err := net.Listen("tcp", addr)
@@ -348,9 +350,10 @@ func loadRule(m *portmux.Mux, name, text string, office portmux.Matcher) error {
 ```
 
 `ParseMatcher` reads what matchers print, as in
-`And(office, TLS(SNI("*.example.com"), MinTLSVersion(1.2)))`, so routes can be
-stored and read back. `Names` supplies your own matchers and filters, also
-with arguments, such as `JA4("...")` through `fingerprint.MatchJA4`.
+`And(office, TLS(SNI("*.example.com"), MinTLSVersion(1.2)))`, so the matchers
+of routes can be stored and read back, next to the other settings of their
+`RouteConfig`. `Names` supplies your own matchers and filters, also with
+arguments; `fpnames.Register` (package `fingerprint/fpnames`) adds `JA4("...")` and `JA3("...")`.
 
 ## Delivery
 
@@ -377,11 +380,17 @@ func serveTunnel(m *portmux.Mux, backend string) (*portmux.Route, error) {
 - A route delivers to `Accept`, or to its `Handler`, which needs no accept loop
   and scales best for a busy route.
 - A `Conn` carries what was parsed: `ClientHello`, `HTTPRequest`,
-  `ProxyHeader`, `Entry` and `Route`. It keeps half-close and the fast copy
-  paths of the underlying connection.
+  `HTTP2Request`, `RequestedName`, `ProxyHeader`, the values that your
+  matchers stored with `Input.SetValue` (`Conn.Value`), `Entry` and `Route`.
+  It keeps half-close and the fast copy paths of the underlying connection.
+- A panic in a matcher, resolver, PROXY policy or handler closes only its
+  connection and is reported as a `*PanicError`.
 - `Serve` runs for any number of listeners, and `ServeConn` routes a connection
-  obtained elsewhere. `Shutdown` waits for pending connections to be routed;
-  `Close` stops at once. Neither affects delivered connections.
+  obtained elsewhere, without the admission of `Serve`: limits, bans and
+  rates apply to connections that come through a `net.Listener` passed to
+  `Serve`. `Shutdown` waits for pending connections to be routed; `Close`
+  stops at once, after which `Add` and `Batch` return `net.ErrClosed`.
+  Neither affects delivered connections.
 
 A route is a `net.Listener`, so TLS can be terminated on it and what it
 carries routed again by a second Mux, for example SOCKS and HTTP proxies
@@ -394,7 +403,7 @@ func serveInsideTLS(l net.Listener, cert tls.Certificate, proxies func(*portmux.
 	outer, inner := portmux.New(), portmux.New()
 	proxies(outer)
 	proxies(inner)
-	secure := outer.Match(portmux.TLS())
+	secure := outer.Listen(portmux.TLS())
 	go inner.Serve(tls.NewListener(secure, &tls.Config{Certificates: []tls.Certificate{cert}}))
 	return outer.Serve(l)
 }
@@ -427,9 +436,9 @@ what address matchers and the `Conn` see. Allow them only from trusted peers.
 func newPublicMux() *portmux.Mux {
 	return portmux.New(
 		portmux.WithSniffTimeout(5*time.Second),
-		portmux.WithMaxPendingPerIP(32),
-		portmux.WithRateLimitPerIP(20, 40),
-		portmux.WithBanPerIP(10, time.Minute, 10*time.Minute),
+		portmux.WithMaxPendingPerClient(32),
+		portmux.WithRateLimitPerClient(20, 40),
+		portmux.WithBanPerClient(10, time.Minute, 10*time.Minute),
 		portmux.WithObserver(func(ev portmux.Event) {
 			if ev.Err != nil {
 				log.Printf("%s %s: %v", ev.Entry, ev.Remote, ev.Err)
@@ -440,7 +449,7 @@ func newPublicMux() *portmux.Mux {
 
 // tighten lowers the limits while serving and returns the new settings.
 func tighten(m *portmux.Mux) portmux.Config {
-	m.SetOptions(portmux.WithMaxPendingPerIP(4), portmux.WithRateLimitPerIP(2, 4))
+	m.SetOptions(portmux.WithMaxPendingPerClient(4), portmux.WithRateLimitPerClient(2, 4))
 	return m.Config()
 }
 ```
@@ -450,12 +459,12 @@ func tighten(m *portmux.Mux) portmux.Config {
 | `WithSniffTimeout(d)`            | 10s     | Time until a route matches, not counting a wait for a pending slot        | yes       |
 | `WithDispatchTimeout(d)`         | 5s      | Time a matched connection waits for `Accept`                              | yes       |
 | `WithMaxSniffBytes(n)`           | 16 KiB  | Bytes buffered for matching                                               | yes       |
-| `WithMaxPending(n)`              | 4096    | Undelivered connections; at the limit the oldest undecided one is evicted |           |
-| `WithMaxPendingPerIP(n)`         | none    | Undelivered connections per client                                        | yes       |
-| `WithRateLimitPerIP(r, b)`       | none    | New connections per second per client                                     | yes       |
+| `WithMaxPending(n)`              | 4096    | Connections being matched; at the limit the oldest undecided is evicted   |           |
+| `WithMaxPendingPerClient(n)`         | none    | Undelivered connections per client                                        | yes       |
+| `WithRateLimitPerClient(r, b)`       | none    | New connections per second per client                                     | yes       |
 | `WithRateLimitPerListener(r, b)` | none    | New connections per second per listener                                   | yes       |
-| `WithBanPerIP(n, w, d)`          | none    | Bans for d a client with n failed connections within w                    | yes       |
-| `WithMaxQueuedPerRoute(n)`       | 1024    | Matched connections waiting for one route's `Accept`                      | yes       |
+| `WithBanPerClient(n, w, d)`          | none    | Bans for d a client with n failed connections within w                    | yes       |
+| `WithMaxQueued(n)`       | 1024    | Matched connections waiting for one route's `Accept`                      | yes       |
 | `WithObserver(fn)`               | none    | Called with an `Event` for every connection delivered or closed           |           |
 | `WithProxyProtocol(policy)`      | none    | PROXY protocol v1/v2 per entry and peer                                   |           |
 | `WithClientPrefix(v4, v6)`       | 32, 64  | Networks counted as one client by the per-client limits and bans          |           |
@@ -468,14 +477,26 @@ func tighten(m *portmux.Mux) portmux.Config {
   not limited or banned for its clients. Failed
   connections that count toward bans matched no route, timed out, hit a reject
   route or sent an invalid PROXY header or none where one is required;
-  `Mux.Ban` and `Unban` act by hand; `Unban` lifts the bans of every network
-  that holds the address, such as a /24 banned under a shorter prefix.
-- An `Event` names the server name or host that matchers parsed, and reports
-  with `Banned` the failure that banned its client.
+  `Mux.Ban`, `BanPrefix`, `Unban` and `UnbanPrefix` act by hand; `Unban`
+  lifts the bans of every network that holds the address, such as a /24
+  banned under a shorter prefix.
+- A matched connection waiting for `Accept` holds no pending slot: the queue
+  of its route, `WithMaxQueued` and `RouteConfig.MaxQueued`, and the dispatch
+  timeout bound those. In a `RouteConfig`, a zero `DispatchTimeout` or
+  `MaxQueued` keeps the entry's setting and a negative one removes the limit,
+  while a zero `MaxConns` means no limit.
+- `Entry.ResetOptions` drops one or all of an entry's settings, `Mux.Entries`
+  lists the entries in use, which catches a misspelt name, and
+  `Config.Options` turns settings read back into options again.
+- An `Event` carries the name the client asked for and what matchers parsed,
+  for logs and fingerprints, and reports with `Banned` the failure that
+  banned its client.
 - Rejected connections are reported with `ErrNoMatch`, `ErrRefused`,
   `ErrSniffTimeout`, `ErrDispatchTimeout`, `ErrEvicted`, `ErrPendingLimit`,
-  `ErrRateLimited`, `ErrBanned`, `ErrRouteBusy`, `ErrRouteFull`,
-  `ErrRouteClosed`, the `proxyproto` errors or read errors.
+  `ErrRateLimited`, `ErrBanned`, `ErrQueueFull`, `ErrConnLimit`,
+  `ErrRouteClosed`, `ErrEntryMismatch`, a `*PanicError`, the `proxyproto`
+  errors or read errors. Route configurations that are not valid fail with
+  errors that wrap `ErrInvalidRoute`.
 
 ## Status
 
@@ -515,7 +536,7 @@ and delivered connections are the servers' to limit.
 
 | Function                                                        | Use                                                       |
 |-----------------------------------------------------------------|-----------------------------------------------------------|
-| `Peek(c, m, opts...)`                                           | Sniff one connection; the `Conn` replays what was read    |
+| `Peek(c, m, sniffOpts...)`                                      | Sniff one connection; the `Conn` replays what was read    |
 | `tlshello.Parse`, `httphead.Parse`, `httphead.ParseHTTP2`       | Parse the first bytes of a connection                     |
 | `tlshello.Scanner`, `httphead.Scanner`, `httphead.HTTP2Scanner` | Parse as bytes arrive                                     |
 | `fingerprint.JA4`, `fingerprint.JA3`                            | Fingerprint a client's TLS library                        |

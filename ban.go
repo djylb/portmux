@@ -14,7 +14,7 @@ import (
 )
 
 // banWorthy reports whether a connection failed in a way that counts toward
-// WithBanPerIP.
+// WithBanPerClient.
 func banWorthy(err error) bool {
 	return errors.Is(err, ErrNoMatch) || errors.Is(err, ErrSniffTimeout) || errors.Is(err, ErrRefused) ||
 		errors.Is(err, proxyproto.ErrMalformed) || errors.Is(err, proxyproto.ErrNoHeader)
@@ -28,6 +28,32 @@ func (m *Mux) Ban(client netip.Addr, d time.Duration) {
 	if client.IsValid() {
 		m.bans.set(banKey{client: m.clientNet(client)}, m.bans.now(), d)
 	}
+}
+
+// BanPrefix bans the clients in network for d, as Ban does the network of
+// one client; an IPv4-mapped IPv6 network is banned as IPv4. A non-positive
+// d lifts the ban of network.
+func (m *Mux) BanPrefix(network netip.Prefix, d time.Duration) {
+	if network.IsValid() {
+		m.bans.set(banKey{client: canonicalPrefix(network)}, m.bans.now(), d)
+	}
+}
+
+// UnbanPrefix lifts the ban of network, as BanPrefix or Ban set it, and
+// reports whether it was banned. Bans of other networks that hold some of
+// its addresses stay; Unban lifts every ban of an address.
+func (m *Mux) UnbanPrefix(network netip.Prefix) bool {
+	return network.IsValid() && m.bans.set(banKey{client: canonicalPrefix(network)}, m.bans.now(), 0)
+}
+
+// canonicalPrefix returns p masked, without a zone, and IPv4-mapped IPv6
+// prefixes as IPv4.
+func canonicalPrefix(p netip.Prefix) netip.Prefix {
+	addr, bits := p.Addr().WithZone(""), p.Bits()
+	if addr.Is4In6() && bits >= 96 {
+		addr, bits = addr.Unmap(), bits-96
+	}
+	return netip.PrefixFrom(addr, bits).Masked()
 }
 
 // Unban lifts the bans of the networks that hold client, of the prefix
@@ -56,8 +82,8 @@ type Ban struct {
 	Until time.Time
 }
 
-// Bans returns the clients that are banned now, automatically or with Ban,
-// in no particular order.
+// Bans returns the clients that are banned now, automatically or with Ban or
+// BanPrefix, in no particular order.
 func (m *Mux) Bans() []Ban {
 	return m.bans.list(m.bans.now())
 }
@@ -125,7 +151,7 @@ type banShard struct {
 
 // banKey names a record of a client: the one with its ban and the failures
 // counted for the Mux, or with own set, the failures counted for an entry
-// with its own WithBanPerIP.
+// with its own WithBanPerClient.
 type banKey struct {
 	client netip.Prefix
 	entry  string

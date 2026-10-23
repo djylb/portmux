@@ -8,6 +8,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/djylb/portmux/httphead"
+	"github.com/djylb/portmux/tlshello"
 )
 
 // Snapshot is the state of a Mux at one moment.
@@ -63,7 +66,8 @@ type Stats struct {
 	// fields after Pending break it down by reason.
 	Rejected uint64
 	// Pending is the number of connections being matched or waiting for
-	// their route to accept them.
+	// their route to accept them. Only those being matched count against
+	// WithMaxPending, so Pending can be above that limit.
 	Pending int64
 	// Open is the number of connections delivered, or waiting for Accept,
 	// and not closed yet with Conn.Close.
@@ -77,13 +81,16 @@ type Stats struct {
 	Timeouts uint64
 	// Evicted counts undecided connections closed at the pending limit.
 	Evicted uint64
-	// Limited counts connections closed by the rate and pending limits or
-	// because their route was busy.
+	// Limited counts connections closed by the rate and pending limits, or
+	// because their route had too many connections queued or open
+	// (ErrQueueFull, ErrConnLimit).
 	Limited uint64
 	// Banned counts connections closed because their client is banned.
 	Banned uint64
 	// Failed counts the rest: clients that closed or reset the connection,
-	// invalid PROXY headers, matcher panics and connections closed by Close.
+	// invalid PROXY headers, panics of matchers, resolvers and PROXY policies,
+	// and connections closed by Close. A connection whose handler panics was
+	// counted as delivered.
 	Failed uint64
 }
 
@@ -111,7 +118,7 @@ func reasonOf(err error) rejectReason {
 		return reasonTimeout
 	case errors.Is(err, ErrEvicted):
 		return reasonEvicted
-	case errors.Is(err, ErrPendingLimit), errors.Is(err, ErrRateLimited), errors.Is(err, ErrRouteBusy), errors.Is(err, ErrRouteFull):
+	case errors.Is(err, ErrPendingLimit), errors.Is(err, ErrRateLimited), errors.Is(err, ErrQueueFull), errors.Is(err, ErrConnLimit):
 		return reasonLimited
 	case errors.Is(err, ErrBanned):
 		return reasonBanned
@@ -231,7 +238,9 @@ type Event struct {
 	// Route is the route that took the connection, or nil.
 	Route *Route
 	// Err is why the connection was closed, or the Accept error; it is nil
-	// for a delivered connection.
+	// for a delivered connection. A delivered connection whose route handler
+	// panics is reported once more, after its delivery, with its Route and
+	// a *PanicError; that event is not counted in Stats again.
 	Err error
 	// Elapsed is the time from taking the connection, as in
 	// WithSniffTimeout, to the decision, by the monotonic clock, whose ticks are coarse on some systems such as
@@ -240,11 +249,17 @@ type Event struct {
 	// Sniffed is the number of bytes read while matching, including a PROXY
 	// header.
 	Sniffed int
-	// Name is the server name of a TLS ClientHello, or the host of an HTTP
-	// request, that matchers parsed, or "" when none did.
+	// Name is the host name the client asked for, as Conn.RequestedName
+	// returns it, from what matchers parsed, or "".
 	Name string
+	// ClientHello, HTTPRequest and HTTP2Request are what matchers parsed of
+	// the connection, or nil, for example to log the fingerprint of a client
+	// that was refused.
+	ClientHello  *tlshello.Hello
+	HTTPRequest  *httphead.Request
+	HTTP2Request *httphead.Request
 	// Banned reports that this connection's failure banned its client; see
-	// WithBanPerIP.
+	// WithBanPerClient.
 	Banned bool
 }
 

@@ -75,9 +75,9 @@ func inputOf(data []byte) *Input {
 //goland:noinspection HttpUrlsUsage
 func TestH2CRouting(t *testing.T) {
 	m := startMux(t)
-	grpc := m.Match(HTTP2(Header("content-type", "application/grpc")))
-	h2 := m.Match(HTTP2())
-	web := m.Match(HTTP1())
+	grpc := m.Listen(HTTP2(Header("content-type", "application/grpc")))
+	h2 := m.Listen(HTTP2())
+	web := m.Listen(HTTP1())
 	serve(t, m)
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)

@@ -45,10 +45,10 @@ func (c *memConn) SetWriteDeadline(time.Time) error { return nil }
 func benchServeConn(b *testing.B, data []byte) {
 	m := New()
 	defer func() { _ = m.Close() }()
-	m.Match(Prefix("TST"))
-	m.Match(HTTP1(Host("manager.example.com")))
-	m.Match(TLS(SNI("manager.example.com")))
-	r := m.Match(HTTP1(), TLS())
+	m.Listen(Prefix("TST"))
+	m.Listen(HTTP1(Host("manager.example.com")))
+	m.Listen(TLS(SNI("manager.example.com")))
+	r := m.Listen(HTTP1(), TLS())
 	go func() {
 		for {
 			c, err := r.Accept()
@@ -90,9 +90,9 @@ func benchParallel(b *testing.B, acceptors int) {
 	hello := testutil.ClientHelloBytes(b, &tls.Config{ServerName: "www.example.com", InsecureSkipVerify: true})
 	m := New()
 	defer func() { _ = m.Close() }()
-	m.Match(Prefix("TST"))
-	m.Match(HTTP1(Host("manager.example.com")))
-	r := m.Match(HTTP1(), TLS())
+	m.Listen(Prefix("TST"))
+	m.Listen(HTTP1(Host("manager.example.com")))
+	r := m.Listen(HTTP1(), TLS())
 	for range acceptors {
 		go func() {
 			for {
@@ -129,7 +129,7 @@ func BenchmarkLoopback(b *testing.B) {
 	}
 	m := New()
 	defer func() { _ = m.Close() }()
-	r := m.Match(TLS())
+	r := m.Listen(TLS())
 	go func() { _ = m.Serve(ln) }()
 	go func() {
 		for {
@@ -196,7 +196,7 @@ func BenchmarkServeConnAlways(b *testing.B) {
 	defer func() { _ = m.Close() }()
 	// Rules of other entries are not asked; a global rule that waits for
 	// bytes would be, so the dedicated route comes first.
-	m.Match(HTTP1(Host("other.example.com")))
+	m.Listen(HTTP1(Host("other.example.com")))
 	if _, err := m.Add(RouteConfig{Entries: []string{"web"}, Matchers: []Matcher{HTTP1()}}); err != nil {
 		b.Fatal(err)
 	}
@@ -325,8 +325,8 @@ func BenchmarkServeConnParallelHandler(b *testing.B) {
 	hello := testutil.ClientHelloBytes(b, &tls.Config{ServerName: "www.example.com", InsecureSkipVerify: true})
 	m := New()
 	defer func() { _ = m.Close() }()
-	m.Match(Prefix("TST"))
-	m.Match(HTTP1(Host("manager.example.com")))
+	m.Listen(Prefix("TST"))
+	m.Listen(HTTP1(Host("manager.example.com")))
 	if _, err := m.Add(RouteConfig{Matchers: []Matcher{HTTP1(), TLS()}, Handler: func(c *Conn) { _ = c.Close() }}); err != nil {
 		b.Fatal(err)
 	}

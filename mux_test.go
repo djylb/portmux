@@ -19,7 +19,7 @@ import (
 
 func TestPrefixRouteReplaysBytes(t *testing.T) {
 	m := startMux(t)
-	bridge := m.Match(Prefix("TST"))
+	bridge := m.Listen(Prefix("TST"))
 	serve(t, m)
 
 	c := dial(t, m)
@@ -82,10 +82,10 @@ func tlsRequest(t *testing.T, m *testMux, serverName string, alpn ...string) str
 
 func TestTLSRoutingBySNIAndALPN(t *testing.T) {
 	m := startMux(t)
-	serveTLSNames(t, m.Match(TLS(SNI("admin.example.com"))), "admin")
-	serveTLSNames(t, m.Match(TLS(ALPN("h2"))), "h2")
-	serveTLSNames(t, m.Match(TLS(SNI("*.example.com"))), "wild")
-	serveTLSNames(t, m.Match(TLS()), "default")
+	serveTLSNames(t, m.Listen(TLS(SNI("admin.example.com"))), "admin")
+	serveTLSNames(t, m.Listen(TLS(ALPN("h2"))), "h2")
+	serveTLSNames(t, m.Listen(TLS(SNI("*.example.com"))), "wild")
+	serveTLSNames(t, m.Listen(TLS()), "default")
 	serve(t, m)
 
 	tests := []struct {
@@ -117,8 +117,8 @@ func httpServer(t *testing.T, l net.Listener, name string) {
 //goland:noinspection HttpUrlsUsage
 func TestHTTPServersOnRoutes(t *testing.T) {
 	m := startMux(t)
-	httpServer(t, m.Match(HTTP1(Host("api.example.com"), PathPrefix("/v1/"))), "api")
-	httpServer(t, m.Match(HTTP1()), "web")
+	httpServer(t, m.Listen(HTTP1(Host("api.example.com"), PathPrefix("/v1/"))), "api")
+	httpServer(t, m.Listen(HTTP1()), "web")
 	serve(t, m)
 
 	client := &http.Client{Transport: &http.Transport{}}
@@ -157,8 +157,8 @@ func TestHTTPServersOnRoutes(t *testing.T) {
 
 func TestEarlierRouteWaitsForMoreBytes(t *testing.T) {
 	m := startMux(t)
-	specific := m.Match(HTTP1(Host("a.example")))
-	general := m.Match(Prefix("GET "))
+	specific := m.Listen(HTTP1(Host("a.example")))
+	general := m.Listen(Prefix("GET "))
 	serve(t, m)
 
 	c := dial(t, m)
@@ -184,7 +184,7 @@ func TestEarlierRouteWaitsForMoreBytes(t *testing.T) {
 
 func TestClientHelloByteByByte(t *testing.T) {
 	m := startMux(t)
-	tlsRoute := m.Match(TLS(SNI("slow.example.com")))
+	tlsRoute := m.Listen(TLS(SNI("slow.example.com")))
 	serve(t, m)
 
 	hello := testutil.ClientHelloBytes(t, &tls.Config{ServerName: "slow.example.com", InsecureSkipVerify: true})
@@ -204,8 +204,8 @@ func TestClientHelloByteByByte(t *testing.T) {
 
 func TestFinalInputOnHalfClose(t *testing.T) {
 	m := startMux(t)
-	bridge := m.Match(Prefix("TST"))
-	rest := m.Match(Any())
+	bridge := m.Listen(Prefix("TST"))
+	rest := m.Listen(AnyBytes())
 	serve(t, m)
 
 	c := dial(t, m)
@@ -224,7 +224,7 @@ func TestFinalInputOnHalfClose(t *testing.T) {
 func TestNoMatchClosesConnection(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option())
-	m.Match(Prefix("TST"))
+	m.Listen(Prefix("TST"))
 	serve(t, m)
 
 	c := dial(t, m)
@@ -238,7 +238,7 @@ func TestNoMatchClosesConnection(t *testing.T) {
 func TestEmptyConnectionReportsEOF(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option())
-	m.Match(Any())
+	m.Listen(AnyBytes())
 	serve(t, m)
 
 	_ = dial(t, m).Close()
@@ -250,7 +250,7 @@ func TestEmptyConnectionReportsEOF(t *testing.T) {
 func TestSniffTimeout(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option(), WithSniffTimeout(100*time.Millisecond))
-	m.Match(Prefix("TST"))
+	m.Listen(Prefix("TST"))
 	serve(t, m)
 
 	for _, data := range []string{"", "TS"} {
@@ -267,8 +267,8 @@ func TestSniffTimeout(t *testing.T) {
 
 func TestMaxSniffBytes(t *testing.T) {
 	m := startMux(t, WithMaxSniffBytes(64))
-	hosted := m.Match(HTTP1(Host("a.example")))
-	rest := m.Match(Any())
+	hosted := m.Listen(HTTP1(Host("a.example")))
+	rest := m.Listen(AnyBytes())
 	serve(t, m)
 
 	req := "GET / HTTP/1.1\r\nX-Pad: " + strings.Repeat("p", 200) + "\r\nHost: a.example\r\n\r\n"
@@ -287,7 +287,7 @@ func TestMaxSniffBytes(t *testing.T) {
 func TestDispatchTimeout(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option(), WithDispatchTimeout(50*time.Millisecond))
-	m.Match(Prefix("A"))
+	m.Listen(Prefix("A"))
 	serve(t, m)
 
 	c := dial(t, m)
@@ -300,8 +300,8 @@ func TestDispatchTimeout(t *testing.T) {
 
 func TestRouteClose(t *testing.T) {
 	m := startMux(t)
-	first := m.Match(Prefix("A"))
-	rest := m.Match(Any())
+	first := m.Listen(Prefix("A"))
+	rest := m.Listen(AnyBytes())
 	serve(t, m)
 
 	if err := first.Close(); err != nil {
@@ -323,7 +323,7 @@ func TestRouteClose(t *testing.T) {
 func TestRouteClosedWhileDispatchingRematches(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option())
-	route := m.Match(Prefix("A"))
+	route := m.Listen(Prefix("A"))
 	serve(t, m)
 
 	c := dial(t, m)
@@ -339,7 +339,7 @@ func TestRouteClosedWhileDispatchingRematches(t *testing.T) {
 func TestMatchWhileServing(t *testing.T) {
 	m := startMux(t)
 	serve(t, m)
-	late := m.Match(Prefix("L"))
+	late := m.Listen(Prefix("L"))
 
 	c := dial(t, m)
 	_, _ = c.Write([]byte("L"))
@@ -348,7 +348,7 @@ func TestMatchWhileServing(t *testing.T) {
 
 func TestCloseStopsEverything(t *testing.T) {
 	m := startMux(t, WithSniffTimeout(-1))
-	route := m.Match(Prefix("A"))
+	route := m.Listen(Prefix("A"))
 	errc := make(chan error, 1)
 	go func() { errc <- m.Serve(m.ln) }()
 	waitServing(t, m.Mux, 1)
@@ -378,7 +378,7 @@ func TestCloseStopsEverything(t *testing.T) {
 		}
 	}
 	expectClosed(t, silent)
-	if _, err := m.Match(Any()).Accept(); !errors.Is(err, net.ErrClosed) {
+	if _, err := m.Listen(AnyBytes()).Accept(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Accept on a route added after Close = %v", err)
 	}
 	other, err := net.Listen("tcp", "127.0.0.1:0")
@@ -403,8 +403,8 @@ func TestServeSeveralListeners(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstPort := uint16(m.ln.Addr().(*net.TCPAddr).Port)
-	viaFirst := m.Match(LocalPort(firstPort))
-	rest := m.Match(Any())
+	viaFirst := m.Listen(LocalPort(firstPort))
+	rest := m.Listen(AnyBytes())
 	serve(t, m)
 	errc := make(chan error, 1)
 	go func() { errc <- m.Serve(second) }()
@@ -488,7 +488,7 @@ func TestTemporaryAcceptErrorsAreRetried(t *testing.T) {
 			mu.Unlock()
 			log.ch <- ev.Err
 		}))}
-	route := m.Match(Any())
+	route := m.Listen(AnyBytes())
 	serve(t, m)
 
 	for range 2 {
@@ -510,7 +510,7 @@ func TestTemporaryAcceptErrorsAreRetried(t *testing.T) {
 
 func TestListenerFailureStopsOnlyItsServe(t *testing.T) {
 	m := startMux(t)
-	route := m.Match(Any())
+	route := m.Listen(AnyBytes())
 	serve(t, m)
 
 	broken, err := net.Listen("tcp", "127.0.0.1:0")
@@ -529,36 +529,78 @@ func TestListenerFailureStopsOnlyItsServe(t *testing.T) {
 	accept(t, route)
 }
 
-func TestMaxPendingWaitsWhenNothingIsEvictable(t *testing.T) {
-	m := startMux(t, WithMaxPending(1), WithDispatchTimeout(300*time.Millisecond))
-	stuck := m.Match(Prefix("A")) // nobody accepts yet
+// TestMatchedConnectionsFreeTheirSlot checks that a matched connection that
+// waits for Accept gives its pending slot to the next one.
+func TestMatchedConnectionsFreeTheirSlot(t *testing.T) {
+	m := startMux(t, WithMaxPending(1), WithDispatchTimeout(-1))
+	stuck := m.Listen(Prefix("A")) // nobody accepts yet
 	serve(t, m)
 
 	_, _ = dial(t, m).Write([]byte("A"))
-	// The only pending connection is matched, so it is not evicted: the next
-	// one waits for the slot, which frees when the first one times out.
 	waitUntil(t, "the first connection is matched", func() bool { return stuck.Matched() == 1 })
-	start := time.Now()
-	c := dial(t, m)
-	_, _ = c.Write([]byte("AB"))
-	time.Sleep(100 * time.Millisecond)
-	if st := m.Stats(); st.Accepted != 1 || st.Evicted != 0 {
-		t.Fatalf("second connection taken while the slot was busy: %+v", st)
+	_, _ = dial(t, m).Write([]byte("AB"))
+	waitUntil(t, "the second connection is matched", func() bool { return stuck.Matched() == 2 })
+	if b := readN(t, accept(t, stuck), 1); string(b) != "A" {
+		t.Fatalf("read %q, want the first connection", b)
 	}
-	// The first connection times out waiting for Accept and frees the slot.
-	for deadline := time.Now().Add(5 * time.Second); m.Stats().Timeouts == 0; time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("first connection did not time out")
-		}
-	}
-	got := accept(t, stuck)
-	if b := readN(t, got, 2); string(b) != "AB" {
+	if b := readN(t, accept(t, stuck), 2); string(b) != "AB" {
 		t.Fatalf("read %q, want the second connection", b)
 	}
-	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
-		t.Fatalf("second connection served after %v while the slot was taken", elapsed)
+	if st := m.Stats(); st.Evicted != 0 {
+		t.Fatalf("stats %+v", st)
 	}
-	if st := m.Stats(); st.Evicted != 0 || st.Timeouts != 1 {
+}
+
+// TestNestedRoutesDoNotStarveSlots serves a route of a Mux with the same
+// Mux, as nesting a second round of matching inside TLS does, under a small
+// pending limit: the inner connections must not wait for slots that outer
+// connections waiting for them hold.
+func TestNestedRoutesDoNotStarveSlots(t *testing.T) {
+	m := startMux(t, WithMaxPending(2), WithDispatchTimeout(-1))
+	outer, err := m.Add(RouteConfig{Matchers: []Matcher{Prefix("NN")}, Entries: []string{""}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := m.Add(RouteConfig{Matchers: []Matcher{Prefix("NN")}, Entries: []string{"inner"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serve(t, m)
+	go func() { _ = m.Entry("inner").Serve(outer) }()
+
+	const clients = 40
+	go func() {
+		for {
+			c, err := inner.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	// Every client is served or, under the limit, evicted; none waits.
+	var wg sync.WaitGroup
+	for range clients {
+		wg.Go(func() {
+			c, err := net.Dial("tcp", m.Addr().String())
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			_, _ = c.Write([]byte("NN"))
+			_, _ = c.Read(make([]byte, 1))
+		})
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("clients still waiting: %+v", m.Stats())
+	}
+	waitPending(t, m.Mux, 0)
+	if st := m.Stats(); st.Delivered == 0 || st.Timeouts != 0 {
 		t.Fatalf("stats %+v", st)
 	}
 }
@@ -569,7 +611,7 @@ func TestProxyProtocol(t *testing.T) {
 	m := startMux(t, log.option(), WithProxyProtocol(func(_ string, remote, _ net.Addr) proxyproto.Policy {
 		return modes[remote.(*net.TCPAddr).IP.String()]
 	}))
-	bridge := m.Match(Prefix("TST"))
+	bridge := m.Listen(Prefix("TST"))
 	serve(t, m)
 
 	c := dial(t, m)
@@ -615,9 +657,9 @@ func TestProxyProtocolOptionalAndNone(t *testing.T) {
 		defer mu.Unlock()
 		return mode
 	}))
-	proxyLine := m.Match(Prefix("PROXY "))
-	bridge := m.Match(Prefix("TST"))
-	silent := m.Match(Silent(20 * time.Millisecond))
+	proxyLine := m.Listen(Prefix("PROXY "))
+	bridge := m.Listen(Prefix("TST"))
+	silent := m.Listen(Silent(20 * time.Millisecond))
 	serve(t, m)
 	setMode := func(v proxyproto.Policy) {
 		mu.Lock()
@@ -657,7 +699,7 @@ func TestProxyProtocolOptionalAndNone(t *testing.T) {
 func TestMatcherPanicIsContained(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option())
-	m.Match(MatcherFunc(func(in *Input) Result {
+	m.Listen(MatcherFunc(func(in *Input) Result {
 		switch {
 		case len(in.Bytes()) < 4:
 			return NeedMore
@@ -666,7 +708,7 @@ func TestMatcherPanicIsContained(t *testing.T) {
 		}
 		return NoMatch
 	}))
-	rest := m.Match(Any())
+	rest := m.Listen(AnyBytes())
 	serve(t, m)
 
 	c := dial(t, m)
@@ -682,7 +724,7 @@ func TestMatcherPanicIsContained(t *testing.T) {
 
 func TestConnCopyPaths(t *testing.T) {
 	m := startMux(t)
-	route := m.Match(Prefix("TST"))
+	route := m.Listen(Prefix("TST"))
 	serve(t, m)
 
 	c := dial(t, m)
@@ -736,9 +778,9 @@ func TestConnUnsupportedHalfClose(t *testing.T) {
 func TestConcurrentConnections(t *testing.T) {
 	m := startMux(t)
 	routes := map[string]net.Listener{
-		"A": m.Match(Prefix("A")),
-		"B": m.Match(HTTP1(Host("b.example"))),
-		"C": m.Match(Any()),
+		"A": m.Listen(Prefix("A")),
+		"B": m.Listen(HTTP1(Host("b.example"))),
+		"C": m.Listen(AnyBytes()),
 	}
 	serve(t, m)
 	for name, l := range routes {
@@ -806,7 +848,7 @@ func TestNewPanics(t *testing.T) {
 	}
 	m := startMux(t)
 	expectPanic("nil listener", func() { _ = m.Serve(nil) })
-	expectPanic("nil matcher", func() { m.Match(Any(), nil) })
+	expectPanic("nil matcher", func() { m.Listen(AnyBytes(), nil) })
 }
 
 // TestMaxSniffBytesAfterProxyHeader checks that matchers see at most the

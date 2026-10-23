@@ -123,7 +123,7 @@ func TestPathIsResolved(t *testing.T) {
 	if _, err := m.Add(RouteConfig{Name: "block", Priority: 10, Reject: true, Matchers: []Matcher{HTTP1(PathPrefix("/admin"))}}); err != nil {
 		t.Fatal(err)
 	}
-	routes := map[string]*Route{"web": m.Match(HTTP1())}
+	routes := map[string]*Route{"web": m.Listen(HTTP1())}
 	got := collect(routes)
 	for _, target := range []string{"/public/../admin/", "//admin", "/./admin/x", "/%61dmin/x"} {
 		data := "GET " + target + " HTTP/1.1\r\nHost: h\r\n\r\n"

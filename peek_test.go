@@ -110,7 +110,7 @@ func TestPeekTimeoutAndEOF(t *testing.T) {
 	}
 	client3, server3 := pair(t)
 	_ = client3.Close()
-	if _, err := Peek(server3, Any()); !errors.Is(err, io.EOF) {
+	if _, err := Peek(server3, AnyBytes()); !errors.Is(err, io.EOF) {
 		t.Fatalf("Peek on a closed stream = %v", err)
 	}
 }

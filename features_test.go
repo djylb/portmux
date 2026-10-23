@@ -19,9 +19,9 @@ var loopback = netip.MustParsePrefix("127.0.0.0/8")
 
 func TestSilentRouteGetsServerFirstClients(t *testing.T) {
 	m := startMux(t)
-	web := m.Match(HTTP1())
-	m.Match(TLS())
-	ssh := m.Match(SSH(), Silent(100*time.Millisecond))
+	web := m.Listen(HTTP1())
+	m.Listen(TLS())
+	ssh := m.Listen(SSH(), Silent(100*time.Millisecond))
 	serve(t, m)
 
 	start := time.Now()
@@ -46,10 +46,10 @@ func TestSilentRouteGetsServerFirstClients(t *testing.T) {
 
 func TestSilenceCheckThatFailsKeepsWaiting(t *testing.T) {
 	m := startMux(t)
-	web := m.Match(HTTP1())
+	web := m.Listen(HTTP1())
 	elsewhere := netip.MustParsePrefix("192.0.2.0/24")
-	never := m.Match(And(RemoteIP(elsewhere), Silent(30*time.Millisecond)))
-	later := m.Match(Silent(150 * time.Millisecond))
+	never := m.Listen(And(RemoteIP(elsewhere), Silent(30*time.Millisecond)))
+	later := m.Listen(Silent(150 * time.Millisecond))
 	serve(t, m)
 
 	// The first check finds no route, so the second one applies.
@@ -73,8 +73,8 @@ func TestSilenceCheckThatFailsKeepsWaiting(t *testing.T) {
 
 func TestRemoteIPDecidesWithoutBytes(t *testing.T) {
 	m := startMux(t)
-	other := m.Match(RemoteIP(netip.MustParsePrefix("192.0.2.0/24")))
-	local := m.Match(RemoteIP(loopback, netip.MustParsePrefix("::1/128")))
+	other := m.Listen(RemoteIP(netip.MustParsePrefix("192.0.2.0/24")))
+	local := m.Listen(RemoteIP(loopback, netip.MustParsePrefix("::1/128")))
 	serve(t, m)
 
 	start := time.Now()
@@ -88,8 +88,8 @@ func TestRemoteIPDecidesWithoutBytes(t *testing.T) {
 
 func TestAddressMatchersUseProxyHeader(t *testing.T) {
 	m := startMux(t, WithProxyProtocol(func(_ string, _, _ net.Addr) proxyproto.Policy { return proxyproto.Required }))
-	proxied := m.Match(And(RemoteIP(netip.MustParsePrefix("192.0.2.0/24")), LocalIP(netip.MustParsePrefix("198.51.100.2/32")), LocalPort(443)))
-	m.Match(Any())
+	proxied := m.Listen(And(RemoteIP(netip.MustParsePrefix("192.0.2.0/24")), LocalIP(netip.MustParsePrefix("198.51.100.2/32")), LocalPort(443)))
+	m.Listen(AnyBytes())
 	serve(t, m)
 
 	c := dial(t, m)
@@ -208,7 +208,7 @@ func TestSOCKSMatchers(t *testing.T) {
 func TestServeConn(t *testing.T) {
 	m := New()
 	defer func() { _ = m.Close() }()
-	route := m.Match(Prefix("TST"))
+	route := m.Listen(Prefix("TST"))
 
 	c1, c2 := net.Pipe()
 	defer func() { _ = c2.Close() }()
@@ -235,7 +235,7 @@ func TestServeConn(t *testing.T) {
 
 func TestShutdownDeliversPendingConnections(t *testing.T) {
 	m := startMux(t)
-	web := m.Match(HTTP1())
+	web := m.Listen(HTTP1())
 	serve(t, m)
 
 	c := dial(t, m)
@@ -262,7 +262,7 @@ func TestShutdownDeliversPendingConnections(t *testing.T) {
 
 func TestShutdownGivesUpAtDeadline(t *testing.T) {
 	m := startMux(t)
-	m.Match(HTTP1())
+	m.Listen(HTTP1())
 	serve(t, m)
 
 	c := dial(t, m)
@@ -285,10 +285,10 @@ func waitPending(t *testing.T, m *Mux, n int64) {
 	t.Fatalf("pending = %d, want %d", m.Stats().Pending, n)
 }
 
-func TestMaxPendingPerIP(t *testing.T) {
+func TestMaxPendingPerClient(t *testing.T) {
 	log := newErrorLog()
-	m := startMux(t, log.option(), WithMaxPendingPerIP(1), WithSniffTimeout(time.Second))
-	route := m.Match(Prefix("A"))
+	m := startMux(t, log.option(), WithMaxPendingPerClient(1), WithSniffTimeout(time.Second))
+	route := m.Listen(Prefix("A"))
 	serve(t, m)
 
 	_ = dial(t, m) // silent, holds the address's slot
@@ -304,12 +304,12 @@ func TestMaxPendingPerIP(t *testing.T) {
 
 func TestNestedMuxOverTLS(t *testing.T) {
 	outer := startMux(t)
-	secure := outer.Match(TLS(SNI("tunnel.example.com")))
+	secure := outer.Listen(TLS(SNI("tunnel.example.com")))
 	serve(t, outer)
 
 	inner := New()
 	defer func() { _ = inner.Close() }()
-	agents := inner.Match(Prefix("AGENT/1\n"))
+	agents := inner.Listen(Prefix("AGENT/1\n"))
 	go func() {
 		_ = inner.Serve(tls.NewListener(secure, &tls.Config{Certificates: []tls.Certificate{certificate(t)}}))
 	}()
@@ -376,8 +376,8 @@ func TestHeaderFilterAndLazyHeader(t *testing.T) {
 func TestSilentWithoutDeadlineSupport(t *testing.T) {
 	m := New()
 	defer func() { _ = m.Close() }()
-	m.Match(Silent(time.Millisecond))
-	web := m.Match(Prefix("GET"))
+	m.Listen(Silent(time.Millisecond))
+	web := m.Listen(Prefix("GET"))
 	go func() { _ = m.ServeConn(&memConn{data: []byte("GET /")}) }()
 	if b, err := io.ReadAll(io.LimitReader(accept(t, web), 5)); err != nil || string(b) != "GET /" {
 		t.Fatalf("read %q, %v", b, err)
@@ -387,7 +387,7 @@ func TestSilentWithoutDeadlineSupport(t *testing.T) {
 func TestBrokenReaderIsRejected(t *testing.T) {
 	m := New()
 	defer func() { _ = m.Close() }()
-	m.Match(Prefix("TST"))
+	m.Listen(Prefix("TST"))
 	if err := m.ServeConn(&memConn{data: []byte("TS")}); !errors.Is(err, io.ErrNoProgress) {
 		t.Fatalf("ServeConn = %v", err)
 	}
@@ -397,8 +397,8 @@ func TestBrokenReaderIsRejected(t *testing.T) {
 // matchers parsed and whether the connection banned its client.
 func TestEventNameAndBanned(t *testing.T) {
 	events := make(chan Event, 8)
-	m := startMux(t, WithBanPerIP(2, time.Minute, time.Minute), WithObserver(func(ev Event) { events <- ev }))
-	route := m.Match(HTTP1(Host("served.test")))
+	m := startMux(t, WithBanPerClient(2, time.Minute, time.Minute), WithObserver(func(ev Event) { events <- ev }))
+	route := m.Listen(HTTP1(Host("served.test")))
 	serve(t, m)
 	next := func() Event {
 		t.Helper()
@@ -452,7 +452,7 @@ func TestInputValues(t *testing.T) {
 		return NoMatch
 	})
 	m := startMux(t)
-	route := m.Match(magic)
+	route := m.Listen(magic)
 	serve(t, m)
 	for range 2 {
 		c := dial(t, m)
@@ -483,7 +483,7 @@ func TestInputValues(t *testing.T) {
 // queue limit override the entry's.
 func TestRouteDispatchSettings(t *testing.T) {
 	log := newErrorLog()
-	m := startMux(t, log.option(), WithDispatchTimeout(time.Minute), WithMaxQueuedPerRoute(8))
+	m := startMux(t, log.option(), WithDispatchTimeout(time.Minute), WithMaxQueued(8))
 	slow, err := m.Add(RouteConfig{Matchers: []Matcher{Prefix("S")}, DispatchTimeout: 50 * time.Millisecond, MaxQueued: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -511,7 +511,7 @@ func TestRouteDispatchSettings(t *testing.T) {
 	c = dial(t, m)
 	_, _ = c.Write([]byte("S"))
 	expectClosed(t, c)
-	if err := log.wait(t); !errors.Is(err, ErrRouteBusy) {
+	if err := log.wait(t); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("reported %v", err)
 	}
 	if err := slow.SetMaxQueued(0); err != nil {

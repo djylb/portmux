@@ -22,7 +22,7 @@ import (
 // and checks that a real client is still served long before they time out.
 func TestEvictionUnderSilentFlood(t *testing.T) {
 	m := startMux(t, WithMaxPending(8))
-	route := m.Match(Prefix("A"))
+	route := m.Listen(Prefix("A"))
 	serve(t, m)
 
 	idle := make([]net.Conn, 8)
@@ -45,39 +45,35 @@ func TestEvictionUnderSilentFlood(t *testing.T) {
 	}
 }
 
-// TestSlotWaitKeepsSniffTimeout fills the pending budget with a matched
-// connection that nobody accepts. The next client waits for the slot longer
-// than its sniff timeout, and is matched once it has one.
-func TestSlotWaitKeepsSniffTimeout(t *testing.T) {
+// TestEvictedSlotIsHandedOver fills the pending budget with an idle client.
+// The next one evicts it, takes its slot and is matched, and the eviction
+// does not count toward a ban of either.
+func TestEvictedSlotIsHandedOver(t *testing.T) {
 	log := newErrorLog()
-	m := startMux(t, log.option(), WithMaxPending(1), WithSniffTimeout(200*time.Millisecond),
-		WithDispatchTimeout(time.Second), WithBanPerIP(1, time.Minute, time.Minute))
-	route := m.Match(Prefix("GET"))
+	m := startMux(t, log.option(), WithMaxPending(1), WithSniffTimeout(time.Minute),
+		WithBanPerClient(1, time.Minute, time.Minute))
+	route := m.Listen(Prefix("GET"))
 	serve(t, m)
 
+	idle := dial(t, m)
+	waitPending(t, m.Mux, 1)
 	_, _ = dial(t, m).Write([]byte("GET"))
-	// Matched, it can no longer be evicted for the next one.
-	for deadline := time.Now().Add(5 * time.Second); route.Info().Queued != 1; time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("not queued")
-		}
-	}
-	_, _ = dial(t, m).Write([]byte("GET"))
-	if err := log.wait(t); !errors.Is(err, ErrDispatchTimeout) {
-		t.Fatalf("first connection: %v", err)
-	}
 	accept(t, route)
+	expectClosed(t, idle)
+	if err := log.wait(t); !errors.Is(err, ErrEvicted) {
+		t.Fatalf("idle connection: %v", err)
+	}
 	if bans := m.Bans(); len(bans) != 0 {
 		t.Fatalf("bans %+v", bans)
 	}
 }
 
-// TestEvictionUnderSlowloris does the same with clients that send a partial
+// TestEvictionUnderSlowloris evicts clients that send a partial
 // request head and stall.
 func TestEvictionUnderSlowloris(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option(), WithMaxPending(4))
-	web := m.Match(HTTP1())
+	web := m.Listen(HTTP1())
 	serve(t, m)
 
 	for range 4 {
@@ -149,10 +145,10 @@ type closeCounter struct {
 
 func (c *closeCounter) Close() error { c.n++; return nil }
 
-func TestRateLimitPerIP(t *testing.T) {
+func TestRateLimitPerClient(t *testing.T) {
 	log := newErrorLog()
-	m := startMux(t, log.option(), WithRateLimitPerIP(0.001, 2))
-	route := m.Match(Prefix("A"))
+	m := startMux(t, log.option(), WithRateLimitPerClient(0.001, 2))
+	route := m.Listen(Prefix("A"))
 	serve(t, m)
 
 	for range 2 {
@@ -258,7 +254,7 @@ func TestRejectRouteClosesBeforeReading(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.Match(Any())
+	m.Listen(AnyBytes())
 	serve(t, m)
 
 	start := time.Now()
@@ -275,9 +271,9 @@ func TestRejectRouteClosesBeforeReading(t *testing.T) {
 
 func TestBusyRouteDoesNotBlockOthers(t *testing.T) {
 	log := newErrorLog()
-	m := startMux(t, log.option(), WithMaxQueuedPerRoute(1))
-	busy := m.Match(Prefix("A")) // its server never accepts
-	other := m.Match(Prefix("B"))
+	m := startMux(t, log.option(), WithMaxQueued(1))
+	busy := m.Listen(Prefix("A")) // its server never accepts
+	other := m.Listen(Prefix("B"))
 	serve(t, m)
 
 	_, _ = dial(t, m).Write([]byte("A"))
@@ -285,7 +281,7 @@ func TestBusyRouteDoesNotBlockOthers(t *testing.T) {
 	c := dial(t, m)
 	_, _ = c.Write([]byte("A"))
 	expectClosed(t, c)
-	if err := log.wait(t); !errors.Is(err, ErrRouteBusy) {
+	if err := log.wait(t); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("reported %v", err)
 	}
 	_, _ = dial(t, m).Write([]byte("B"))
@@ -298,9 +294,9 @@ func TestBusyRouteDoesNotBlockOthers(t *testing.T) {
 func TestInvalidAndShortInputs(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option())
-	m.Match(Prefix("TST"))
-	web := m.Match(HTTP1())
-	m.Match(TLS())
+	m.Listen(Prefix("TST"))
+	web := m.Listen(HTTP1())
+	m.Listen(TLS())
 	serve(t, m)
 
 	inputs := []struct {
@@ -355,7 +351,7 @@ func randomBytes(n int) []byte {
 func TestOversizedHeadIsRejected(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option(), WithMaxSniffBytes(1024))
-	m.Match(HTTP1())
+	m.Listen(HTTP1())
 	serve(t, m)
 
 	c := dial(t, m)
@@ -440,7 +436,7 @@ func TestRoutingRecipes(t *testing.T) {
 		"api-tls":  add("api-tls", 0, false, TLS(SNI("api.example.com"), ALPN("h2"))),
 		"site-tls": add("site-tls", 0, false, TLS()),
 		"web":      add("web", 0, false, HTTP1(NoneOf(Host("admin.example.com")))),
-		"fallback": add("fallback", -100, false, And(Not(RemoteIP(office)), Any())),
+		"fallback": add("fallback", -100, false, And(Not(RemoteIP(office)), AnyBytes())),
 	}
 	add("blocklist", 100, true, RemoteIP(blocked))
 	got := collect(routes)
@@ -483,8 +479,8 @@ func TestRoutingRecipes(t *testing.T) {
 // connections at once and checks that every valid one is delivered.
 func TestHostileConnectionMix(t *testing.T) {
 	m := startMux(t, WithMaxPending(32), WithSniffTimeout(2*time.Second))
-	web := m.Match(HTTP1(Host("ok.example")))
-	m.Match(TLS())
+	web := m.Listen(HTTP1(Host("ok.example")))
+	m.Listen(TLS())
 	serve(t, m)
 	go func() {
 		for {
@@ -543,7 +539,7 @@ func TestHostileConnectionMix(t *testing.T) {
 func TestRateLimitPerListener(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option(), WithRateLimitPerListener(0.001, 2))
-	web := m.Match(Prefix("GET"))
+	web := m.Listen(Prefix("GET"))
 	serve(t, m)
 	for range 2 {
 		_, _ = dial(t, m).Write([]byte("GET"))
@@ -580,8 +576,8 @@ func TestShardsSpreadIPv6(t *testing.T) {
 // TestQueuedWithoutLimit counts the connections that wait for Accept also
 // when their number is not limited.
 func TestQueuedWithoutLimit(t *testing.T) {
-	m := startMux(t, WithMaxQueuedPerRoute(0))
-	route := m.Match(Prefix("A")) // its server never accepts
+	m := startMux(t, WithMaxQueued(0))
+	route := m.Listen(Prefix("A")) // its server never accepts
 	serve(t, m)
 	for range 3 {
 		_, _ = dial(t, m).Write([]byte("A"))
@@ -596,9 +592,9 @@ func TestQueuedWithoutLimit(t *testing.T) {
 // the source in the header, not to the peer.
 func TestPerClientRulesUseProxySource(t *testing.T) {
 	log := newErrorLog()
-	m := startMux(t, log.option(), WithBanPerIP(1, time.Minute, time.Minute), WithMaxPendingPerIP(1),
+	m := startMux(t, log.option(), WithBanPerClient(1, time.Minute, time.Minute), WithMaxPendingPerClient(1),
 		WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Required }))
-	route := m.Match(Prefix("A"))
+	route := m.Listen(Prefix("A"))
 	serve(t, m)
 	dst := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443}
 	from := func(ip string) []byte { return v2Header(t, &net.TCPAddr{IP: net.ParseIP(ip), Port: 40000}, dst) }
@@ -627,9 +623,9 @@ func TestPerClientRulesUseProxySource(t *testing.T) {
 	// Pending connections count per source.
 	send(from("192.0.2.7")) // undecided
 	waitUntil(t, "the source is counted", func() bool {
-		m.perIP.mu.Lock()
-		defer m.perIP.mu.Unlock()
-		return m.perIP.count[netip.MustParsePrefix("192.0.2.7/32")] == 1
+		m.perClient.mu.Lock()
+		defer m.perClient.mu.Unlock()
+		return m.perClient.count[netip.MustParsePrefix("192.0.2.7/32")] == 1
 	})
 	expectRejected(send(append(from("192.0.2.7"), "A"...)), ErrPendingLimit)
 	send(append(from("192.0.2.8"), "A"...))
@@ -641,9 +637,9 @@ func TestPerClientRulesUseProxySource(t *testing.T) {
 // nothing names another client.
 func TestHeaderFailuresCountAgainstPeer(t *testing.T) {
 	log := newErrorLog()
-	m := startMux(t, log.option(), WithBanPerIP(1, time.Minute, time.Minute),
+	m := startMux(t, log.option(), WithBanPerClient(1, time.Minute, time.Minute),
 		WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Required }))
-	m.Match(Prefix("GET"))
+	m.Listen(Prefix("GET"))
 	serve(t, m)
 
 	c := dial(t, m)
@@ -667,7 +663,7 @@ func TestHeaderFailuresCountAgainstPeer(t *testing.T) {
 func TestBansSurvivePrefixChange(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option())
-	route := m.Match(Prefix("A"))
+	route := m.Listen(Prefix("A"))
 	serve(t, m)
 	loopback := netip.MustParseAddr("127.0.0.1")
 
@@ -714,7 +710,7 @@ func TestProxyPolicyRunsOutsideAcceptLoop(t *testing.T) {
 		return proxyproto.Ignore
 	}))
 	defer close(release)
-	route := m.Match(Prefix("A"))
+	route := m.Listen(Prefix("A"))
 	serve(t, m)
 
 	_, _ = dial(t, m).Write([]byte("A")) // its policy blocks

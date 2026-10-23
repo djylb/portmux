@@ -10,9 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djylb/portmux/fingerprint"
 	"github.com/djylb/portmux/httphead"
-	"github.com/djylb/portmux/internal/testutil"
 	"github.com/djylb/portmux/tlshello"
 )
 
@@ -25,7 +23,7 @@ func TestParseMatcherRoundTrip(t *testing.T) {
 	}
 	many = append(many, netip.MustParsePrefix("2001:db8::/32"), netip.MustParsePrefix("2001:db9::/32"))
 	matchers := []Matcher{
-		Any(), Always(), SSH(), HTTP2Preface(), SOCKS4(), SOCKS5(), PostgreSQL(), MQTT(), RDP(), OpenVPN(), XMPP(), DNS(),
+		AnyBytes(), Always(), SSH(), HTTP2Preface(), SOCKS4(), SOCKS5(), PostgreSQL(), MQTT(), RDP(), OpenVPN(), XMPP(), DNS(),
 		Prefix("TST", "a\"b\x00"), Domain("*.example.com", ""), Regexp(regexp.MustCompile(`^[A-Z]+ \S+ RTSP`), 32),
 		Silent(1500 * time.Millisecond),
 		RemoteIP(netip.MustParsePrefix("192.168.1.7/24"), netip.MustParsePrefix("::1/128")), RemoteIP(many...), LocalIP(), LocalPort(80, 443),
@@ -123,7 +121,7 @@ func TestParseMatcherErrors(t *testing.T) {
 		{`Prefix("a`, 7},
 		{`Prefix("a") x`, 12},
 		{`Not()`, 0},
-		{`Not(Any(), Any())`, 0},
+		{`Not(AnyBytes(), AnyBytes())`, 0},
 		{`Silent(soon)`, 7},
 		{`Silent("1s")`, 7},
 		{`TLS(MinTLSVersion("1.2"))`, 18},
@@ -167,6 +165,13 @@ func FuzzParseMatcher(f *testing.F) {
 	})
 }
 
+// serverFilter is a TLS filter of its own, which describes itself as the
+// call that builds it.
+type serverFilter string
+
+func (s serverFilter) Match(h *tlshello.Hello) bool { return h.ServerName == string(s) }
+func (s serverFilter) String() string               { return fmt.Sprintf("Server(%q)", string(s)) }
+
 // TestParseMatcherFuncs builds calls with arguments from Names, as for the
 // filters of the fingerprint package or a matcher of your own.
 func TestParseMatcherFuncs(t *testing.T) {
@@ -176,17 +181,17 @@ func TestParseMatcherFuncs(t *testing.T) {
 				if len(args) == 0 {
 					return nil, errors.New("no country")
 				}
-				return Named(fmt.Sprintf("Country(%q)", args[0]), Any()), nil
+				return Named(fmt.Sprintf("Country(%q)", args[0]), AnyBytes()), nil
 			},
 		},
 		HTTPFilterFuncs: map[string]func(args ...string) (HTTPFilter, error){
 			"Agent": func(args ...string) (HTTPFilter, error) { return Header("User-Agent", args...), nil },
 		},
 		TLSFilterFuncs: map[string]func(args ...string) (TLSFilter, error){
-			"JA4": func(args ...string) (TLSFilter, error) { return fingerprint.MatchJA4(args...), nil },
+			"Server": func(args ...string) (TLSFilter, error) { return serverFilter(args[0]), nil },
 		},
 	}
-	const text = `Or(Country("CN"), TLS(JA4("t13d1516h2_8daaf6152771_e5627efa2ab1")))`
+	const text = `Or(Country("CN"), TLS(Server("a.example")))`
 	m, err := ParseMatcher(text, names)
 	if err != nil {
 		t.Fatal(err)
@@ -194,15 +199,10 @@ func TestParseMatcherFuncs(t *testing.T) {
 	if describe(m) != text {
 		t.Fatalf("description %s", describe(m))
 	}
-	in := NewInput(nil, nil)
-	in.SetBytes(testutil.JA4Example(), false)
-	if TLS(fingerprint.MatchJA4("t13d1516h2_8daaf6152771_e5627efa2ab1")).Match(in) != Match {
-		t.Fatal("JA4 filter in TLS")
-	}
 	if _, err := ParseMatcher(`HTTP1(Agent(curl))`, names); err != nil {
 		t.Fatal(err)
 	}
-	for text, offset := range map[string]int{`Country()`: 0, `Country(Any())`: 8, `TLS(JA5("x"))`: 4} {
+	for text, offset := range map[string]int{`Country()`: 0, `Country(AnyBytes())`: 8, `TLS(JA5("x"))`: 4} {
 		var pe *ParseError
 		if _, err := ParseMatcher(text, names); !errors.As(err, &pe) || pe.Offset != offset {
 			t.Errorf("%s: %v, want offset %d", text, err, offset)
@@ -214,7 +214,7 @@ func TestParseMatcherFuncs(t *testing.T) {
 // make connections costly, and that errors on long text stay short.
 func TestParseMatcherLimits(t *testing.T) {
 	nested := func(depth int) string {
-		return strings.Repeat("Not(", depth) + "Any()" + strings.Repeat(")", depth)
+		return strings.Repeat("Not(", depth) + "AnyBytes()" + strings.Repeat(")", depth)
 	}
 	if _, err := ParseMatcher(nested(maxParseDepth-1), nil); err != nil {
 		t.Fatalf("depth %d: %v", maxParseDepth, err)

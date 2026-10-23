@@ -72,7 +72,8 @@ func (e *ParseError) Unwrap() error { return e.Err }
 //
 // so that routes can be kept in configuration files and databases: every
 // built-in matcher and filter prints text that ParseMatcher turns into an
-// equal matcher. Strings are Go string literals; prefixes, ports, durations
+// equal matcher, except RemoteIPFunc and LocalIPFunc, whose functions have no
+// text; name them in names to keep them as text. Strings are Go string literals; prefixes, ports, durations
 // and versions are written bare. names, which may be nil, supplies the
 // matchers and filters of your own.
 //
@@ -196,7 +197,7 @@ func (p *parser) node() (*node, error) {
 
 // matcherArgs lists the matchers that take no arguments.
 var matcherArgs = map[string]func() Matcher{
-	"Any": Any, "Always": Always, "SSH": SSH, "HTTP2Preface": HTTP2Preface,
+	"AnyBytes": AnyBytes, "Always": Always, "SSH": SSH, "HTTP2Preface": HTTP2Preface,
 	"SOCKS4": SOCKS4, "SOCKS5": SOCKS5, "PostgreSQL": PostgreSQL, "MQTT": MQTT,
 	"RDP": RDP, "OpenVPN": OpenVPN, "XMPP": XMPP, "DNS": DNS,
 }

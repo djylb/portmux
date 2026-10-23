@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// clientNet returns the network of ip that per-IP limits count it under,
+// clientNet returns the network of ip that per-client limits count it under,
 // of the prefix lengths of WithClientPrefix.
 func (m *Mux) clientNet(ip netip.Addr) netip.Prefix {
 	o := m.opts.Load()

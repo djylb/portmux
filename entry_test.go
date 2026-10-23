@@ -151,7 +151,7 @@ func TestEntryRulesApplyAcrossEntries(t *testing.T) {
 	if _, err := m.Add(RouteConfig{Entries: []string{"admin"}, Matchers: []Matcher{counting}}); err != nil {
 		t.Fatal(err)
 	}
-	public, err := m.Add(RouteConfig{Name: "public", Entries: []string{"public"}, Matchers: []Matcher{Any()}})
+	public, err := m.Add(RouteConfig{Name: "public", Entries: []string{"public"}, Matchers: []Matcher{AnyBytes()}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestAlwaysTakesNoBuffer(t *testing.T) {
 
 	m := New()
 	defer func() { _ = m.Close() }()
-	r := m.Match(Always())
+	r := m.Listen(Always())
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
 	go func() { _ = m.ServeConn(server) }()
@@ -264,7 +264,7 @@ func TestEntryOptions(t *testing.T) {
 		err   error
 	}
 	reports := make(chan report, 16)
-	m := New(WithMaxPending(100), WithBanPerIP(1, time.Minute, time.Minute), WithObserver(func(ev Event) {
+	m := New(WithMaxPending(100), WithBanPerClient(1, time.Minute, time.Minute), WithObserver(func(ev Event) {
 		if ev.Err != nil {
 			reports <- report{ev.Entry, ev.Err}
 		}
@@ -286,8 +286,8 @@ func TestEntryOptions(t *testing.T) {
 		}
 	}
 	public, internal := m.Entry("public"), m.Entry("internal")
-	public.SetOptions(WithSniffTimeout(50*time.Millisecond), WithRateLimitPerIP(0.001, 2), WithBanPerIP(0, 0, 0))
-	internal.SetOptions(WithBanPerIP(0, 0, 0))
+	public.SetOptions(WithSniffTimeout(50*time.Millisecond), WithRateLimitPerClient(0.001, 2), WithBanPerClient(0, 0, 0))
+	internal.SetOptions(WithBanPerClient(0, 0, 0))
 	pub, in := listen(t, public), listen(t, internal)
 	waitServing(t, m, 2)
 
@@ -322,7 +322,7 @@ func TestEntryOptions(t *testing.T) {
 		t.Fatalf("Mux config %+v", got)
 	}
 	got := public.Config()
-	if got.SniffTimeout != 50*time.Millisecond || got.RateLimitPerIP != 0.001 || got.RateBurstPerIP != 2 || got.BanFailures != 0 || got.MaxPending != 100 {
+	if got.SniffTimeout != 50*time.Millisecond || got.RateLimitPerClient != 0.001 || got.RateBurstPerClient != 2 || got.BanFailures != 0 || got.MaxPending != 100 {
 		t.Fatalf("public config %+v", got)
 	}
 	// A change to the Mux applies to what the entry does not override, and
@@ -355,14 +355,14 @@ func TestEntryOptions(t *testing.T) {
 // changes.
 func TestEntryOwnRateBuckets(t *testing.T) {
 	log := newErrorLog()
-	m := New(WithRateLimitPerIP(0.001, 1), log.option())
+	m := New(WithRateLimitPerClient(0.001, 1), log.option())
 	t.Cleanup(func() { _ = m.Close() })
 	web, err := m.Add(RouteConfig{Matchers: []Matcher{Prefix("GET")}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	own := m.Entry("own")
-	own.SetOptions(WithRateLimitPerIP(0.001, 1))
+	own.SetOptions(WithRateLimitPerClient(0.001, 1))
 	def, ln := listen(t, m.Entry("")), listen(t, own)
 	waitServing(t, m, 2)
 
@@ -372,7 +372,7 @@ func TestEntryOwnRateBuckets(t *testing.T) {
 	_ = dialTo(t, ln, "GET")
 	accept(t, web)
 	for _, rate := range []float64{0.002, 0.001} {
-		m.SetOptions(WithRateLimitPerIP(rate, 1))
+		m.SetOptions(WithRateLimitPerClient(rate, 1))
 		expectClosed(t, dialTo(t, ln, "GET"))
 		if err := log.wait(t); !errors.Is(err, ErrRateLimited) {
 			t.Fatalf("after the Mux's rate became %v: %v", rate, err)

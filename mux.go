@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -31,7 +32,7 @@ type Mux struct {
 	seq         atomic.Uint64 // orders routes added with equal priority
 	accepts     atomic.Uint64 // numbers the connections from Serve
 	slots       *slotLimit
-	perIP       pendingLimit
+	perClient   pendingLimit
 	rate        atomic.Pointer[rateLimit]
 	entries     atomic.Pointer[map[string]*entryConfig] // entries with options of their own
 	bans        *banList
@@ -80,7 +81,7 @@ func New(opts ...Option) *Mux {
 		quit:      make(chan struct{}),
 		listeners: make(map[net.Listener]*listener),
 		slots:     newSlotLimit(),
-		perIP:     pendingLimit{count: make(map[netip.Prefix]int)},
+		perClient: pendingLimit{count: make(map[netip.Prefix]int)},
 		bans:      newBanList(),
 	}
 	o := newOptions(opts)
@@ -98,7 +99,7 @@ func New(opts ...Option) *Mux {
 // with. Lowering WithMaxPending closes nothing at once: for each connection it
 // accepts over the limit, Serve evicts the oldest undecided one, as at the
 // limit, and waits until enough pending connections are gone. A new
-// WithRateLimitPerIP starts every client with a full bucket.
+// WithRateLimitPerClient starts every client with a full bucket.
 func (m *Mux) SetOptions(opts ...Option) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -124,13 +125,15 @@ func (m *Mux) Config() Config {
 	return m.opts.Load().config()
 }
 
-// Match adds an unnamed route with priority 0 for the matchers and returns
-// it. Routes with equal priority are tried in the order they were added, so
-// for a static setup Match routes can simply be added from specific to
-// general. Match panics on a nil matcher.
-func (m *Mux) Match(matchers ...Matcher) *Route {
+// Listen adds an unnamed route with priority 0 for the matchers and returns
+// it, a net.Listener of the connections it matches. Routes with equal
+// priority are tried in the order they were added, so for a static setup
+// Listen routes can simply be added from specific to general. After Close it
+// returns a closed route, whose Accept returns net.ErrClosed, as a listener
+// does. Listen panics on a nil matcher.
+func (m *Mux) Listen(matchers ...Matcher) *Route {
 	r, err := m.Add(RouteConfig{Matchers: matchers})
-	if err != nil {
+	if err != nil && !errors.Is(err, net.ErrClosed) {
 		panic(err)
 	}
 	return r
@@ -138,7 +141,8 @@ func (m *Mux) Match(matchers ...Matcher) *Route {
 
 // Add adds a route. Each change of the routes rebuilds what connections are
 // matched against, in time that grows with the number of routes, so add many
-// routes at once with Batch.
+// routes at once with Batch. After Close it returns net.ErrClosed with the
+// route, closed.
 func (m *Mux) Add(cfg RouteConfig) (*Route, error) {
 	var r *Route
 	err := m.Batch(func(b *Batch) error {
@@ -222,7 +226,7 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 		if !m.acquireSlot() {
 			_ = c.Close()
 			if a.counted {
-				m.perIP.release(a.client)
+				m.perClient.release(a.client)
 			}
 			return net.ErrClosed
 		}
@@ -275,7 +279,7 @@ func (m *Mux) admit(c net.Conn, l *listener) (admission, error) {
 		return a, nil
 	}
 	a := admission{proxy: proxyproto.Ignore}
-	if o.maxPendingPerIP <= 0 && rate == nil && o.banFailures <= 0 && m.bans.size.Load() == 0 {
+	if o.maxPendingPerClient <= 0 && rate == nil && o.banFailures <= 0 && m.bans.size.Load() == 0 {
 		return a, nil
 	}
 	return m.admitClient(a, c.RemoteAddr(), o, rate)
@@ -303,29 +307,38 @@ func (m *Mux) admitClient(a admission, client net.Addr, o *options, rate *rateLi
 		return a, ErrBanned
 	case rate != nil && !rate.allow(key):
 		return a, ErrRateLimited
-	case o.maxPendingPerIP <= 0:
+	case o.maxPendingPerClient <= 0:
 		return a, nil
-	case !m.perIP.acquire(key, o.maxPendingPerIP):
+	case !m.perClient.acquire(key, o.maxPendingPerClient):
 		return a, ErrPendingLimit
 	}
 	a.counted = true
 	return a, nil
 }
 
-// releaseAdmitted frees the pending slot and the pending count per client of
+// freeAdmitted gives back the pending slot and the client's pending count of
+// a.
+func (m *Mux) freeAdmitted(a *admission) {
+	if a.counted {
+		m.perClient.release(a.client)
+		a.counted = false
+	}
+	m.slots.release()
+}
+
+// releaseAdmitted frees, when held, the pending slot and the pending count per client of
 // a connection accepted by Serve, and counts err, its failure if any, toward
 // banning the client, or the peer when the failure came before a PROXY
 // header named the client. It reports whether that banned the client.
-func (m *Mux) releaseAdmitted(l *listener, a admission, err error) (banned bool) {
-	if a.counted {
-		m.perIP.release(a.client)
+func (m *Mux) releaseAdmitted(l *listener, a admission, held bool, err error) (banned bool) {
+	if held {
+		m.freeAdmitted(&a)
 	}
-	m.slots.release()
 	key := a.client
 	if !key.IsValid() {
 		key = a.peer
 	}
-	if o, _ := m.settings(l.entry); err != nil && o.banFailures > 0 && key.IsValid() && banWorthy(err) {
+	if o, _ := m.settings(l.entry); err != nil && o.banFailures > 0 && o.banTime > 0 && key.IsValid() && banWorthy(err) {
 		return m.bans.fail(m.banKey(l.entry, key), m.bans.now(), o.banFailures, o.banWindow, o.banTime)
 	}
 	return false
@@ -336,15 +349,35 @@ func (m *Mux) releaseAdmitted(l *listener, a admission, err error) (banned bool)
 func (m *Mux) serveAccepted(c net.Conn, a admission, l *listener, at arrival) {
 	handler, conn, _ := m.serveConn(c, l, a, l.entry, at)
 	if handler != nil {
-		handler(conn)
+		_ = m.runHandler(handler, conn)
 	}
+}
+
+// runHandler calls the handler of a route with conn. A panic is recovered:
+// the connection is closed and the panic reported as a *PanicError, to the
+// observer and to the caller.
+func (m *Mux) runHandler(handler func(*Conn), conn *Conn) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = &PanicError{Value: p, Stack: debug.Stack()}
+			_ = conn.Close()
+			m.observe(Event{Entry: conn.entry, Remote: conn.RemoteAddr(), Local: conn.LocalAddr(), Route: conn.route, Err: err})
+		}
+	}()
+	handler(conn)
+	return nil
 }
 
 // ServeConn matches c and hands it to a route, in the calling goroutine. It
 // returns nil once a route accepted c; for a route with a handler, it calls
-// the handler and returns when the handler returns. Otherwise it closes c and
-// returns the reason, which the observer of WithObserver also receives.
-// Connections passed to ServeConn do not count against the pending limits.
+// the handler and returns when the handler returns, or a *PanicError when
+// the handler panicked. Otherwise it closes c and returns the reason, which
+// the observer of WithObserver also receives.
+//
+// Connections passed to ServeConn skip the admission that Serve applies: the
+// pending limits, the per-client rate limits and bans, and the listener rate.
+// To keep them for connections that a program obtains itself, hand them to
+// Serve through a net.Listener of its own, such as a channel listener.
 // The sniff timeout and silence checks rely on c supporting read deadlines. c
 // belongs to the entry with the empty name; Entry routes connections of other
 // entries.
@@ -367,7 +400,7 @@ func (m *Mux) serveOne(entry string, c net.Conn) error {
 	counts.accepted.Add(1)
 	handler, conn, err := m.serveConn(c, nil, admission{}, entry, at)
 	if handler != nil {
-		handler(conn)
+		err = m.runHandler(handler, conn)
 	}
 	return err
 }

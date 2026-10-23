@@ -26,11 +26,11 @@ func Example() {
 	}
 	m := portmux.New()
 
-	agents := m.Match(portmux.Prefix("AGENT/1\n"))
-	admin := m.Match(portmux.TLS(portmux.SNI("admin.example.com")))
-	site := m.Match(portmux.TLS())
-	redirect := m.Match(portmux.HTTP1())
-	ssh := m.Match(portmux.SSH(), portmux.Silent(2*time.Second))
+	agents := m.Listen(portmux.Prefix("AGENT/1\n"))
+	admin := m.Listen(portmux.TLS(portmux.SNI("admin.example.com")))
+	site := m.Listen(portmux.TLS())
+	redirect := m.Listen(portmux.HTTP1())
+	ssh := m.Listen(portmux.SSH(), portmux.Silent(2*time.Second))
 
 	go serveAgents(agents)
 	go serveAgents(ssh)
@@ -67,9 +67,9 @@ func ExampleHTTP1() {
 	m := portmux.New()
 	defer func() { _ = m.Close() }()
 
-	_ = m.Match(portmux.HTTP1(portmux.Host("tunnel.example.com"), portmux.Path("/ws"), portmux.WebSocket()))
-	api := m.Match(portmux.HTTP1(portmux.Host("*.example.com"), portmux.PathPrefix("/api/")))
-	_ = m.Match(portmux.HTTP1())
+	_ = m.Listen(portmux.HTTP1(portmux.Host("tunnel.example.com"), portmux.Path("/ws"), portmux.WebSocket()))
+	api := m.Listen(portmux.HTTP1(portmux.Host("*.example.com"), portmux.PathPrefix("/api/")))
+	_ = m.Listen(portmux.HTTP1())
 	go func() { _ = m.Serve(ln) }()
 
 	c, err := net.Dial("tcp", ln.Addr().String())
@@ -101,8 +101,8 @@ func ExampleWithProxyProtocol() {
 		return proxyproto.Ignore
 	}))
 	// RemoteIP sees the client address from the PROXY header.
-	_ = m.Match(portmux.And(portmux.RemoteIP(office), portmux.TLS(portmux.SNI("admin.example.com"))))
-	_ = m.Match(portmux.TLS())
+	_ = m.Listen(portmux.And(portmux.RemoteIP(office), portmux.TLS(portmux.SNI("admin.example.com"))))
+	_ = m.Listen(portmux.TLS())
 
 	ln, err := net.Listen("tcp", ":443")
 	if err != nil {
@@ -165,11 +165,11 @@ func ExampleMux_Batch() {
 // Mux.
 func ExampleMux_Serve_nested() {
 	outer := portmux.New()
-	secure := outer.Match(portmux.TLS(portmux.SNI("tunnel.example.com")))
+	secure := outer.Listen(portmux.TLS(portmux.SNI("tunnel.example.com")))
 
 	inner := portmux.New()
-	agents := inner.Match(portmux.Prefix("AGENT/1\n"))
-	web := inner.Match(portmux.HTTP1())
+	agents := inner.Listen(portmux.Prefix("AGENT/1\n"))
+	web := inner.Listen(portmux.HTTP1())
 	go func() { _ = inner.Serve(tls.NewListener(secure, &tls.Config{ /* certificates */ })) }()
 	go serveAgents(agents)
 	go func() { _ = http.Serve(web, publicHandler()) }()

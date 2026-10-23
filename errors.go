@@ -1,6 +1,9 @@
 package portmux
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	// ErrNoMatch is reported for a connection that no route accepted.
@@ -16,30 +19,30 @@ var (
 	ErrDispatchTimeout = errors.New("portmux: dispatch timeout")
 
 	// ErrPendingLimit is reported for a connection closed because its client
-	// reached the WithMaxPendingPerIP limit.
+	// reached the WithMaxPendingPerClient limit.
 	ErrPendingLimit = errors.New("portmux: too many pending connections from one client")
 
 	// ErrRateLimited is reported for a connection closed because its client
-	// or its listener took connections faster than WithRateLimitPerIP or
+	// or its listener took connections faster than WithRateLimitPerClient or
 	// WithRateLimitPerListener allows.
 	ErrRateLimited = errors.New("portmux: connection rate exceeded")
 
 	// ErrBanned is reported for a connection closed because its client is
-	// banned; see WithBanPerIP and Mux.Ban.
+	// banned; see WithBanPerClient and Mux.Ban.
 	ErrBanned = errors.New("portmux: client is banned")
 
 	// ErrEvicted is reported for an undecided connection closed to make room
 	// for a new one when the WithMaxPending limit was reached.
 	ErrEvicted = errors.New("portmux: evicted to make room for new connections")
 
-	// ErrRouteBusy is reported for a matched connection closed because its
-	// route already had WithMaxQueuedPerRoute connections waiting for Accept,
+	// ErrQueueFull is reported for a matched connection closed because its
+	// route already had WithMaxQueued connections waiting for Accept,
 	// which tells that its server does not keep up.
-	ErrRouteBusy = errors.New("portmux: route has too many connections waiting")
+	ErrQueueFull = errors.New("portmux: route has too many connections waiting")
 
-	// ErrRouteFull is reported for a matched connection closed because its
+	// ErrConnLimit is reported for a matched connection closed because its
 	// route already had RouteConfig.MaxConns connections open.
-	ErrRouteFull = errors.New("portmux: route has too many open connections")
+	ErrConnLimit = errors.New("portmux: route has too many open connections")
 
 	// ErrRouteClosed is reported for a connection that a resolver sent to a
 	// route that was closed or removed.
@@ -48,6 +51,31 @@ var (
 	// ErrRefused is reported for a connection closed by a reject route.
 	ErrRefused = errors.New("portmux: refused by a reject route")
 
+	// ErrEntryMismatch is reported for a connection that a resolver sent to
+	// a route limited to other entries; see RouteConfig.Entries.
+	ErrEntryMismatch = errors.New("portmux: resolved to a route of another entry")
+
 	// ErrDuplicateName is returned when a route name is already in use.
 	ErrDuplicateName = errors.New("portmux: duplicate route name")
+
+	// ErrInvalidRoute is wrapped by the errors that Add, Batch and the
+	// setters of a Route return for a configuration that is not valid, such
+	// as a fallback route with matchers, or for a route of another Mux; and
+	// by the error reported for a connection that a resolver sent to a
+	// route of another Mux.
+	ErrInvalidRoute = errors.New("portmux: invalid route")
 )
+
+// PanicError is reported for a connection whose matcher, resolver, PROXY
+// protocol policy or route handler panicked: the Mux recovers, closes the
+// connection and goes on serving the others.
+type PanicError struct {
+	// Value is the value passed to panic.
+	Value any
+	// Stack is the stack of the goroutine that panicked.
+	Stack []byte
+}
+
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("portmux: panic serving a connection: %v", e.Value)
+}

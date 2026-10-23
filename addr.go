@@ -26,10 +26,33 @@ func LocalIP(prefixes ...netip.Prefix) Matcher {
 	return ipMatcher{name: "LocalIP", set: ipmatch.NewSet(prefixes...)}
 }
 
+// RemoteIPFunc matches connections from a client whose address contains
+// accepts, as RemoteIP does for a fixed list: for lists that change while
+// the Mux runs, such as a block list behind an atomic.Pointer to an
+// ipmatch.Set, without rebuilding the routes. IPv4-mapped IPv6 addresses are
+// passed as IPv4. contains is called for every connection that the route is
+// tried for, from many goroutines at once, and must not block.
+func RemoteIPFunc(contains func(netip.Addr) bool) Matcher {
+	if contains == nil {
+		panic("portmux: nil RemoteIPFunc function")
+	}
+	return ipMatcher{name: "RemoteIPFunc", contains: contains, remote: true}
+}
+
+// LocalIPFunc is RemoteIPFunc for the local address, as LocalIP is
+// RemoteIP.
+func LocalIPFunc(contains func(netip.Addr) bool) Matcher {
+	if contains == nil {
+		panic("portmux: nil LocalIPFunc function")
+	}
+	return ipMatcher{name: "LocalIPFunc", contains: contains}
+}
+
 type ipMatcher struct {
-	name   string
-	set    *ipmatch.Set
-	remote bool
+	name     string
+	set      *ipmatch.Set
+	contains func(netip.Addr) bool // when set is nil
+	remote   bool
 }
 
 func (m ipMatcher) Match(in *Input) Result {
@@ -37,10 +60,18 @@ func (m ipMatcher) Match(in *Input) Result {
 	if m.remote {
 		a = in.remote
 	}
+	if m.set == nil {
+		return matchAddr(a, func(ap netip.AddrPort) bool { return m.contains(ap.Addr()) })
+	}
 	return matchAddr(a, func(ap netip.AddrPort) bool { return m.set.Contains(ap.Addr()) })
 }
 
-func (m ipMatcher) String() string { return call(m.name, m.set.Prefixes(), netip.Prefix.String) }
+func (m ipMatcher) String() string {
+	if m.set == nil {
+		return m.name + "(...)"
+	}
+	return call(m.name, m.set.Prefixes(), netip.Prefix.String)
+}
 
 // LocalPort matches connections to one of the local ports, which tells apart
 // the listeners when one Mux serves several. The port comes from the PROXY

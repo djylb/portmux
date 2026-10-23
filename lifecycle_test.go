@@ -25,7 +25,7 @@ import (
 func TestFallbackTakesUnmatchedConnections(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option(), WithSniffTimeout(150*time.Millisecond))
-	bridge := m.Match(Prefix("TST"))
+	bridge := m.Listen(Prefix("TST"))
 	fallback := mustAdd(t, m, RouteConfig{Name: "default", Fallback: true})
 	// Added after the fallback with a lower priority, yet still tried first.
 	web := mustAdd(t, m, RouteConfig{Priority: -1000, Matchers: []Matcher{HTTP1()}})
@@ -60,7 +60,7 @@ func TestFallbackTakesUnmatchedConnections(t *testing.T) {
 
 func TestFallbackStandby(t *testing.T) {
 	m := startMux(t)
-	m.Match(Prefix("TST"))
+	m.Listen(Prefix("TST"))
 	old := mustAdd(t, m, RouteConfig{Name: "old", Fallback: true})
 	next := mustAdd(t, m, RouteConfig{Name: "next", Fallback: true, Priority: -1})
 	serve(t, m)
@@ -76,16 +76,33 @@ func TestFallbackStandby(t *testing.T) {
 	_, _ = dial(t, m).Write([]byte("x"))
 	accept(t, next)
 
-	for _, cfg := range []RouteConfig{
-		{Fallback: true, Matchers: []Matcher{Any()}},
-		{Fallback: true, Reject: true},
-	} {
-		if _, err := m.Add(cfg); !errors.Is(err, errFallbackConfig) {
-			t.Errorf("Add(%+v) = %v", cfg, err)
-		}
+	if _, err := m.Add(RouteConfig{Fallback: true, Matchers: []Matcher{AnyBytes()}}); !errors.Is(err, ErrInvalidRoute) {
+		t.Errorf("Add of a fallback with matchers = %v", err)
 	}
-	if err := next.SetMatchers(Any()); !errors.Is(err, errFallbackConfig) {
+	if err := next.SetMatchers(AnyBytes()); !errors.Is(err, ErrInvalidRoute) {
 		t.Errorf("SetMatchers on a fallback = %v", err)
+	}
+}
+
+// TestRejectFallback checks a fallback route that rejects, which closes
+// what the allowed routes did not take.
+func TestRejectFallback(t *testing.T) {
+	log := newErrorLog()
+	m := startMux(t, log.option())
+	allowed := m.Listen(Prefix("OK"))
+	mustAdd(t, m, RouteConfig{Fallback: true, Reject: true})
+	serve(t, m)
+
+	_, _ = dial(t, m).Write([]byte("OK"))
+	accept(t, allowed)
+	c := dial(t, m)
+	_, _ = c.Write([]byte("NO"))
+	expectClosed(t, c)
+	if err := log.wait(t); !errors.Is(err, ErrRefused) {
+		t.Fatalf("reported %v, want the fallback to refuse", err)
+	}
+	if st := m.Stats(); st.Refused != 1 {
+		t.Fatalf("stats %+v", st)
 	}
 }
 
@@ -183,8 +200,8 @@ func TestSnapshotDescribesRoutes(t *testing.T) {
 
 func TestBatchPreviewAndNoDeadlock(t *testing.T) {
 	m := startMux(t)
-	a := mustAdd(t, m, RouteConfig{Name: "a", Priority: 10, Matchers: []Matcher{Any()}})
-	b := mustAdd(t, m, RouteConfig{Name: "b", Priority: 0, Matchers: []Matcher{Any()}})
+	a := mustAdd(t, m, RouteConfig{Name: "a", Priority: 10, Matchers: []Matcher{AnyBytes()}})
+	b := mustAdd(t, m, RouteConfig{Name: "b", Priority: 0, Matchers: []Matcher{AnyBytes()}})
 
 	err := m.Batch(func(bt *Batch) error {
 		// Other methods of the Mux, even other batches, work inside a batch.
@@ -194,7 +211,7 @@ func TestBatchPreviewAndNoDeadlock(t *testing.T) {
 		if err := b.SetPriority(1); err != nil {
 			return err
 		}
-		c, err := bt.Add(RouteConfig{Name: "c", Priority: 5, Matchers: []Matcher{Any()}})
+		c, err := bt.Add(RouteConfig{Name: "c", Priority: 5, Matchers: []Matcher{AnyBytes()}})
 		if err != nil {
 			return err
 		}
@@ -216,7 +233,7 @@ func TestBatchPreviewAndNoDeadlock(t *testing.T) {
 		if err := bt.SetPriority(b, 100); err != nil {
 			return err
 		}
-		if _, err := bt.Add(RouteConfig{Name: "d", Matchers: []Matcher{Any()}}); err != nil {
+		if _, err := bt.Add(RouteConfig{Name: "d", Matchers: []Matcher{AnyBytes()}}); err != nil {
 			return err
 		}
 		return b.Close() // removed by another call before this batch commits
@@ -272,9 +289,9 @@ func TestNoGoroutineLeaks(t *testing.T) {
 			t.Fatal(err)
 		}
 		m := New(WithSniffTimeout(100*time.Millisecond), WithDispatchTimeout(100*time.Millisecond), WithMaxPending(4))
-		served := m.Match(Prefix("A"))
-		m.Match(Prefix("S")) // nobody accepts: dispatch timeouts
-		m.Match(Silent(20 * time.Millisecond))
+		served := m.Listen(Prefix("A"))
+		m.Listen(Prefix("S")) // nobody accepts: dispatch timeouts
+		m.Listen(Silent(20 * time.Millisecond))
 		errc := make(chan error, 1)
 		go func() { errc <- m.Serve(ln) }()
 		var accepted sync.WaitGroup
@@ -318,10 +335,10 @@ func TestNoGoroutineLeaks(t *testing.T) {
 }
 
 // TestRejectionReleasesAtOnce checks that a connection that matches nothing
-// gives back its slot, its per-IP count and its buffer immediately.
+// gives back its slot, its per-client count and its buffer immediately.
 func TestRejectionReleasesAtOnce(t *testing.T) {
-	m := startMux(t, WithMaxPendingPerIP(1), WithMaxPending(1))
-	route := m.Match(Prefix("A"))
+	m := startMux(t, WithMaxPendingPerClient(1), WithMaxPending(1))
+	route := m.Listen(Prefix("A"))
 	serve(t, m)
 
 	for range 20 {
@@ -332,11 +349,11 @@ func TestRejectionReleasesAtOnce(t *testing.T) {
 	_, _ = dial(t, m).Write([]byte("A"))
 	accept(t, route)
 	waitPending(t, m.Mux, 0)
-	m.perIP.mu.Lock()
-	n := len(m.perIP.count)
-	m.perIP.mu.Unlock()
+	m.perClient.mu.Lock()
+	n := len(m.perClient.count)
+	m.perClient.mu.Unlock()
 	if st := m.Stats(); n != 0 || st.NoMatch != 20 || st.Delivered != 1 || st.Evicted != 0 || st.Limited != 0 {
-		t.Fatalf("per-IP entries %d, stats %+v", n, st)
+		t.Fatalf("per-client entries %d, stats %+v", n, st)
 	}
 }
 
@@ -348,7 +365,7 @@ func TestIdleConnectionsHoldNoBuffer(t *testing.T) {
 	bufferTaken.Store(&count)
 	defer bufferTaken.Store(nil)
 	m := startMux(t)
-	m.Match(HTTP1())
+	m.Listen(HTTP1())
 	serve(t, m)
 
 	idle := make([]net.Conn, 50)
@@ -387,7 +404,7 @@ func TestIdleConnectionsHoldNoBuffer(t *testing.T) {
 // bytes in odd-sized writes and checks that the server reads exactly them.
 func TestStreamIntegrity(t *testing.T) {
 	m := startMux(t)
-	route := m.Match(TLS(SNI("bulk.example")))
+	route := m.Listen(TLS(SNI("bulk.example")))
 	serve(t, m)
 
 	hello := testutil.ClientHelloBytes(t, &tls.Config{ServerName: "bulk.example", InsecureSkipVerify: true})
@@ -417,7 +434,7 @@ func TestStreamIntegrity(t *testing.T) {
 }
 
 func TestSniffLimitIsClamped(t *testing.T) {
-	if got := newOptions([]Option{WithMaxSniffBytes(math.MaxInt)}).maxSniffBytes; got != MaxSniffBytes {
+	if got := newOptions([]Option{WithMaxSniffBytes(math.MaxInt)}).maxSniffBytes; got != MaxSniffBytesLimit {
 		t.Fatalf("maxSniffBytes = %d", got)
 	}
 }
@@ -489,7 +506,7 @@ func TestShutdownKeepsAcceptedConnections(t *testing.T) {
 			t.Fatal(err)
 		}
 		m := New()
-		r := m.Match(Always())
+		r := m.Listen(Always())
 		got := make(chan *Conn, 1)
 		go func() {
 			if c, err := r.AcceptConn(); err == nil {

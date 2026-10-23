@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/djylb/netx/proxyproto"
+	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/tlshello"
 )
@@ -25,7 +26,9 @@ type Conn struct {
 	pending []byte
 	buf     *[]byte
 	hello   *tlshello.Hello
-	req     *httphead.Request
+	req     *httphead.Request // HTTP/1.x
+	req2    *httphead.Request // h2c
+	values  []inputValue      // of Input.SetValue
 	proxy   *proxyproto.Header
 	route   *Route
 	mux     *Mux      // counts the connection while open, with ln
@@ -199,11 +202,56 @@ func (c *Conn) ClientHello() *tlshello.Hello {
 	return c.hello
 }
 
-// HTTPRequest returns the HTTP/1.x request head, or the first request of an
-// h2c connection, parsed while matching, or nil when none was parsed. It is
-// always set for routes that matched with HTTP1 or HTTP2.
+// HTTPRequest returns the HTTP/1.x request head parsed while matching, or
+// nil when none was parsed. It is always set for routes that matched with
+// HTTP1.
 func (c *Conn) HTTPRequest() *httphead.Request {
 	return c.req
+}
+
+// HTTP2Request returns the first request of a cleartext HTTP/2 connection
+// parsed while matching, or nil when none was parsed. It is always set for
+// routes that matched with HTTP2.
+func (c *Conn) HTTP2Request() *httphead.Request {
+	return c.req2
+}
+
+// RequestedName returns the host name the client asked for, as
+// Input.RequestedName does: the SNI of the ClientHello, or the host of the
+// HTTP request without its port, normalized, from what was parsed while
+// matching, or "" without one.
+func (c *Conn) RequestedName() string {
+	return requestedName(c.hello, c.req, c.req2)
+}
+
+// requestedName returns the normalized name of the first that is parsed, or
+// "".
+func requestedName(hello *tlshello.Hello, req, req2 *httphead.Request) string {
+	var n hostmatch.Name
+	switch {
+	case hello != nil:
+		n = hello.Name()
+	case req != nil:
+		n = req.Name()
+	case req2 != nil:
+		n = req2.Name()
+	}
+	if !n.Valid() {
+		return ""
+	}
+	return n.String()
+}
+
+// Value returns the value that a matcher or resolver stored under key with
+// Input.SetValue while the connection was matched, or nil, so that what a
+// parser of your own found reaches the server of the route.
+func (c *Conn) Value(key any) any {
+	for _, v := range c.values {
+		if v.key == key {
+			return v.value
+		}
+	}
+	return nil
 }
 
 // ProxyHeader returns the PROXY protocol header, or nil when none was parsed.

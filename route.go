@@ -24,7 +24,9 @@ type RouteConfig struct {
 	// Without entries the route applies to every entry, which suits rules
 	// such as block lists; a global route that waits for bytes also holds
 	// back the later routes of every entry, so give such routes entries or a
-	// lower priority than the routes of dedicated entries.
+	// lower priority than the routes of dedicated entries. Entries also bind
+	// resolvers: a resolver that sends a connection to a route limited to
+	// other entries gets it closed with ErrEntryMismatch.
 	Entries []string
 	// Matchers select the connections of the route; one of them matching is
 	// enough. A route without matchers matches nothing, which pauses it while
@@ -39,7 +41,8 @@ type RouteConfig struct {
 	// list that closes connections before reading from them. Matchers rule
 	// out what they cannot parse or find ambiguous, such as a request with two
 	// Host fields, so a reject route does not see it: where reject routes
-	// guard the others, make the fallback a reject route too.
+	// guard the others, make the fallback a reject route too, with Fallback
+	// and Reject, which closes whatever no other route took.
 	Reject bool
 	// Fallback makes the route take the connections that no other route
 	// matched, after all of them, whatever their priorities: those every
@@ -51,10 +54,10 @@ type RouteConfig struct {
 	Fallback bool
 	// MaxConns limits the connections the route has open: delivered, or
 	// waiting for Accept, and not closed yet. Connections over the limit are
-	// closed and reported with ErrRouteFull. Zero means no limit.
+	// closed and reported with ErrConnLimit. Zero means no limit.
 	MaxConns int
 	// DispatchTimeout and MaxQueued override WithDispatchTimeout and
-	// WithMaxQueuedPerRoute for the route, so that a route whose server is
+	// WithMaxQueued for the route, so that a route whose server is
 	// slow to accept can wait longer, or queue less, than the others of its
 	// entry. Zero keeps the entry's setting, and a negative value removes the
 	// limit. They do not apply to a route with a Handler.
@@ -64,8 +67,10 @@ type RouteConfig struct {
 	// each matched connection is passed to it in the goroutine that matched
 	// it, once it no longer counts as pending. This saves the accept loop,
 	// the hand-over to it and the queue, so dispatch timeouts and
-	// WithMaxQueuedPerRoute do not apply. The handler owns the connection
-	// and must close it. Accept of such a route never returns a connection.
+	// WithMaxQueued do not apply. The handler owns the connection and must
+	// close it. A panic in the handler closes the connection and is
+	// reported to the observer as a *PanicError, as one in a matcher is.
+	// Accept of such a route never returns a connection.
 	Handler func(c *Conn)
 }
 
@@ -84,7 +89,8 @@ type RouteConfig struct {
 //
 // Its decisions must be final, as a matcher's are. It runs in the Mux's
 // goroutines, must not block, and must not retain the Input. A connection it
-// sends to a closed route is closed and reported with ErrRouteClosed.
+// sends to a closed route is closed and reported with ErrRouteClosed, and one
+// it sends to a route limited to other entries with ErrEntryMismatch.
 type ResolveFunc func(in *Input) (*Route, Result)
 
 // Route is a net.Listener for the connections matched by one route of a Mux.

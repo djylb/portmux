@@ -78,7 +78,7 @@ type namedMatcher struct {
 
 func (n namedMatcher) Match(in *Input) Result           { return n.m.Match(in) }
 func (n namedMatcher) String() string                   { return n.name }
-func (n namedMatcher) silences(add func(time.Duration)) { reportSilences([]Matcher{n.m}, add) }
+func (n namedMatcher) Silences(add func(time.Duration)) { reportSilences([]Matcher{n.m}, add) }
 
 // describe returns the description of a matcher or filter: its String method,
 // or else its type.
@@ -106,10 +106,16 @@ func call[T any](name string, args []T, format func(T) string) string {
 
 func quote(s string) string { return strconv.Quote(s) }
 
-// silencer is implemented by matchers that decide on silence. The Mux checks
-// silent connections again at each reported duration after accepting them.
-type silencer interface {
-	silences(add func(time.Duration))
+// Silencer is implemented by matchers that decide on silence, as Silent
+// does. Silences reports, by calling add, the times after taking a connection
+// at which the Mux checks a connection that has sent nothing again; the
+// matcher reads Input.Elapsed then. And, Or, Not and Named report the
+// durations of the matchers they hold. A matcher of your own that waits for
+// silence must implement Silencer, as one that calls Silent inside a
+// MatcherFunc is never checked again; or it can be combined with Silent by
+// And.
+type Silencer interface {
+	Silences(add func(time.Duration))
 }
 
 // And matches when every matcher matches. It decides NoMatch as soon as one
@@ -158,7 +164,7 @@ func (a andMatcher) Match(in *Input) Result {
 	return res
 }
 
-func (a andMatcher) silences(add func(time.Duration)) { reportSilences(a, add) }
+func (a andMatcher) Silences(add func(time.Duration)) { reportSilences(a, add) }
 
 type orMatcher []Matcher
 
@@ -168,7 +174,7 @@ func (o orMatcher) Match(in *Input) Result {
 	return matchAny(o, in)
 }
 
-func (o orMatcher) silences(add func(time.Duration)) { reportSilences(o, add) }
+func (o orMatcher) Silences(add func(time.Duration)) { reportSilences(o, add) }
 
 type notMatcher struct{ m Matcher }
 
@@ -188,7 +194,7 @@ func (n notMatcher) Match(in *Input) Result {
 	}
 }
 
-func (n notMatcher) silences(add func(time.Duration)) { reportSilences([]Matcher{n.m}, add) }
+func (n notMatcher) Silences(add func(time.Duration)) { reportSilences([]Matcher{n.m}, add) }
 
 func matchAny(ms []Matcher, in *Input) Result {
 	res := NoMatch
@@ -206,16 +212,16 @@ func matchAny(ms []Matcher, in *Input) Result {
 
 func reportSilences(ms []Matcher, add func(time.Duration)) {
 	for _, m := range ms {
-		if s, ok := m.(silencer); ok {
-			s.silences(add)
+		if s, ok := m.(Silencer); ok {
+			s.Silences(add)
 		}
 	}
 }
 
-// Any matches every connection that has sent at least one byte. To take the
+// AnyBytes matches every connection that has sent at least one byte. To take the
 // connections that no other route accepts, prefer a fallback route, which
 // also takes those left undecided at the sniff timeout; see RouteConfig.
-func Any() Matcher {
+func AnyBytes() Matcher {
 	return anyMatcher{}
 }
 
@@ -228,7 +234,7 @@ func (anyMatcher) Match(in *Input) Result {
 	return NeedMore
 }
 
-func (anyMatcher) String() string { return "Any()" }
+func (anyMatcher) String() string { return "AnyBytes()" }
 
 // Always matches every connection at once, before reading anything. On an
 // entry whose listeners serve one service alone, a route with Always hands
@@ -328,7 +334,7 @@ func (s silentMatcher) Match(in *Input) Result {
 	return NeedMore
 }
 
-func (s silentMatcher) silences(add func(time.Duration)) { add(time.Duration(s)) }
+func (s silentMatcher) Silences(add func(time.Duration)) { add(time.Duration(s)) }
 
 func (s silentMatcher) String() string { return "Silent(" + time.Duration(s).String() + ")" }
 

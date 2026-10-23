@@ -80,7 +80,7 @@ func TestHandlerServesWithoutAccept(t *testing.T) {
 		t.Fatal("ServeConn returned before the handler")
 	}
 
-	if _, err := m.Add(RouteConfig{Reject: true, Matchers: []Matcher{Any()}, Handler: func(*Conn) {}}); !errors.Is(err, errHandlerConfig) {
+	if _, err := m.Add(RouteConfig{Reject: true, Matchers: []Matcher{AnyBytes()}, Handler: func(*Conn) {}}); !errors.Is(err, errHandlerConfig) {
 		t.Fatalf("Add = %v", err)
 	}
 }
@@ -103,7 +103,7 @@ func TestOpenConnections(t *testing.T) {
 	c := dial(t, m)
 	_, _ = c.Write([]byte("GET"))
 	expectClosed(t, c)
-	if err := log.wait(t); !errors.Is(err, ErrRouteFull) {
+	if err := log.wait(t); !errors.Is(err, ErrConnLimit) {
 		t.Fatalf("reported %v", err)
 	}
 	if info := web.Info(); info.Open != 2 || info.MaxConns != 2 {

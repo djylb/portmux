@@ -21,22 +21,24 @@
 //     Shutdown and Close stop the Mux.
 //   - Matchers: Prefix, Regexp, HTTP1, HTTP2, TLS, Domain, HTTP2Preface, SSH,
 //     SOCKS4, SOCKS5, PostgreSQL, MQTT, RDP, OpenVPN, XMPP and DNS look at the
-//     bytes; Silent routes clients that wait for the server and Always takes
-//     every connection unread; RemoteIP, LocalIP and LocalPort look at the
-//     addresses; And, Or and Not combine them in any nesting, and MatcherFunc
-//     adds your own. HTTP1 and HTTP2 take the filters Host, HostRegexp, Path,
+//     bytes; AnyBytes takes any client that sent a byte, Silent routes
+//     clients that wait for the server and Always takes every connection
+//     unread; RemoteIP, LocalIP, their changing forms RemoteIPFunc and
+//     LocalIPFunc, and LocalPort look at the addresses; And, Or and Not
+//     combine them in any nesting, and MatcherFunc adds your own. HTTP1 and HTTP2 take the filters Host, HostRegexp, Path,
 //     PathPrefix, PathRegexp, Method, Header, HeaderRegexp, Query and
 //     WebSocket, and TLS takes SNI, SNIRegexp, ALPN and MinTLSVersion, and
 //     the fingerprint filters of package fingerprint; AllOf, AnyOf and NoneOf
 //     combine the filters of one protocol. Matchers and filters describe
-//     themselves in the text that ParseMatcher reads, so routes can be kept
-//     as text.
+//     themselves in the text that ParseMatcher reads, so the matchers of
+//     routes can be kept as text, next to the other settings of their
+//     RouteConfig.
 //   - Delivered connections: Conn replays the sniffed bytes and carries the
-//     parsed ClientHello, HTTP/1 or h2c request and PROXY header, its entry
-//     and the matching Route. Peek sniffs one connection without a Mux, and
+//     parsed ClientHello, HTTP/1 and h2c request and PROXY header, what your
+//     matchers stored with Input.SetValue, its entry and the matching Route. Peek sniffs one connection without a Mux, and
 //     NewInput runs matchers on bytes of your choice.
-//   - Options: timeouts, buffer and pending limits with eviction of the
-//     oldest undecided connection, rate limits per client and per listener,
+//   - Options: timeouts, buffer limits, limits of the connections being
+//     matched with eviction of the oldest undecided one, rate limits per client and per listener,
 //     bans of clients whose connections keep failing, a queue limit per
 //     route, an observer of every connection, and a PROXY protocol v1/v2
 //     policy per entry and peer. They can change while serving, most of them

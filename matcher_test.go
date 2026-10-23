@@ -45,8 +45,8 @@ func TestBuiltinPrefixMatchers(t *testing.T) {
 	check("HTTP2Preface", HTTP2Preface(), httphead.HTTP2Preface, Match)
 	check("HTTP2Preface", HTTP2Preface(), "PRI * HTTP/2.0\r\n", NeedMore)
 	check("HTTP2Preface", HTTP2Preface(), "PRI * HTTP/1.1", NoMatch)
-	check("Any", Any(), "x", Match)
-	check("Any", Any(), "", NeedMore)
+	check("Any", AnyBytes(), "x", Match)
+	check("Any", AnyBytes(), "", NeedMore)
 }
 
 func TestResultString(t *testing.T) {
