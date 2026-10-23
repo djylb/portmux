@@ -92,7 +92,7 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 	stripe := at.stripe
 	conn = &Conn{conn: c, entry: entry, stripe: stripe}
 	// The caller counted the connection as pending.
-	o, _ := m.settings(entry)
+	o, rate := m.settings(entry)
 	s := newSniffer(conn, o, at.start)
 	s.seq = at.seq
 	m.undelivered.add(s, l != nil)
@@ -108,7 +108,7 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 		observed := s.opts.observer != nil
 		var ev Event
 		if observed {
-			ev = Event{Entry: entry, Err: err, Elapsed: time.Since(s.start), Sniffed: len(s.buf)}
+			ev = Event{Entry: entry, Err: err, Elapsed: time.Since(s.start), Sniffed: len(s.buf), Name: s.in.parsedName()}
 			ev.Remote, ev.Local = conn.RemoteAddr(), conn.LocalAddr()
 		}
 		s.release()
@@ -132,7 +132,7 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 		// connection closed, so that a client that connects again at once
 		// is held to the limits and bans that this connection leaves.
 		if l != nil {
-			m.releaseAdmitted(l, a, err)
+			ev.Banned = m.releaseAdmitted(l, a, err)
 		}
 		if delivered {
 			ev.Route = conn.route
@@ -147,8 +147,26 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 	if m.closed.Load() {
 		return nil, conn, net.ErrClosed
 	}
-	if err = s.readProxyHeader(s.opts.proxyPolicy, &m.table); err != nil {
+	switch {
+	case l == nil:
+		a.proxy = proxyPolicyFor(o, entry, c)
+	case a.policy:
+		// Here rather than in the accept loop, which a slow or panicking
+		// policy would hold up or bring down.
+		if a.proxy = proxyPolicyFor(o, entry, c); a.proxy != proxyproto.Ignore {
+			a.proxied = true
+		} else if a, err = m.admitClient(a, c.RemoteAddr(), o, rate); err != nil {
+			return nil, conn, err
+		}
+	}
+	if err = s.readProxyHeader(a.proxy, &m.table); err != nil {
 		return nil, conn, err
+	}
+	if a.proxied {
+		// The client is the source of the header, if there was one.
+		if a, err = m.admitClient(a, conn.RemoteAddr(), o, rate); err != nil {
+			return nil, conn, err
+		}
 	}
 	for {
 		var r *Route
@@ -194,7 +212,8 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 		if r.reject {
 			return nil, conn, ErrRefused
 		}
-		if !r.tryOpen(m.table.Load().routes[r].maxConns) {
+		st := m.table.Load().routes[r]
+		if !r.tryOpen(st.maxConns) {
 			return nil, conn, ErrRouteFull
 		}
 		conn.mux, conn.ln = m, l
@@ -207,7 +226,7 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 			conn.dropEmpty()
 			return r.handler, conn, nil
 		}
-		if err = m.deliver(s, r); err == nil {
+		if err = m.deliver(s, r, st); err == nil {
 			delivered = true
 			conn.dropEmpty()
 			return nil, conn, nil
@@ -228,24 +247,19 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 // largest payload.
 const maxProxyHeaderLen = 16 + 0xffff
 
-// readProxyHeader reads a PROXY header when policy expects one, then sets
+// readProxyHeader reads a PROXY header when mode expects one, then sets
 // the addresses that matchers see. A missing header is reported with
 // proxyproto.ErrNoHeader, an invalid one with an error wrapping
 // proxyproto.ErrMalformed, and one cut short with io.ErrUnexpectedEOF. An
 // optional header is taken to be missing when the client stays silent until
 // a silence check of the routes in tables or the sniff deadline, which match
 // then decides on.
-func (s *sniffer) readProxyHeader(policy func(entry string, peer, local net.Addr) proxyproto.Policy, tables *atomic.Pointer[table]) error {
+func (s *sniffer) readProxyHeader(mode proxyproto.Policy, tables *atomic.Pointer[table]) error {
 	defer func() {
 		c := s.conn
 		s.in.remote, s.in.local, s.in.proxy = c.RemoteAddr(), c.LocalAddr(), c.proxy
 		s.in.peer = c.conn.RemoteAddr()
 	}()
-	if policy == nil {
-		return nil
-	}
-	c := s.conn.conn
-	mode := policy(s.in.entry, c.RemoteAddr(), c.LocalAddr())
 	if mode == proxyproto.Ignore {
 		return nil
 	}
@@ -442,8 +456,9 @@ func (s *sniffer) handOver(r *Route) {
 	}
 }
 
-// deliver hands the connection to r's Accept.
-func (m *Mux) deliver(s *sniffer, r *Route) error {
+// deliver hands the connection to r's Accept, with the queue limit and the
+// dispatch timeout of st, the route's settings, or else of the entry.
+func (m *Mux) deliver(s *sniffer, r *Route, st routeState) error {
 	conn := s.conn
 	// A route whose server is waiting in Accept takes the connection without
 	// a timer.
@@ -452,14 +467,21 @@ func (m *Mux) deliver(s *sniffer, r *Route) error {
 		return nil
 	default:
 	}
+	q, d := s.opts.maxQueued, s.opts.dispatchTimeout
+	if st.maxQueued != 0 {
+		q = st.maxQueued
+	}
+	if st.dispatchTimeout != 0 {
+		d = st.dispatchTimeout
+	}
 	// Counted without a limit too, for RouteInfo.Queued.
 	queued := r.queued.Add(1)
 	defer r.queued.Add(-1)
-	if q := s.opts.maxQueued; q > 0 && queued > int64(q) {
+	if q > 0 && queued > int64(q) {
 		return ErrRouteBusy
 	}
 	var timeout <-chan time.Time
-	if d := s.opts.dispatchTimeout; d > 0 {
+	if d > 0 {
 		if s.timer == nil {
 			s.timer = time.NewTimer(d)
 		} else {

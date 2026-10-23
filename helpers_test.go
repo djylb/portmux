@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"testing"
@@ -181,7 +182,11 @@ func (l *errorLog) wait(t *testing.T) error {
 	}
 }
 
-// expectClosed checks that the peer closes c without sending data.
+// host returns the network of a single address, as client keys are.
+func host(a netip.Addr) netip.Prefix {
+	return netip.PrefixFrom(a, a.BitLen())
+}
+
 // v2Header encodes a version 2 PROXY header for a connection from src to
 // dst.
 func v2Header(t *testing.T, src, dst net.Addr) []byte {
@@ -207,6 +212,7 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	}
 }
 
+// expectClosed checks that the peer closes c without sending data.
 func expectClosed(t *testing.T, c net.Conn) {
 	t.Helper()
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))

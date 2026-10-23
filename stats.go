@@ -240,6 +240,12 @@ type Event struct {
 	// Sniffed is the number of bytes read while matching, including a PROXY
 	// header.
 	Sniffed int
+	// Name is the server name of a TLS ClientHello, or the host of an HTTP
+	// request, that matchers parsed, or "" when none did.
+	Name string
+	// Banned reports that this connection's failure banned its client; see
+	// WithBanPerIP.
+	Banned bool
 }
 
 // observe passes ev to the observer, unless the Mux was closed.

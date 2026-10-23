@@ -102,7 +102,7 @@ func (m *Mux) settings(entry string) (*options, *rateLimit) {
 }
 
 // banKey returns the record that counts the failures of client on entry.
-func (m *Mux) banKey(entry string, client netip.Addr) banKey {
+func (m *Mux) banKey(entry string, client netip.Prefix) banKey {
 	if c := m.entryConfig(entry); c != nil && c.ownBan {
 		return banKey{client: client, entry: entry, own: true}
 	}

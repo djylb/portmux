@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/djylb/netx/proxyproto"
 )
 
 // Mux distributes connections to routes by their first bytes. It serves any
@@ -78,7 +80,7 @@ func New(opts ...Option) *Mux {
 		quit:      make(chan struct{}),
 		listeners: make(map[net.Listener]*listener),
 		slots:     newSlotLimit(),
-		perIP:     pendingLimit{count: make(map[netip.Addr]int)},
+		perIP:     pendingLimit{count: make(map[netip.Prefix]int)},
 		bans:      newBanList(),
 	}
 	o := newOptions(opts)
@@ -238,34 +240,73 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 
 // admission is the client of a connection admitted by Serve.
 type admission struct {
-	client  netip.Addr // valid when a per-client rule needs it
-	counted bool       // whether the pending limit per client counts it
+	client  netip.Prefix // valid when a per-client rule needs it
+	counted bool         // whether the pending limit per client counts it
+	// policy reports that the PROXY protocol policy and the per-client
+	// rules wait for serveConn, which calls the policy, the program's code,
+	// in the connection's goroutine, so that a slow or failing policy does
+	// not hold up the accept loop. proxy is its answer, and proxied that the
+	// rules then wait for the header, whose source is the client. peer is
+	// the key of the TCP peer, which failures before the header count
+	// against.
+	policy  bool
+	proxy   proxyproto.Policy
+	proxied bool
+	peer    netip.Prefix
 }
 
 // admit applies the listener's rate and the per-client rules to a connection
-// accepted by Serve.
+// accepted by Serve. With a PROXY protocol policy, it checks only that the
+// peer is not banned: serveConn calls the policy and applies the rules, to
+// the source of the header for a peer that sends one.
 func (m *Mux) admit(c net.Conn, l *listener) (admission, error) {
 	o, rate := m.settings(l.entry)
 	if o.listenerRate > 0 && !l.allow(o.listenerRate, o.listenerBurst, time.Now()) {
 		return admission{}, ErrRateLimited
 	}
+	if o.proxyPolicy != nil {
+		a := admission{policy: true}
+		if ap, ok := addrPort(c.RemoteAddr()); ok {
+			a.peer = m.clientNet(ap.Addr())
+			if m.bans.banned(ap.Addr(), m.bans.now()) {
+				return admission{}, ErrBanned
+			}
+		}
+		return a, nil
+	}
+	a := admission{proxy: proxyproto.Ignore}
 	if o.maxPendingPerIP <= 0 && rate == nil && o.banFailures <= 0 && m.bans.size.Load() == 0 {
-		return admission{}, nil
+		return a, nil
 	}
-	client, ok := clientKey(c.RemoteAddr())
+	return m.admitClient(a, c.RemoteAddr(), o, rate)
+}
+
+// proxyPolicyFor returns the PROXY protocol policy of o for c on entry.
+func proxyPolicyFor(o *options, entry string, c net.Conn) proxyproto.Policy {
+	if o.proxyPolicy == nil {
+		return proxyproto.Ignore
+	}
+	return o.proxyPolicy(entry, c.RemoteAddr(), c.LocalAddr())
+}
+
+// admitClient applies the per-client rules to client, the peer of a
+// connection or the source of its PROXY header, and records the client in a.
+func (m *Mux) admitClient(a admission, client net.Addr, o *options, rate *rateLimit) (admission, error) {
+	ap, ok := addrPort(client)
 	if !ok {
-		return admission{}, nil
+		return a, nil
 	}
-	a := admission{client: client}
+	key := m.clientNet(ap.Addr())
+	a.client = key
 	switch {
-	case m.bans.banned(client, m.bans.now()):
-		return admission{}, ErrBanned
-	case rate != nil && !rate.allow(client):
-		return admission{}, ErrRateLimited
+	case m.bans.banned(ap.Addr(), m.bans.now()):
+		return a, ErrBanned
+	case rate != nil && !rate.allow(key):
+		return a, ErrRateLimited
 	case o.maxPendingPerIP <= 0:
 		return a, nil
-	case !m.perIP.acquire(client, o.maxPendingPerIP):
-		return admission{}, ErrPendingLimit
+	case !m.perIP.acquire(key, o.maxPendingPerIP):
+		return a, ErrPendingLimit
 	}
 	a.counted = true
 	return a, nil
@@ -273,15 +314,21 @@ func (m *Mux) admit(c net.Conn, l *listener) (admission, error) {
 
 // releaseAdmitted frees the pending slot and the pending count per client of
 // a connection accepted by Serve, and counts err, its failure if any, toward
-// banning the client.
-func (m *Mux) releaseAdmitted(l *listener, a admission, err error) {
+// banning the client, or the peer when the failure came before a PROXY
+// header named the client. It reports whether that banned the client.
+func (m *Mux) releaseAdmitted(l *listener, a admission, err error) (banned bool) {
 	if a.counted {
 		m.perIP.release(a.client)
 	}
 	m.slots.release()
-	if o, _ := m.settings(l.entry); err != nil && o.banFailures > 0 && a.client.IsValid() && banWorthy(err) {
-		m.bans.fail(m.banKey(l.entry, a.client), m.bans.now(), o.banFailures, o.banWindow, o.banTime)
+	key := a.client
+	if !key.IsValid() {
+		key = a.peer
 	}
+	if o, _ := m.settings(l.entry); err != nil && o.banFailures > 0 && key.IsValid() && banWorthy(err) {
+		return m.bans.fail(m.banKey(l.entry, key), m.bans.now(), o.banFailures, o.banWindow, o.banTime)
+	}
+	return false
 }
 
 // serveAccepted serves a connection from Serve in its own goroutine, which

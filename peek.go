@@ -32,7 +32,7 @@ func Peek(c net.Conn, m Matcher, opts ...Option) (*Conn, error) {
 	defer s.release()
 	var tables atomic.Pointer[table]
 	tables.Store(peekTable(m))
-	err := s.readProxyHeader(o.proxyPolicy, &tables)
+	err := s.readProxyHeader(proxyPolicyFor(&o, "", c), &tables)
 	if err == nil {
 		_, err = s.match(&tables, o.maxSniffBytes)
 	}

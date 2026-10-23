@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -390,4 +391,134 @@ func TestBrokenReaderIsRejected(t *testing.T) {
 	if err := m.ServeConn(&memConn{data: []byte("TS")}); !errors.Is(err, io.ErrNoProgress) {
 		t.Fatalf("ServeConn = %v", err)
 	}
+}
+
+// TestEventNameAndBanned checks that observed events carry the name that
+// matchers parsed and whether the connection banned its client.
+func TestEventNameAndBanned(t *testing.T) {
+	events := make(chan Event, 8)
+	m := startMux(t, WithBanPerIP(2, time.Minute, time.Minute), WithObserver(func(ev Event) { events <- ev }))
+	route := m.Match(HTTP1(Host("served.test")))
+	serve(t, m)
+	next := func() Event {
+		t.Helper()
+		select {
+		case ev := <-events:
+			return ev
+		case <-time.After(5 * time.Second):
+			t.Fatal("no event")
+			return Event{}
+		}
+	}
+
+	_, _ = dial(t, m).Write([]byte("GET / HTTP/1.1\r\nHost: served.test\r\n\r\n"))
+	accept(t, route)
+	if ev := next(); ev.Err != nil || ev.Name != "served.test" || ev.Banned {
+		t.Fatalf("delivered %+v", ev)
+	}
+	for i, want := range []bool{false, true} {
+		c := dial(t, m)
+		_, _ = c.Write([]byte("GET / HTTP/1.1\r\nHost: other.test\r\n\r\n"))
+		expectClosed(t, c)
+		if ev := next(); !errors.Is(ev.Err, ErrNoMatch) || ev.Name != "other.test" || ev.Banned != want {
+			t.Fatalf("failure %d: %+v", i, ev)
+		}
+	}
+	c := dial(t, m)
+	expectClosed(t, c)
+	if ev := next(); !errors.Is(ev.Err, ErrBanned) || ev.Banned {
+		t.Fatalf("banned %+v", ev)
+	}
+}
+
+type countingKey struct{}
+
+// TestInputValues checks that a matcher of its own keeps state across calls
+// on one connection, and that the state starts over for another.
+func TestInputValues(t *testing.T) {
+	var parses atomic.Int32
+	magic := MatcherFunc(func(in *Input) Result {
+		if in.Value(countingKey{}) == nil {
+			parses.Add(1)
+		}
+		n := len(in.Bytes())
+		in.SetValue(countingKey{}, n)
+		if n < 4 {
+			return NeedMore
+		}
+		if string(in.Bytes()[:4]) == "MAGI" {
+			return Match
+		}
+		return NoMatch
+	})
+	m := startMux(t)
+	route := m.Match(magic)
+	serve(t, m)
+	for range 2 {
+		c := dial(t, m)
+		for _, b := range []string{"M", "A", "G", "I"} {
+			_, _ = c.Write([]byte(b))
+			time.Sleep(5 * time.Millisecond)
+		}
+		accept(t, route)
+	}
+	if n := parses.Load(); n != 2 {
+		t.Fatalf("parse started %d times, want once per connection", n)
+	}
+
+	var in Input
+	in.SetBytes([]byte("MAGIC"), false)
+	in.SetValue(countingKey{}, 1)
+	in.SetValue(countingKey{}, 2)
+	if v := in.Value(countingKey{}); v != 2 {
+		t.Fatalf("Value = %v", v)
+	}
+	in.SetBytes([]byte("M"), false)
+	if v := in.Value(countingKey{}); v != nil {
+		t.Fatalf("Value after shorter bytes = %v", v)
+	}
+}
+
+// TestRouteDispatchSettings checks that a route's own dispatch timeout and
+// queue limit override the entry's.
+func TestRouteDispatchSettings(t *testing.T) {
+	log := newErrorLog()
+	m := startMux(t, log.option(), WithDispatchTimeout(time.Minute), WithMaxQueuedPerRoute(8))
+	slow, err := m.Add(RouteConfig{Matchers: []Matcher{Prefix("S")}, DispatchTimeout: 50 * time.Millisecond, MaxQueued: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serve(t, m)
+	if info := slow.Info(); info.DispatchTimeout != 50*time.Millisecond || info.MaxQueued != 1 {
+		t.Fatalf("Info = %+v", info)
+	}
+
+	// The route's timeout, not the entry's minute, ends the wait.
+	start := time.Now()
+	c := dial(t, m)
+	_, _ = c.Write([]byte("S"))
+	expectClosed(t, c)
+	if err := log.wait(t); !errors.Is(err, ErrDispatchTimeout) || time.Since(start) > 10*time.Second {
+		t.Fatalf("reported %v after %v", err, time.Since(start))
+	}
+
+	// One connection queues; the next is over the route's limit.
+	if err := slow.SetDispatchTimeout(-1); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = dial(t, m).Write([]byte("S"))
+	waitUntil(t, "a connection is queued", func() bool { return slow.Info().Queued == 1 })
+	c = dial(t, m)
+	_, _ = c.Write([]byte("S"))
+	expectClosed(t, c)
+	if err := log.wait(t); !errors.Is(err, ErrRouteBusy) {
+		t.Fatalf("reported %v", err)
+	}
+	if err := slow.SetMaxQueued(0); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = dial(t, m).Write([]byte("S"))
+	waitUntil(t, "the entry's limit applies", func() bool { return slow.Info().Queued == 2 })
+	accept(t, slow)
+	accept(t, slow)
 }

@@ -34,11 +34,57 @@ type Input struct {
 	h2    httphead.HTTP2Scanner
 	h2P   parseState
 
+	// values are the ones of SetValue, in the order set.
+	values []inputValue
+
 	// memo keeps the decisions of the first Regexp matchers that decided,
 	// which do not change, so that a matcher that waits for more bytes in
 	// the same route does not run their expressions again on every read.
 	memo  [4]memoEntry
 	nmemo int
+}
+
+type inputValue struct{ key, value any }
+
+// Value returns the value that SetValue stored under key for this
+// connection, or nil.
+func (in *Input) Value(key any) any {
+	for _, v := range in.values {
+		if v.key == key {
+			return v.value
+		}
+	}
+	return nil
+}
+
+// SetValue stores value under key for the rest of the matching of this
+// connection, so that a Matcher of your own can keep the state of an
+// incremental parse across calls, as the parsers of Input do, and share it
+// with other matchers. key must be comparable; to avoid collisions, use a
+// value of an unexported type, as for context keys. SetBytes with shorter
+// data drops the values, as it does the parses.
+func (in *Input) SetValue(key, value any) {
+	for i := range in.values {
+		if in.values[i].key == key {
+			in.values[i].value = value
+			return
+		}
+	}
+	in.values = append(in.values, inputValue{key, value})
+}
+
+// parsedName returns the server name of a parsed ClientHello or the host of
+// a parsed HTTP request, without parsing.
+func (in *Input) parsedName() string {
+	switch {
+	case in.hello != nil:
+		return in.hello.ServerName
+	case in.req != nil:
+		return in.req.Host
+	case in.req2 != nil:
+		return in.req2.Host
+	}
+	return ""
 }
 
 type memoEntry struct {
@@ -105,6 +151,8 @@ func (in *Input) SetBytes(data []byte, final bool) {
 		in.req, in.http, in.httpP = nil, httphead.Scanner{}, parseState{}
 		in.req2, in.h2, in.h2P = nil, httphead.HTTP2Scanner{}, parseState{}
 		in.nmemo = 0
+		clear(in.values)
+		in.values = in.values[:0]
 	}
 	in.data, in.final = data, final
 }

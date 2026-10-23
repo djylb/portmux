@@ -10,9 +10,11 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/djylb/netx/proxyproto"
 	"github.com/djylb/portmux/internal/testutil"
 )
 
@@ -186,7 +188,7 @@ func TestRateLimitBuckets(t *testing.T) {
 		{a, 10_000, true}, {a, 10_000, true}, {a, 10_000, false}, // refilled to burst only
 	}
 	for i, st := range steps {
-		if got := l.allowAt(st.client, at(st.ms)); got != st.want {
+		if got := l.allowAt(host(st.client), at(st.ms)); got != st.want {
 			t.Fatalf("step %d: allow = %v, want %v", i, got, st.want)
 		}
 	}
@@ -209,7 +211,7 @@ func TestRateLimitTracksBoundedClients(t *testing.T) {
 	// clients pass untracked instead of growing the maps.
 	for i := range maxRateClients * 2 {
 		ip := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
-		l.allowAt(ip, 0)
+		l.allowAt(host(ip), 0)
 	}
 	total := 0
 	for i := range l.shards {
@@ -221,12 +223,32 @@ func TestRateLimitTracksBoundedClients(t *testing.T) {
 }
 
 func TestClientKeyGroupsIPv6Networks(t *testing.T) {
-	k1, _ := clientKey(&net.TCPAddr{IP: net.ParseIP("2001:db8:1:2::1")})
-	k2, _ := clientKey(&net.TCPAddr{IP: net.ParseIP("2001:db8:1:2:ffff::9")})
-	k3, _ := clientKey(&net.TCPAddr{IP: net.ParseIP("2001:db8:1:3::1")})
-	k4, _ := clientKey(&net.TCPAddr{IP: net.ParseIP("::ffff:192.0.2.1")})
-	if k1 != k2 || k1 == k3 || k4 != netip.MustParseAddr("192.0.2.1") {
+	m := New()
+	defer func() { _ = m.Close() }()
+	key := func(ip string) netip.Prefix { return m.clientNet(netip.MustParseAddr(ip)) }
+	k1, k2, k3, k4 := key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff::9"), key("2001:db8:1:3::1"), key("::ffff:192.0.2.1")
+	if k1 != k2 || k1 == k3 || k1 != netip.MustParsePrefix("2001:db8:1:2::/64") || k4 != netip.MustParsePrefix("192.0.2.1/32") {
 		t.Fatalf("keys %v %v %v %v", k1, k2, k3, k4)
+	}
+
+	// Other prefix lengths group more clients, and bans report them.
+	m.SetOptions(WithClientPrefix(24, 48))
+	if k1, k3 := key("2001:db8:1:2::1"), key("2001:db8:1:3::1"); k1 != k3 || k1 != netip.MustParsePrefix("2001:db8:1::/48") {
+		t.Fatalf("/48 keys %v %v", k1, k3)
+	}
+	if k := key("192.0.2.200"); k != netip.MustParsePrefix("192.0.2.0/24") {
+		t.Fatalf("/24 key %v", k)
+	}
+	m.Ban(netip.MustParseAddr("192.0.2.9"), time.Minute)
+	if bans := m.Bans(); len(bans) != 1 || bans[0].Client != netip.MustParsePrefix("192.0.2.0/24") {
+		t.Fatalf("Bans = %+v", bans)
+	}
+	if c := m.Config(); c.ClientPrefix4 != 24 || c.ClientPrefix6 != 48 {
+		t.Fatalf("Config = %+v", c)
+	}
+	m.SetOptions(WithClientPrefix(0, 200))
+	if c := m.Config(); c.ClientPrefix4 != 32 || c.ClientPrefix6 != 64 {
+		t.Fatalf("out of range Config = %+v", c)
 	}
 }
 
@@ -545,7 +567,7 @@ func TestShardsSpreadIPv6(t *testing.T) {
 	for i := range 4096 {
 		b := base
 		b[4], b[5] = byte(i>>8), byte(i)
-		client, _ := clientKey(net.TCPAddrFromAddrPort(netip.AddrPortFrom(netip.AddrFrom16(b), 1)))
+		client := netip.PrefixFrom(netip.AddrFrom16(b), 64)
 		counts[shardOf(client, rateShards)]++
 	}
 	for i, n := range counts {
@@ -567,4 +589,142 @@ func TestQueuedWithoutLimit(t *testing.T) {
 	waitUntil(t, "three connections wait for Accept", func() bool { return route.Info().Queued == 3 })
 	accept(t, route)
 	waitUntil(t, "two wait", func() bool { return route.Info().Queued == 2 })
+}
+
+// TestPerClientRulesUseProxySource checks that behind a peer that sends
+// PROXY headers, as a load balancer does, bans and pending counts apply to
+// the source in the header, not to the peer.
+func TestPerClientRulesUseProxySource(t *testing.T) {
+	log := newErrorLog()
+	m := startMux(t, log.option(), WithBanPerIP(1, time.Minute, time.Minute), WithMaxPendingPerIP(1),
+		WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Required }))
+	route := m.Match(Prefix("A"))
+	serve(t, m)
+	dst := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443}
+	from := func(ip string) []byte { return v2Header(t, &net.TCPAddr{IP: net.ParseIP(ip), Port: 40000}, dst) }
+	send := func(data []byte) net.Conn {
+		c := dial(t, m)
+		_, _ = c.Write(data)
+		return c
+	}
+	expectRejected := func(c net.Conn, want error) {
+		t.Helper()
+		expectClosed(t, c)
+		if err := log.wait(t); !errors.Is(err, want) {
+			t.Fatalf("reported %v, want %v", err, want)
+		}
+	}
+
+	// A scanner behind the balancer is banned, and the balancer is not.
+	expectRejected(send(append(from("192.0.2.1"), "X"...)), ErrNoMatch)
+	expectRejected(send(append(from("192.0.2.1"), "A"...)), ErrBanned)
+	send(append(from("192.0.2.2"), "A"...))
+	accept(t, route)
+	if bans := m.Bans(); len(bans) != 1 || bans[0].Client != netip.MustParsePrefix("192.0.2.1/32") {
+		t.Fatalf("Bans = %+v", bans)
+	}
+
+	// Pending connections count per source.
+	send(from("192.0.2.7")) // undecided
+	waitUntil(t, "the source is counted", func() bool {
+		m.perIP.mu.Lock()
+		defer m.perIP.mu.Unlock()
+		return m.perIP.count[netip.MustParsePrefix("192.0.2.7/32")] == 1
+	})
+	expectRejected(send(append(from("192.0.2.7"), "A"...)), ErrPendingLimit)
+	send(append(from("192.0.2.8"), "A"...))
+	accept(t, route)
+}
+
+// TestHeaderFailuresCountAgainstPeer checks that a peer that sends no PROXY
+// header, or a broken one, where one is required is banned itself, as
+// nothing names another client.
+func TestHeaderFailuresCountAgainstPeer(t *testing.T) {
+	log := newErrorLog()
+	m := startMux(t, log.option(), WithBanPerIP(1, time.Minute, time.Minute),
+		WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Required }))
+	m.Match(Prefix("GET"))
+	serve(t, m)
+
+	c := dial(t, m)
+	_, _ = c.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
+	expectClosed(t, c)
+	if err := log.wait(t); !errors.Is(err, proxyproto.ErrNoHeader) {
+		t.Fatalf("reported %v", err)
+	}
+	c = dial(t, m)
+	expectClosed(t, c)
+	if err := log.wait(t); !errors.Is(err, ErrBanned) {
+		t.Fatalf("reported %v, want the peer banned", err)
+	}
+	if bans := m.Bans(); len(bans) != 1 || bans[0].Client != netip.MustParsePrefix("127.0.0.1/32") {
+		t.Fatalf("Bans = %+v", bans)
+	}
+}
+
+// TestBansSurvivePrefixChange checks that bans set under one client prefix
+// still refuse clients, and can be lifted, after WithClientPrefix changes.
+func TestBansSurvivePrefixChange(t *testing.T) {
+	log := newErrorLog()
+	m := startMux(t, log.option())
+	route := m.Match(Prefix("A"))
+	serve(t, m)
+	loopback := netip.MustParseAddr("127.0.0.1")
+
+	m.Ban(loopback, time.Minute)
+	m.SetOptions(WithClientPrefix(24, 64))
+	c := dial(t, m)
+	expectClosed(t, c)
+	if err := log.wait(t); !errors.Is(err, ErrBanned) {
+		t.Fatalf("reported %v, want the ban of 127.0.0.1/32 to hold", err)
+	}
+	if !m.Unban(loopback) || len(m.Bans()) != 0 {
+		t.Fatalf("Unban after the prefix change left %+v", m.Bans())
+	}
+	_, _ = dial(t, m).Write([]byte("A"))
+	accept(t, route)
+
+	// A ban of the /24 holds when the prefix becomes longer again.
+	m.Ban(loopback, time.Minute)
+	m.SetOptions(WithClientPrefix(32, 64))
+	c = dial(t, m)
+	expectClosed(t, c)
+	if err := log.wait(t); !errors.Is(err, ErrBanned) {
+		t.Fatalf("reported %v, want the ban of 127.0.0.0/24 to hold", err)
+	}
+	if bans := m.Bans(); len(bans) != 1 || bans[0].Client != netip.MustParsePrefix("127.0.0.0/24") {
+		t.Fatalf("Bans = %+v", bans)
+	}
+}
+
+// TestProxyPolicyRunsOutsideAcceptLoop checks that a PROXY protocol policy
+// that blocks holds up only its own connection, and one that panics fails
+// only its own.
+func TestProxyPolicyRunsOutsideAcceptLoop(t *testing.T) {
+	log := newErrorLog()
+	release := make(chan struct{})
+	var calls atomic.Int32
+	m := startMux(t, log.option(), WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy {
+		switch calls.Add(1) {
+		case 1:
+			<-release
+		case 2:
+			panic("policy failed")
+		}
+		return proxyproto.Ignore
+	}))
+	defer close(release)
+	route := m.Match(Prefix("A"))
+	serve(t, m)
+
+	_, _ = dial(t, m).Write([]byte("A")) // its policy blocks
+	waitUntil(t, "the policy runs", func() bool { return calls.Load() == 1 })
+	c := dial(t, m) // its policy panics
+	_, _ = c.Write([]byte("A"))
+	expectClosed(t, c)
+	if err := log.wait(t); err == nil || !strings.Contains(err.Error(), "policy failed") {
+		t.Fatalf("reported %v", err)
+	}
+	_, _ = dial(t, m).Write([]byte("A"))
+	accept(t, route)
 }

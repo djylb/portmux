@@ -35,6 +35,8 @@ type options struct {
 	banTime         time.Duration
 	observer        func(Event)
 	proxyPolicy     func(entry string, peer, local net.Addr) proxyproto.Policy
+	clientBits4     int
+	clientBits6     int
 }
 
 // Option configures a Mux; see New and Mux.SetOptions.
@@ -126,13 +128,34 @@ func WithMaxPending(n int) Option {
 	})
 }
 
+// WithClientPrefix sets the networks that the per-client rules,
+// WithMaxPendingPerIP, WithRateLimitPerIP and WithBanPerIP, and Mux.Ban count
+// a client as: the IPv4 /v4 and the IPv6 /v6 network of its address. The
+// defaults, 32 and 64, take an IPv4 address and the /64 network that one IPv6
+// client usually holds; a shorter IPv6 prefix such as 56 groups clients whose
+// provider hands out larger networks. Values out of range, below 1 or above
+// 32 and 128, select the defaults. A change applies to new connections and
+// bans; bans already set keep the networks they were set for, and still
+// refuse their clients, while failures toward bans and the tokens of
+// WithRateLimitPerIP start over for the new networks.
+func WithClientPrefix(v4, v6 int) Option {
+	return optionFunc(func(o *options) {
+		o.clientBits4, o.clientBits6 = v4, v6
+	})
+}
+
 // WithMaxPendingPerIP limits how many connections accepted by Serve from one
 // client may be undelivered at once, so that a single client cannot use up
 // the WithMaxPending budget with idle connections. Connections over the limit
-// are closed at once and reported with ErrPendingLimit. A client is an IPv4
-// address or an IPv6 /64 network of the peer of the TCP connection, not an
-// address from a PROXY protocol header. A non-positive value, the default,
-// removes the limit.
+// are closed at once and reported with ErrPendingLimit. A client is the
+// network, as WithClientPrefix sets it, of the peer of the connection or,
+// for a peer that WithProxyProtocol lets send a header, of the source in its
+// header. For such a peer the per-client rules apply once the header is read,
+// with the peer itself as the client when it sends none where one is
+// optional, and failures before the header, such as a missing or broken one,
+// count toward banning the peer; until then its connections are bounded by
+// WithMaxPending and the sniff timeout only, so allow headers only from
+// trusted peers. A non-positive value, the default, removes the limit.
 func WithMaxPendingPerIP(n int) EntryOption {
 	return entryOption{settingMaxPendingPerIP, func(o *options) {
 		o.maxPendingPerIP = n
@@ -142,10 +165,11 @@ func WithMaxPendingPerIP(n int) EntryOption {
 // WithRateLimitPerIP limits how fast one client may open connections that
 // Serve accepts: a token bucket per client refills perSecond tokens a second
 // up to burst, and every connection takes one. Connections without a token
-// are closed at once, before any byte is read, and reported with
-// ErrRateLimited. Clients are counted as in WithMaxPendingPerIP. Up to 65536
-// clients are tracked; beyond that, new clients pass unchecked. A
-// non-positive rate, the default, disables the limit.
+// are closed at once, before any byte is read past a PROXY header, and
+// reported with ErrRateLimited. Clients are counted as in
+// WithMaxPendingPerIP. Up to 65536 clients are tracked; beyond that, new
+// clients pass unchecked. A non-positive rate, the default, disables the
+// limit.
 func WithRateLimitPerIP(perSecond float64, burst int) EntryOption {
 	return entryOption{settingRateLimitPerIP, func(o *options) {
 		o.rate, o.rateBurst = perSecond, burst
@@ -169,9 +193,10 @@ func WithRateLimitPerListener(perSecond float64, burst int) EntryOption {
 // do: once failures connections from Serve of one client matched no route,
 // timed out while sniffing, were refused by a reject route, or sent an invalid
 // PROXY header or none where one is required within window, the client's
-// connections are refused for d, before any byte is read, and reported with
-// ErrBanned. Connections that are closed without sending anything, as health
-// checks are, do not count.
+// connections are refused for d, before any byte is read past a PROXY
+// header, and reported with ErrBanned; a banned peer that may send a header
+// is refused before its header. Connections that are closed without sending
+// anything, as health checks are, do not count.
 // Clients are counted as in WithMaxPendingPerIP; Mux.Ban and Mux.Bans manage
 // bans directly. A non-positive failures, the default, disables automatic
 // bans.
@@ -221,7 +246,12 @@ func WithObserver(fn func(Event)) Option {
 //
 // Use this option rather than a proxyproto.Listener in front of the Mux: the
 // header is then read within the sniff timeout and the pending limits, and
-// the accept loop never waits for it.
+// the accept loop never waits for it. The policy, too, runs in the
+// connection's goroutine once it has a pending slot, so a slow policy holds
+// up only its connection and a panicking one closes only its connection.
+// With a policy set, Serve applies the per-client rules there too, to the
+// source of the header for a peer that sends one, and checks only bans of
+// the peer when accepting; see WithMaxPendingPerIP.
 //
 // Only trusted peers such as a load balancer should be allowed to send a
 // header, since it lets the peer choose the reported client address.
@@ -238,6 +268,8 @@ func newOptions(opts []Option) options {
 		maxSniffBytes:   DefaultMaxSniffBytes,
 		maxPending:      DefaultMaxPending,
 		maxQueued:       DefaultMaxQueuedPerRoute,
+		clientBits4:     32,
+		clientBits6:     64,
 	}
 	cfg.apply(opts)
 	return cfg
@@ -257,6 +289,12 @@ func (o *options) normalize() {
 		o.maxSniffBytes = DefaultMaxSniffBytes
 	}
 	o.maxSniffBytes = min(o.maxSniffBytes, MaxSniffBytes)
+	if o.clientBits4 < 1 || o.clientBits4 > 32 {
+		o.clientBits4 = 32
+	}
+	if o.clientBits6 < 1 || o.clientBits6 > 128 {
+		o.clientBits6 = 64
+	}
 }
 
 // Config reports the settings of a Mux, or those that apply to the
@@ -284,6 +322,9 @@ type Config struct {
 	// WithProxyProtocol set a function.
 	Observer      bool
 	ProxyProtocol bool
+	// ClientPrefix4 and ClientPrefix6 are the arguments of WithClientPrefix.
+	ClientPrefix4 int
+	ClientPrefix6 int
 }
 
 func (o *options) config() Config {
@@ -303,5 +344,7 @@ func (o *options) config() Config {
 		BanDuration:          o.banTime,
 		Observer:             o.observer != nil,
 		ProxyProtocol:        o.proxyPolicy != nil,
+		ClientPrefix4:        o.clientBits4,
+		ClientPrefix6:        o.clientBits6,
 	}
 }

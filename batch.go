@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net"
 	"slices"
+	"time"
 )
 
 var (
@@ -43,6 +44,10 @@ type routeState struct {
 	matchers []Matcher
 	entries  []string
 	maxConns int
+	// dispatchTimeout and maxQueued override the entry's settings when
+	// not zero.
+	dispatchTimeout time.Duration
+	maxQueued       int
 }
 
 func (s *routeSet) clone() routeSet {
@@ -128,7 +133,8 @@ func (b *Batch) Add(cfg RouteConfig) (*Route, error) {
 		resolve:  cfg.Resolve,
 		handler:  cfg.Handler,
 	}
-	st := routeState{priority: cfg.Priority, matchers: slices.Clone(cfg.Matchers), entries: entryList(cfg.Entries), maxConns: cfg.MaxConns}
+	st := routeState{priority: cfg.Priority, matchers: slices.Clone(cfg.Matchers), entries: entryList(cfg.Entries), maxConns: cfg.MaxConns,
+		dispatchTimeout: cfg.DispatchTimeout, maxQueued: cfg.MaxQueued}
 	err := b.do(func(s *routeSet) error {
 		if r.name != "" {
 			if _, ok := s.names[r.name]; ok {
@@ -184,6 +190,18 @@ func entryList(entries []string) []string {
 // RouteConfig.MaxConns. Open connections over a lowered limit stay open.
 func (b *Batch) SetMaxConns(r *Route, n int) error {
 	return b.update(r, func(st *routeState) { st.maxConns = n })
+}
+
+// SetDispatchTimeout changes the dispatch timeout of r; see
+// RouteConfig.DispatchTimeout.
+func (b *Batch) SetDispatchTimeout(r *Route, d time.Duration) error {
+	return b.update(r, func(st *routeState) { st.dispatchTimeout = d })
+}
+
+// SetMaxQueued changes the limit of queued connections of r; see
+// RouteConfig.MaxQueued.
+func (b *Batch) SetMaxQueued(r *Route, n int) error {
+	return b.update(r, func(st *routeState) { st.maxQueued = n })
 }
 
 // SetPriority changes the priority of r.

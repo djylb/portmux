@@ -158,7 +158,9 @@ var acmeTLS = portmux.MatcherFunc(func(in *portmux.Input) portmux.Result {
 ```
 
 Matchers return `NeedMore` until they can decide, and their decisions must be
-final: a longer input must get the same answer. They must not block.
+final: a longer input must get the same answer. They must not block. A parser
+of your own can keep its state between calls on one connection with
+`Input.SetValue` and `Input.Value`, as the built-in parsers do.
 
 ## Combining Conditions
 
@@ -226,9 +228,12 @@ func moveAdmin(m *portmux.Mux, host string) error {
   a reject route does not see it and later routes may take it. Where reject
   routes guard the others, list what is allowed rather than what is not, and
   make the fallback a reject route too.
-- `MaxConns` limits the connections a route has open at once.
+- `MaxConns` limits the connections a route has open at once, and
+  `DispatchTimeout` and `MaxQueued` replace the entry's dispatch timeout and
+  queue limit for a route whose server is slower to accept than the others.
 - Routes can be added, changed with `SetMatchers`, `SetPriority`,
-  `SetEntries` and `SetMaxConns`, and removed with `Close` at any time.
+  `SetEntries`, `SetMaxConns`, `SetDispatchTimeout` and `SetMaxQueued`, and
+  removed with `Close` at any time.
   `Batch` applies several changes at once, and `Batch.Routes` previews the
   order. Each change rebuilds the routing table, so make many changes, such
   as loading thousands of routes, in one `Batch`.
@@ -378,6 +383,26 @@ func serveTunnel(m *portmux.Mux, backend string) (*portmux.Route, error) {
   obtained elsewhere. `Shutdown` waits for pending connections to be routed;
   `Close` stops at once. Neither affects delivered connections.
 
+A route is a `net.Listener`, so TLS can be terminated on it and what it
+carries routed again by a second Mux, for example SOCKS and HTTP proxies
+inside TLS on the same port as plain ones:
+
+```go
+// serveInsideTLS routes the plain connections of l, and those inside TLS
+// with cert by the same routes.
+func serveInsideTLS(l net.Listener, cert tls.Certificate, proxies func(*portmux.Mux)) error {
+	outer, inner := portmux.New(), portmux.New()
+	proxies(outer)
+	proxies(inner)
+	secure := outer.Match(portmux.TLS())
+	go inner.Serve(tls.NewListener(secure, &tls.Config{Certificates: []tls.Certificate{cert}}))
+	return outer.Serve(l)
+}
+```
+
+Connections of the inner Mux keep the client address of the outer one,
+including one from a PROXY header.
+
 ## PROXY Protocol
 
 ```go
@@ -433,13 +458,20 @@ func tighten(m *portmux.Mux) portmux.Config {
 | `WithMaxQueuedPerRoute(n)`       | 1024    | Matched connections waiting for one route's `Accept`                      | yes       |
 | `WithObserver(fn)`               | none    | Called with an `Event` for every connection delivered or closed           |           |
 | `WithProxyProtocol(policy)`      | none    | PROXY protocol v1/v2 per entry and peer                                   |           |
+| `WithClientPrefix(v4, v6)`       | 32, 64  | Networks counted as one client by the per-client limits and bans          |           |
 
 - `SetOptions` changes options while serving; `Config` reads them back, and
   `Entry.Config` the settings of an entry.
-- Clients are IPv4 addresses or IPv6 /64 networks of the TCP peer. Failed
+- Clients are IPv4 addresses and IPv6 /64 networks, or the networks of
+  `WithClientPrefix`, of the TCP peer, or of the source in the PROXY header of
+  a peer that `WithProxyProtocol` lets send one, so that a load balancer is
+  not limited or banned for its clients. Failed
   connections that count toward bans matched no route, timed out, hit a reject
   route or sent an invalid PROXY header or none where one is required;
-  `Mux.Ban` and `Unban` act by hand.
+  `Mux.Ban` and `Unban` act by hand; `Unban` lifts the bans of every network
+  that holds the address, such as a /24 banned under a shorter prefix.
+- An `Event` names the server name or host that matchers parsed, and reports
+  with `Banned` the failure that banned its client.
 - Rejected connections are reported with `ErrNoMatch`, `ErrRefused`,
   `ErrSniffTimeout`, `ErrDispatchTimeout`, `ErrEvicted`, `ErrPendingLimit`,
   `ErrRateLimited`, `ErrBanned`, `ErrRouteBusy`, `ErrRouteFull`,

@@ -2,26 +2,22 @@ package portmux
 
 import (
 	"hash/maphash"
-	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// clientKey returns the address that per-IP limits count a client under: the
-// IP address, or its /64 network for IPv6, since one IPv6 client usually
-// holds a whole /64.
-func clientKey(a net.Addr) (netip.Addr, bool) {
-	ap, ok := addrPort(a)
-	if !ok {
-		return netip.Addr{}, false
-	}
-	ip := ap.Addr()
+// clientNet returns the network of ip that per-IP limits count it under,
+// of the prefix lengths of WithClientPrefix.
+func (m *Mux) clientNet(ip netip.Addr) netip.Prefix {
+	o := m.opts.Load()
+	ip = ip.Unmap().WithZone("")
+	bits := o.clientBits4
 	if ip.Is6() {
-		ip = netip.PrefixFrom(ip.WithZone(""), 64).Masked().Addr()
+		bits = o.clientBits6
 	}
-	return ip, true
+	return netip.PrefixFrom(ip, bits).Masked()
 }
 
 // shardSeed keys shardOf, so that clients cannot choose addresses that share
@@ -29,9 +25,9 @@ func clientKey(a net.Addr) (netip.Addr, bool) {
 var shardSeed = maphash.MakeSeed()
 
 // shardOf spreads clients over n shards by all bytes of their address: the
-// keys of IPv6 clients are /64 networks, whose last bytes are all zero.
-func shardOf(client netip.Addr, n int) int {
-	b := client.As16()
+// keys of IPv6 clients are networks, whose last bytes are all zero.
+func shardOf(client netip.Prefix, n int) int {
+	b := client.Addr().As16()
 	return int(maphash.Bytes(shardSeed, b[:]) % uint64(n))
 }
 
@@ -77,12 +73,12 @@ func (l *slotLimit) signal() {
 // pendingLimit counts the undelivered connections of each client.
 type pendingLimit struct {
 	mu    sync.Mutex
-	count map[netip.Addr]int
+	count map[netip.Prefix]int
 }
 
 // acquire counts a connection of client. It reports false when the client
 // reached max.
-func (l *pendingLimit) acquire(client netip.Addr, max int) bool {
+func (l *pendingLimit) acquire(client netip.Prefix, max int) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.count[client] >= max {
@@ -92,7 +88,7 @@ func (l *pendingLimit) acquire(client netip.Addr, max int) bool {
 	return true
 }
 
-func (l *pendingLimit) release(client netip.Addr) {
+func (l *pendingLimit) release(client netip.Prefix) {
 	l.mu.Lock()
 	if n := l.count[client]; n > 1 {
 		l.count[client] = n - 1
@@ -128,7 +124,7 @@ type rateShard struct {
 	// check sweep.
 	fullSweep time.Duration
 	swept     bool
-	bucket    map[netip.Addr]tokenBucket
+	bucket    map[netip.Prefix]tokenBucket
 }
 
 type tokenBucket struct {
@@ -139,18 +135,18 @@ type tokenBucket struct {
 func newRateLimit(rate float64, burst int) *rateLimit {
 	l := &rateLimit{rate: rate, burst: float64(max(burst, 1)), epoch: time.Now()}
 	for i := range l.shards {
-		l.shards[i].bucket = make(map[netip.Addr]tokenBucket)
+		l.shards[i].bucket = make(map[netip.Prefix]tokenBucket)
 	}
 	return l
 }
 
 // allow takes a token for a new connection of client and reports whether
 // there was one.
-func (l *rateLimit) allow(client netip.Addr) bool {
+func (l *rateLimit) allow(client netip.Prefix) bool {
 	return l.allowAt(client, time.Since(l.epoch))
 }
 
-func (l *rateLimit) allowAt(client netip.Addr, now time.Duration) bool {
+func (l *rateLimit) allowAt(client netip.Prefix, now time.Duration) bool {
 	sh := &l.shards[shardOf(client, rateShards)]
 	sh.mu.Lock()
 	defer sh.mu.Unlock()

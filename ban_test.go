@@ -93,27 +93,27 @@ func TestBanListBounds(t *testing.T) {
 	l := newBanList()
 	now := time.Duration(0)
 	a := netip.MustParseAddr("192.0.2.1")
-	l.fail(banKey{client: a}, now, 3, time.Second, time.Minute)
-	l.fail(banKey{client: a}, now+2*time.Second, 3, time.Second, time.Minute) // a new window
-	l.fail(banKey{client: a}, now+2*time.Second, 3, time.Second, time.Minute)
+	l.fail(banKey{client: host(a)}, now, 3, time.Second, time.Minute)
+	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute) // a new window
+	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute)
 	if l.banned(a, now+2*time.Second) {
 		t.Fatal("banned with failures in two windows")
 	}
-	l.fail(banKey{client: a}, now+2*time.Second, 3, time.Second, time.Minute)
+	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute)
 	if !l.banned(a, now+2*time.Second) || l.banned(a, now+3*time.Minute) {
 		t.Fatal("ban period")
 	}
 	// Expired clients are swept, and the list stops growing when full.
 	for i := range maxBanClients + 100 {
 		ip := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
-		l.fail(banKey{client: ip}, 10*time.Minute, 5, time.Second, time.Minute)
+		l.fail(banKey{client: host(ip)}, 10*time.Minute, 5, time.Second, time.Minute)
 	}
 	if n := l.size.Load(); n > maxBanClients {
 		t.Fatalf("size %d", n)
 	}
 	for i := range rateSweepEvery * banShards {
 		ip := netip.AddrFrom4([4]byte{172, 16, byte(i >> 8), byte(i)})
-		l.fail(banKey{client: ip}, time.Hour, 5, time.Second, time.Minute)
+		l.fail(banKey{client: host(ip)}, time.Hour, 5, time.Second, time.Minute)
 	}
 	if n := l.size.Load(); n > maxBanClients/2 {
 		t.Fatalf("size %d after sweeping", n)
@@ -125,7 +125,7 @@ func TestBanListBounds(t *testing.T) {
 func TestBanListScopes(t *testing.T) {
 	l := newBanList()
 	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
-	mux, own := banKey{client: a}, banKey{client: a, entry: "fast", own: true}
+	mux, own := banKey{client: host(a)}, banKey{client: host(a), entry: "fast", own: true}
 	// Two failures toward the Mux's rule of three in ten minutes.
 	l.fail(mux, 0, 3, 10*time.Minute, time.Hour)
 	l.fail(mux, time.Second, 3, 10*time.Minute, time.Hour)
@@ -140,7 +140,7 @@ func TestBanListScopes(t *testing.T) {
 	// Sweeps after failures with a short window keep the Mux's count.
 	for i := range rateSweepEvery * banShards {
 		ip := netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)})
-		l.fail(banKey{client: ip, entry: "fast", own: true}, time.Minute, 3, time.Second, time.Hour)
+		l.fail(banKey{client: host(ip), entry: "fast", own: true}, time.Minute, 3, time.Second, time.Hour)
 	}
 	l.fail(mux, 2*time.Minute, 3, 10*time.Minute, time.Hour)
 	if !l.banned(a, 2*time.Minute) {
@@ -148,7 +148,7 @@ func TestBanListScopes(t *testing.T) {
 	}
 	// The entry's rule bans the client as well.
 	for range 3 {
-		l.fail(banKey{client: b, entry: "fast", own: true}, time.Hour, 3, time.Second, time.Minute)
+		l.fail(banKey{client: host(b), entry: "fast", own: true}, time.Hour, 3, time.Second, time.Minute)
 	}
 	if !l.banned(b, time.Hour) || len(l.list(time.Hour)) != 2 {
 		t.Fatalf("bans %+v", l.list(time.Hour))
@@ -162,7 +162,7 @@ func TestExpiredBansAreForgotten(t *testing.T) {
 	const n = 100000
 	for i := range n {
 		ip := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
-		l.set(banKey{client: ip}, time.Duration(i)*time.Millisecond, time.Second)
+		l.set(banKey{client: host(ip)}, time.Duration(i)*time.Millisecond, time.Second)
 	}
 	if size := l.size.Load(); size > n/4 {
 		t.Fatalf("size %d after %d bans of a second over %v", size, n, n*time.Millisecond)
@@ -178,7 +178,7 @@ func TestBanForever(t *testing.T) {
 	defer func() { _ = m.Close() }()
 	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
 	m.Ban(a, math.MaxInt64)
-	m.bans.fail(banKey{client: b}, m.bans.now(), 1, time.Minute, math.MaxInt64)
+	m.bans.fail(banKey{client: host(b)}, m.bans.now(), 1, time.Minute, math.MaxInt64)
 	if !m.bans.banned(a, m.bans.now()) || !m.bans.banned(b, m.bans.now()) || len(m.Bans()) != 2 {
 		t.Fatalf("bans %+v", m.Bans())
 	}

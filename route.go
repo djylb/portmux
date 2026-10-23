@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // RouteConfig describes a route for Mux.Add and Batch.Add.
@@ -52,6 +53,13 @@ type RouteConfig struct {
 	// waiting for Accept, and not closed yet. Connections over the limit are
 	// closed and reported with ErrRouteFull. Zero means no limit.
 	MaxConns int
+	// DispatchTimeout and MaxQueued override WithDispatchTimeout and
+	// WithMaxQueuedPerRoute for the route, so that a route whose server is
+	// slow to accept can wait longer, or queue less, than the others of its
+	// entry. Zero keeps the entry's setting, and a negative value removes the
+	// limit. They do not apply to a route with a Handler.
+	DispatchTimeout time.Duration
+	MaxQueued       int
 	// Handler, when set, serves the route's connections instead of Accept:
 	// each matched connection is passed to it in the goroutine that matched
 	// it, once it no longer counts as pending. This saves the accept loop,
@@ -225,6 +233,20 @@ func (r *Route) MaxConns() int {
 	return r.state().maxConns
 }
 
+// SetDispatchTimeout changes the route's dispatch timeout; see
+// RouteConfig.DispatchTimeout. It applies to connections matched from then
+// on, and returns net.ErrClosed for a removed route.
+func (r *Route) SetDispatchTimeout(d time.Duration) error {
+	return r.mux.Batch(func(b *Batch) error { return b.SetDispatchTimeout(r, d) })
+}
+
+// SetMaxQueued changes the route's limit of queued connections; see
+// RouteConfig.MaxQueued. Connections already queued stay queued. It returns
+// net.ErrClosed for a removed route.
+func (r *Route) SetMaxQueued(n int) error {
+	return r.mux.Batch(func(b *Batch) error { return b.SetMaxQueued(r, n) })
+}
+
 // tryOpen counts a connection as open unless max, when positive, are open.
 func (r *Route) tryOpen(max int) bool {
 	for {
@@ -273,6 +295,10 @@ type RouteInfo struct {
 	Open int64
 	// MaxConns is the limit of Open, or zero.
 	MaxConns int
+	// DispatchTimeout and MaxQueued are the route's own settings, or zero;
+	// see RouteConfig.
+	DispatchTimeout time.Duration
+	MaxQueued       int
 	// Accepting is the number of Accept calls waiting for a connection. A
 	// route without a handler whose Accepting stays zero has no server taking
 	// its connections.
@@ -301,6 +327,9 @@ func (r *Route) info(t *table) RouteInfo {
 		Open:      r.open.Load(),
 		MaxConns:  st.maxConns,
 		Accepting: r.accepting.Load(),
+
+		DispatchTimeout: st.dispatchTimeout,
+		MaxQueued:       st.maxQueued,
 	}
 	for i, m := range st.matchers {
 		info.Matchers[i] = describe(m)
