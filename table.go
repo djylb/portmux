@@ -52,13 +52,13 @@ func newTable(s routeSet, order []*Route) *table {
 		reportSilences(st.matchers, func(d time.Duration) { silences = append(silences, d) })
 		if len(st.entries) > 0 {
 			for _, name := range st.entries {
-				t.byEntry[name].add(r, st.matchers, silences)
+				t.byEntry[name].add(r, st, silences)
 			}
 			continue
 		}
-		t.other.add(r, st.matchers, silences)
+		t.other.add(r, st, silences)
 		for _, rs := range t.byEntry {
-			rs.add(r, st.matchers, silences)
+			rs.add(r, st, silences)
 		}
 	}
 	for _, rs := range t.byEntry {
@@ -72,7 +72,7 @@ func newTable(s routeSet, order []*Route) *table {
 // matchers or a resolver, other than a fallback, matches nothing and is only
 // reached through resolvers.
 func canMatch(r *Route, st routeState) bool {
-	return r.fallback || r.resolve != nil || len(st.matchers) > 0
+	return r.fallback || st.resolve != nil || len(st.matchers) > 0
 }
 
 // orderAfter returns the routes of s, which a change made from those of t,
@@ -132,18 +132,19 @@ type ruleSet struct {
 type rule struct {
 	route    *Route
 	matchers []Matcher
+	resolve  ResolveFunc // of the route, when it is a resolver route
 }
 
 // add appends a route that can match, added in matching order. The first
 // fallback route is the one in use.
-func (rs *ruleSet) add(r *Route, matchers []Matcher, silences []time.Duration) {
+func (rs *ruleSet) add(r *Route, st routeState, silences []time.Duration) {
 	if r.fallback {
 		if rs.fallback == nil {
 			rs.fallback = r
 		}
 		return
 	}
-	rs.rules = append(rs.rules, rule{route: r, matchers: matchers})
+	rs.rules = append(rs.rules, rule{route: r, matchers: st.matchers, resolve: st.resolve})
 	for _, d := range silences {
 		if !slices.Contains(rs.silences, d) {
 			rs.silences = append(rs.silences, d)
@@ -201,7 +202,7 @@ func (rs *ruleSet) evaluateSilent(dead []bool, in *Input) (target, via *Route) {
 // decide runs the rule's matchers and then, for a resolver route whose
 // matchers matched or that has none, its resolver.
 func (e *rule) decide(in *Input) (*Route, Result) {
-	resolve := e.route.resolve
+	resolve := e.resolve
 	if resolve == nil {
 		return e.route, matchAny(e.matchers, in)
 	}

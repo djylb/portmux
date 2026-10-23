@@ -18,6 +18,8 @@ var (
 	errResolveConfig  = fmt.Errorf("%w: a resolver route neither rejects nor falls back", ErrInvalidRoute)
 	errHandlerConfig  = fmt.Errorf("%w: a reject route has no handler", ErrInvalidRoute)
 	errNilMatcher     = fmt.Errorf("%w: nil matcher", ErrInvalidRoute)
+	errMaxConnsConfig = fmt.Errorf("%w: negative MaxConns", ErrInvalidRoute)
+	errUpsertName     = fmt.Errorf("%w: Upsert of a route without a name", ErrInvalidRoute)
 )
 
 // Batch collects route changes that a Mux applies together: a connection is
@@ -49,6 +51,8 @@ type routeState struct {
 	// not zero.
 	dispatchTimeout time.Duration
 	maxQueued       int
+	resolve         ResolveFunc
+	handler         func(*Conn)
 }
 
 func (s *routeSet) clone() routeSet {
@@ -105,22 +109,37 @@ func (b *Batch) do(op func(*routeSet) error) error {
 	return nil
 }
 
+// checkConfig reports why cfg is not a valid route, or nil.
+func checkConfig(cfg RouteConfig) error {
+	if err := checkMatchers(cfg.Matchers); err != nil {
+		return err
+	}
+	switch {
+	case cfg.Fallback && len(cfg.Matchers) > 0:
+		return errFallbackConfig
+	case cfg.Resolve != nil && (cfg.Reject || cfg.Fallback):
+		return errResolveConfig
+	case cfg.Handler != nil && cfg.Reject:
+		return errHandlerConfig
+	case cfg.MaxConns < 0:
+		return errMaxConnsConfig
+	}
+	return nil
+}
+
+// stateOf returns the changeable settings of cfg.
+func stateOf(cfg RouteConfig) routeState {
+	return routeState{priority: cfg.Priority, matchers: slices.Clone(cfg.Matchers), entries: entryList(cfg.Entries), maxConns: cfg.MaxConns,
+		dispatchTimeout: cfg.DispatchTimeout, maxQueued: cfg.MaxQueued, resolve: cfg.Resolve, handler: cfg.Handler}
+}
+
 // Add adds a route.
 func (b *Batch) Add(cfg RouteConfig) (*Route, error) {
 	if b.done {
 		return nil, errBatchDone
 	}
-	if err := checkMatchers(cfg.Matchers); err != nil {
+	if err := checkConfig(cfg); err != nil {
 		return nil, err
-	}
-	if cfg.Fallback && len(cfg.Matchers) > 0 {
-		return nil, errFallbackConfig
-	}
-	if cfg.Resolve != nil && (cfg.Reject || cfg.Fallback) {
-		return nil, errResolveConfig
-	}
-	if cfg.Handler != nil && cfg.Reject {
-		return nil, errHandlerConfig
 	}
 	r := &Route{
 		mux:      b.m,
@@ -130,11 +149,8 @@ func (b *Batch) Add(cfg RouteConfig) (*Route, error) {
 		done:     make(chan struct{}),
 		reject:   cfg.Reject,
 		fallback: cfg.Fallback,
-		resolve:  cfg.Resolve,
-		handler:  cfg.Handler,
 	}
-	st := routeState{priority: cfg.Priority, matchers: slices.Clone(cfg.Matchers), entries: entryList(cfg.Entries), maxConns: cfg.MaxConns,
-		dispatchTimeout: cfg.DispatchTimeout, maxQueued: cfg.MaxQueued}
+	st := stateOf(cfg)
 	err := b.do(func(s *routeSet) error {
 		if r.name != "" {
 			if _, ok := s.names[r.name]; ok {
@@ -189,6 +205,9 @@ func entryList(entries []string) []string {
 // SetMaxConns changes the limit of open connections of r; see
 // RouteConfig.MaxConns. Open connections over a lowered limit stay open.
 func (b *Batch) SetMaxConns(r *Route, n int) error {
+	if n < 0 {
+		return errMaxConnsConfig
+	}
 	return b.update(r, func(st *routeState) { st.maxConns = n })
 }
 
@@ -202,6 +221,65 @@ func (b *Batch) SetDispatchTimeout(r *Route, d time.Duration) error {
 // RouteConfig.MaxQueued.
 func (b *Batch) SetMaxQueued(r *Route, n int) error {
 	return b.update(r, func(st *routeState) { st.maxQueued = n })
+}
+
+// SetHandler changes the handler of r, or turns r into a route that
+// delivers to Accept with nil; see RouteConfig.Handler. Connections that
+// already wait for Accept stay there.
+func (b *Batch) SetHandler(r *Route, handler func(*Conn)) error {
+	if err := b.check(r); err != nil {
+		return err
+	}
+	if handler != nil && r.reject {
+		return errHandlerConfig
+	}
+	return b.update(r, func(st *routeState) { st.handler = handler })
+}
+
+// SetResolve changes the resolver of r, or removes it with nil; see
+// RouteConfig.Resolve.
+func (b *Batch) SetResolve(r *Route, resolve ResolveFunc) error {
+	if err := b.check(r); err != nil {
+		return err
+	}
+	if resolve != nil && (r.reject || r.fallback) {
+		return errResolveConfig
+	}
+	return b.update(r, func(st *routeState) { st.resolve = resolve })
+}
+
+// Upsert adds the route named cfg.Name, or changes the route of that name to
+// cfg, keeping the route and its listener, so that a server in its Accept
+// goes on serving it: reloading a configuration route by route closes no
+// listener of a route that stays. A route whose Reject or Fallback changes is
+// a different kind of route: Upsert replaces it, closing the old one, whose
+// connections waiting for Accept are matched again. cfg.Name must not be
+// empty.
+func (b *Batch) Upsert(cfg RouteConfig) (*Route, error) {
+	if b.done {
+		return nil, errBatchDone
+	}
+	if cfg.Name == "" {
+		return nil, errUpsertName
+	}
+	if err := checkConfig(cfg); err != nil {
+		return nil, err
+	}
+	r := b.view.names[cfg.Name]
+	if r == nil {
+		return b.Add(cfg)
+	}
+	if r.reject != cfg.Reject || r.fallback != cfg.Fallback {
+		if err := b.Remove(r); err != nil {
+			return nil, err
+		}
+		return b.Add(cfg)
+	}
+	st := stateOf(cfg)
+	if err := b.update(r, func(cur *routeState) { *cur = st }); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // SetPriority changes the priority of r.

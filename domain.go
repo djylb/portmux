@@ -27,8 +27,9 @@ func (d domainMatcher) Match(in *Input) Result {
 func (d domainMatcher) String() string { return call("Domain", d.set.Patterns(), quote) }
 
 // RequestedName returns the host name the connection asks for, normalized
-// as hostmatch.Normalize does: the SNI of a TLS ClientHello, or the host of an
-// HTTP/1.x or h2c request without its port. The name is empty for a
+// as hostmatch.Normalize does: the name set with SetRequestedName, or else the
+// SNI of a TLS ClientHello, or the host of an HTTP/1.x or h2c request without
+// its port. The name is empty for a
 // ClientHello or request without one. It returns NoMatch when the
 // connection is none of these or its name is not a valid host name, and
 // NeedMore until it can tell.
@@ -44,6 +45,9 @@ func (in *Input) RequestedName() (string, Result) {
 }
 
 func (in *Input) requestedName() (hostmatch.Name, Result) {
+	if in.named {
+		return in.name, Match
+	}
 	hello, tlsRes := in.ClientHello()
 	if tlsRes == Match {
 		return hello.Name(), Match
@@ -66,7 +70,10 @@ func (in *Input) requestedName() (hostmatch.Name, Result) {
 // ask for, as Input.RequestedName returns it, through hosts: pick is called with
 // the patterns that match the name, most specific first, and their values,
 // and the first route it accepts takes the connection. A nil route sends the
-// connection to the resolver route itself. When pick accepts no pattern, the
+// connection to the resolver route itself. A route that is closed is passed
+// over as pick not accepting it, so that replacing a route, by adding the
+// new one, pointing hosts to it and closing the old one, sends no
+// connection to the closed one. When pick accepts no pattern, the
 // connection is left to the next routes.
 //
 // pick sees the Input too, so that a value can hold several targets, for
@@ -85,7 +92,9 @@ func ResolveHosts[V any](hosts *hostmatch.Map[V], pick func(in *Input, pattern s
 		_, _, found := hosts.LookupNameFunc(n, func(pattern string, v V) bool {
 			var ok bool
 			target, ok = pick(in, pattern, v)
-			return ok
+			// A closed route, such as one replaced while hosts still names
+			// it, passes the name on to the next pattern.
+			return ok && (target == nil || !target.isClosed())
 		})
 		if !found {
 			return nil, NoMatch

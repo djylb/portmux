@@ -62,6 +62,10 @@ func (f MatcherFunc) Match(in *Input) Result {
 	return f(in)
 }
 
+// String describes f as "MatcherFunc", as FilterFunc does; Named gives it
+// a name of its own.
+func (f MatcherFunc) String() string { return "MatcherFunc" }
+
 // Named gives m a description, which Snapshot and RouteInfo show instead of
 // its type. Built-in matchers describe themselves, as in TLS(SNI("a.example")).
 func Named(name string, m Matcher) Matcher {

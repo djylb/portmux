@@ -156,8 +156,8 @@ func TestResolverEdgeCases(t *testing.T) {
 	}
 
 	for _, cfg := range []RouteConfig{
-		{Resolve: self.resolve, Reject: true},
-		{Resolve: self.resolve, Fallback: true},
+		{Resolve: func(*Input) (*Route, Result) { return self, Match }, Reject: true},
+		{Resolve: func(*Input) (*Route, Result) { return self, Match }, Fallback: true},
 	} {
 		if _, err := m.Add(cfg); !errors.Is(err, errResolveConfig) {
 			t.Errorf("Add = %v", err)
@@ -169,7 +169,7 @@ func TestInputPeerAddr(t *testing.T) {
 	type addrs struct{ remote, peer string }
 	seen := make(chan addrs, 1)
 	m := startMux(t, WithProxyProtocol(func(_ string, _, _ net.Addr) proxyproto.Policy { return proxyproto.Required }))
-	target := m.Listen()
+	target := mustAdd(t, m, RouteConfig{}) // a target of the resolver
 	mustAdd(t, m, RouteConfig{Resolve: func(in *Input) (*Route, Result) {
 		select {
 		case seen <- addrs{in.RemoteAddr().String(), in.PeerAddr().String()}:
@@ -194,7 +194,7 @@ func BenchmarkResolverHosts(b *testing.B) {
 		b.Run(fmt.Sprint(n), func(b *testing.B) {
 			// The targets are routes of the table, as in a Mux.
 			var domains domainTable
-			s := routeSet{routes: map[*Route]routeState{{resolve: domains.resolve, seq: uint64(n)}: {}}}
+			s := routeSet{routes: map[*Route]routeState{{seq: uint64(n)}: {resolve: domains.resolve}}}
 			for i := range n {
 				r := &Route{name: fmt.Sprint(i), seq: uint64(i)}
 				domains.set(fmt.Sprintf("h%d.example.com", i), r)

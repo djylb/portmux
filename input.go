@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/djylb/netx/proxyproto"
+	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/tlshello"
 )
@@ -36,6 +37,9 @@ type Input struct {
 
 	// values are the ones of SetValue, in the order set.
 	values []inputValue
+	// name is the name of SetRequestedName, when named.
+	name  hostmatch.Name
+	named bool
 
 	// memo keeps the decisions of the first Regexp matchers that decided,
 	// which do not change, so that a matcher that waits for more bytes in
@@ -139,6 +143,7 @@ func (in *Input) SetBytes(data []byte, final bool) {
 		in.nmemo = 0
 		clear(in.values)
 		in.values = in.values[:0]
+		in.name, in.named = hostmatch.Name{}, false
 	}
 	in.data, in.final = data, final
 }
@@ -166,6 +171,16 @@ func (in *Input) RemoteAddr() net.Addr {
 // protocol header when one was parsed.
 func (in *Input) LocalAddr() net.Addr {
 	return in.local
+}
+
+// SetRequestedName sets the host name that the connection asks for, for a
+// protocol of your own that names its target: Domain, ResolveHosts,
+// ResolveDomain, Conn.RequestedName and Event.Name then see it, in place of
+// the parsed TLS and HTTP names. It is normalized as hostmatch.Normalize
+// does; a name that is not a valid host name matches no name. Like a value,
+// it lasts for the rest of the matching of the connection.
+func (in *Input) SetRequestedName(name string) {
+	in.name, in.named = hostmatch.Normalize(name), true
 }
 
 // Elapsed returns, during a check for silence, how long the connection has

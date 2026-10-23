@@ -258,9 +258,34 @@ type Event struct {
 	ClientHello  *tlshello.Hello
 	HTTPRequest  *httphead.Request
 	HTTP2Request *httphead.Request
+	// Peer is the address of the TCP peer, which differs from Remote when a
+	// PROXY header was parsed: the peer is then the proxy that sent it.
+	Peer net.Addr
+
+	// Closed reports an event of WithCloseEvents: the delivered connection
+	// was closed with Conn.Close, Duration after its delivery, having
+	// returned Read bytes to its server and taken Written from it.
+	Closed   bool
+	Duration time.Duration
+	Read     int64
+	Written  int64
+
+	values []inputValue // of Input.SetValue
 	// Banned reports that this connection's failure banned its client; see
 	// WithBanPerClient.
 	Banned bool
+}
+
+// Value returns the value that a matcher or resolver stored under key with
+// Input.SetValue while the connection was matched, or nil, as Conn.Value
+// does.
+func (e Event) Value(key any) any {
+	for _, v := range e.values {
+		if v.key == key {
+			return v.value
+		}
+	}
+	return nil
 }
 
 // observe passes ev to the observer, unless the Mux was closed.

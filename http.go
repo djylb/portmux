@@ -261,7 +261,7 @@ func hasToken(list string, tokens []string) bool {
 // filters see the request's :method, :path and :authority as Method, Path
 // and Host, and its header fields. It waits for the client connection
 // preface, the SETTINGS frame that follows it and the header block of the
-// first request, so the parsed request is available from Conn.HTTPRequest.
+// first request, so the parsed request is available from Conn.HTTP2Request.
 //
 // Clients that wait for the server's SETTINGS frame before they send a
 // request, as some gRPC implementations do, cannot be matched by their

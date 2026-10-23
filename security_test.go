@@ -632,29 +632,68 @@ func TestPerClientRulesUseProxySource(t *testing.T) {
 	accept(t, route)
 }
 
-// TestHeaderFailuresCountAgainstPeer checks that a peer that sends no PROXY
-// header, or a broken one, where one is required is banned itself, as
-// nothing names another client.
-func TestHeaderFailuresCountAgainstPeer(t *testing.T) {
+// TestTrustedPeerIsNotBanned checks that a peer trusted to send PROXY
+// headers, such as a load balancer, is not banned for connections without a
+// valid header, which would refuse every client behind it, and that the
+// sources of its headers still are.
+func TestTrustedPeerIsNotBanned(t *testing.T) {
 	log := newErrorLog()
 	m := startMux(t, log.option(), WithBanPerClient(1, time.Minute, time.Minute),
-		WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Required }))
-	m.Listen(Prefix("GET"))
+		WithProxyProtocol(TrustPeers(netip.MustParsePrefix("127.0.0.0/8"))))
+	route := m.Listen(Prefix("GET"))
 	serve(t, m)
 
+	for range 3 {
+		c := dial(t, m)
+		_, _ = c.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
+		expectClosed(t, c)
+		if err := log.wait(t); !errors.Is(err, proxyproto.ErrNoHeader) {
+			t.Fatalf("reported %v", err)
+		}
+	}
+	dst := &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443}
+	_, _ = dial(t, m).Write(append(v2Header(t, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 40000}, dst), "GET"...))
+	accept(t, route)
+	if bans := m.Bans(); len(bans) != 0 {
+		t.Fatalf("Bans = %+v, want the balancer not banned", bans)
+	}
+
+	// A source of a header that fails is banned, and Ban bans the peer.
 	c := dial(t, m)
-	_, _ = c.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
+	_, _ = c.Write(append(v2Header(t, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 9), Port: 40000}, dst), "XX"...))
 	expectClosed(t, c)
-	if err := log.wait(t); !errors.Is(err, proxyproto.ErrNoHeader) {
+	if err := log.wait(t); !errors.Is(err, ErrNoMatch) {
 		t.Fatalf("reported %v", err)
 	}
+	if bans := m.Bans(); len(bans) != 1 || bans[0].Client != netip.MustParsePrefix("192.0.2.9/32") {
+		t.Fatalf("Bans = %+v", bans)
+	}
+	m.Ban(netip.MustParseAddr("127.0.0.1"), time.Minute)
 	c = dial(t, m)
 	expectClosed(t, c)
 	if err := log.wait(t); !errors.Is(err, ErrBanned) {
-		t.Fatalf("reported %v, want the peer banned", err)
+		t.Fatalf("reported %v, want the peer banned by hand", err)
 	}
-	if bans := m.Bans(); len(bans) != 1 || bans[0].Client != netip.MustParsePrefix("127.0.0.1/32") {
-		t.Fatalf("Bans = %+v", bans)
+
+	// With optional headers, the peer's own failing connections without a
+	// header do not ban it either.
+	log2 := newErrorLog()
+	m2 := startMux(t, log2.option(), WithBanPerClient(1, time.Minute, time.Minute),
+		WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Optional }))
+	route2 := m2.Listen(Prefix("GET"))
+	serve(t, m2)
+	for range 2 {
+		c := dial(t, m2)
+		_, _ = c.Write([]byte("XX"))
+		expectClosed(t, c)
+		if err := log2.wait(t); !errors.Is(err, ErrNoMatch) {
+			t.Fatalf("reported %v", err)
+		}
+	}
+	_, _ = dial(t, m2).Write([]byte("GET"))
+	accept(t, route2)
+	if bans := m2.Bans(); len(bans) != 0 {
+		t.Fatalf("Bans = %+v, want the peer of optional headers not banned", bans)
 	}
 }
 

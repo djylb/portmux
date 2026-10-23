@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/djylb/netx/proxyproto"
+	"github.com/djylb/portmux/hostmatch"
 )
 
 // errRouteGone reports that the chosen route was removed before it accepted
@@ -115,7 +116,12 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 		var ev Event
 		if observed {
 			ev = Event{Entry: entry, Err: err, Elapsed: time.Since(s.start), Sniffed: len(s.buf)}
-			ev.Name = requestedName(s.in.hello, s.in.req, s.in.req2)
+			var name *hostmatch.Name
+			if s.in.named {
+				name = &s.in.name
+			}
+			ev.Name = requestedName(name, s.in.hello, s.in.req, s.in.req2)
+			ev.Peer, ev.values = conn.conn.RemoteAddr(), s.in.values
 			ev.ClientHello, ev.HTTPRequest, ev.HTTP2Request = s.in.hello, s.in.req, s.in.req2
 			ev.Remote, ev.Local = conn.RemoteAddr(), conn.LocalAddr()
 		}
@@ -172,6 +178,7 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 	}
 	if a.proxied {
 		// The client is the source of the header, if there was one.
+		a.header = conn.proxy != nil
 		if a, err = m.admitClient(a, conn.RemoteAddr(), o, rate); err != nil {
 			return nil, conn, err
 		}
@@ -231,14 +238,17 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 			return nil, conn, ErrConnLimit
 		}
 		conn.mux, conn.ln = m, l
+		if mo := m.opts.Load(); mo.closeEvents && mo.observer != nil {
+			conn.track = &connTrack{start: time.Now()}
+		}
 		conn.open.Store(true)
 		m.count(l, stripe, func(c *counters) { c.open.Add(1) })
 		// The buffer is dropped only once delivered: matched again, the
 		// connection still reads into it.
-		if r.handler != nil {
+		if st.handler != nil {
 			delivered = true
 			conn.dropEmpty()
-			return r.handler, conn, nil
+			return st.handler, conn, nil
 		}
 		if held {
 			// Matched, the connection waits only for its route, which
@@ -478,6 +488,10 @@ func (s *sniffer) handOver(r *Route) {
 		c.req2 = in.req2
 	}
 	c.values = slices.Clone(in.values) // nil, without allocating, when none were set
+	if in.named {
+		name := in.name
+		c.name = &name
+	}
 }
 
 // deliver hands the connection to r's Accept, with the queue limit and the

@@ -23,8 +23,23 @@ import (
 // and WithProxyProtocol. Silent works as in a Mux. Peek sets read deadlines
 // on c while reading and clears them before it returns.
 func Peek(c net.Conn, m Matcher, opts ...PeekOption) (*Conn, error) {
-	if c == nil || m == nil {
-		panic("portmux: Peek needs a connection and a matcher")
+	if m == nil {
+		panic("portmux: Peek needs a matcher")
+	}
+	conn, _, err := PeekAny(c, []Matcher{m}, opts...)
+	return conn, err
+}
+
+// PeekAny is Peek for several matchers, tried in order as the routes of a
+// Mux are: it returns the index of the first that matches, or -1 with an
+// error, so that a server learns which protocol the client speaks, as in
+// PeekAny(c, []Matcher{TLS(), HTTP1(), SSH()}). A matcher that still needs
+// bytes holds back the later ones, as a route does, and Silent among them
+// works as in a Mux. PeekAny panics without a connection, without matchers
+// or on a nil one, as Peek does.
+func PeekAny(c net.Conn, matchers []Matcher, opts ...PeekOption) (*Conn, int, error) {
+	if c == nil || len(matchers) == 0 || slices.Contains(matchers, nil) {
+		panic("portmux: PeekAny needs a connection and matchers")
 	}
 	all := make([]Option, len(opts))
 	for i, opt := range opts {
@@ -35,28 +50,38 @@ func Peek(c net.Conn, m Matcher, opts ...PeekOption) (*Conn, error) {
 	s := newSniffer(conn, &o, time.Now())
 	defer s.release()
 	var tables atomic.Pointer[table]
-	tables.Store(peekTable(m))
+	t, routes := peekTable(matchers)
+	tables.Store(t)
 	err := s.readProxyHeader(proxyPolicyFor(&o, "", c), &tables)
+	index := -1
 	if err == nil {
-		_, err = s.match(&tables, o.maxSniffBytes)
+		var r *Route
+		if r, err = s.match(&tables, o.maxSniffBytes); err == nil {
+			index = slices.Index(routes, r)
+		}
 	}
 	s.handOver(nil)
 	conn.dropEmpty()
-	return conn, err
+	return conn, index, err
 }
 
-// peekRoute is the route of the tables of Peek, which deliver nowhere.
-var peekRoute = new(Route)
-
-// peekTable returns a table with one rule of m, built without the
+// peekTable returns a table with a rule of each matcher, in order, and the
+// routes of the rules, which deliver nowhere; it is built without the
 // configuration that a Mux keeps.
-func peekTable(m Matcher) *table {
-	rs := &ruleSet{rules: []rule{{route: peekRoute, matchers: []Matcher{m}}}}
-	reportSilences(rs.rules[0].matchers, func(d time.Duration) {
-		if !slices.Contains(rs.silences, d) {
-			rs.silences = append(rs.silences, d)
-		}
-	})
+func peekTable(matchers []Matcher) (*table, []*Route) {
+	rs := &ruleSet{}
+	routes := make([]*Route, len(matchers))
+	for i, m := range matchers {
+		routes[i] = new(Route)
+		rs.rules = append(rs.rules, rule{route: routes[i], matchers: []Matcher{m}})
+	}
+	for _, r := range rs.rules {
+		reportSilences(r.matchers, func(d time.Duration) {
+			if !slices.Contains(rs.silences, d) {
+				rs.silences = append(rs.silences, d)
+			}
+		})
+	}
 	slices.Sort(rs.silences)
-	return &table{other: rs}
+	return &table{other: rs}, routes
 }

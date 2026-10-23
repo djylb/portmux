@@ -2,6 +2,7 @@ package portmux
 
 import (
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/djylb/netx/proxyproto"
@@ -37,6 +38,7 @@ type options struct {
 	proxyPolicy         func(entry string, peer, local net.Addr) proxyproto.Policy
 	clientBits4         int
 	clientBits6         int
+	closeEvents         bool
 }
 
 // Option configures a Mux; see New and Mux.SetOptions.
@@ -180,10 +182,12 @@ func WithClientPrefix(v4, v6 int) Option {
 // for a peer that WithProxyProtocol lets send a header, of the source in its
 // header. For such a peer the per-client rules apply once the header is read,
 // with the peer itself as the client when it sends none where one is
-// optional, and failures before the header, such as a missing or broken one,
-// count toward banning the peer; until then its connections are bounded by
-// WithMaxPending and the sniff timeout only, so allow headers only from
-// trusted peers. A non-positive value, the default, removes the limit.
+// optional. The peer's own failures, such as a missing or broken header, and
+// those of its connections without one, do not count toward banning anyone,
+// so that a misconfigured load balancer is not banned with every client
+// behind it; Mux.Ban still bans it. Until the header is read, its connections are
+// bounded by WithMaxPending and the sniff timeout only, so allow headers only
+// from trusted peers. A non-positive value, the default, removes the limit.
 func WithMaxPendingPerClient(n int) EntryOption {
 	return entryOption{settingMaxPendingPerClient, func(o *options) {
 		o.maxPendingPerClient = n
@@ -223,7 +227,9 @@ func WithRateLimitPerListener(perSecond float64, burst int) EntryOption {
 // PROXY header or none where one is required within window, the client's
 // connections are refused for d, before any byte is read past a PROXY
 // header, and reported with ErrBanned; a banned peer that may send a header
-// is refused before its header. Connections that are closed without sending
+// is refused before its header. Peers that WithProxyProtocol lets send a
+// header are not banned automatically for their own failures; see
+// WithMaxPendingPerClient. Connections that are closed without sending
 // anything, as health checks are, do not count.
 // Clients are counted as in WithMaxPendingPerClient; Mux.Ban, BanPrefix and
 // Mux.Bans manage bans directly. A non-positive failures or d, the default,
@@ -261,6 +267,18 @@ func WithObserver(fn func(Event)) Option {
 	})
 }
 
+// WithCloseEvents makes the observer of WithObserver receive one more Event
+// for each delivered connection, when its server closes it with Conn.Close:
+// with Closed set, how long it was open and how many bytes it carried, for
+// access logs. The Mux then counts the bytes of delivered connections, which
+// costs an atomic addition per read and write; without it, they are not
+// counted. It applies to connections delivered after it is set.
+func WithCloseEvents(on bool) Option {
+	return optionFunc(func(o *options) {
+		o.closeEvents = on
+	})
+}
+
 // WithProxyProtocol enables PROXY protocol v1 and v2 headers, parsed with
 // github.com/djylb/netx/proxyproto. The policy is called for each connection
 // with its entry, its peer and its local address, and decides whether a
@@ -286,11 +304,24 @@ func WithObserver(fn func(Event)) Option {
 // the peer when accepting; see WithMaxPendingPerClient.
 //
 // Only trusted peers such as a load balancer should be allowed to send a
-// header, since it lets the peer choose the reported client address.
+// header, since it lets the peer choose the reported client address;
+// TrustPeers gives a policy for a list of their addresses.
 func WithProxyProtocol(policy func(entry string, peer, local net.Addr) proxyproto.Policy) PeekOption {
 	return peekFunc(func(o *options) {
 		o.proxyPolicy = policy
 	})
+}
+
+// TrustPeers returns a policy for WithProxyProtocol under which the peers in
+// prefixes, such as the addresses of a load balancer, must send a PROXY
+// header on every entry, and other peers are served as they are, as
+// proxyproto.TrustPrefixes reads the prefixes. A health check of the peer
+// that sends bytes without a header then fails, though without banning the
+// peer; let health checks send nothing, or write a policy of your own that
+// makes headers optional, as it also may to tell entries apart.
+func TrustPeers(prefixes ...netip.Prefix) func(entry string, peer, local net.Addr) proxyproto.Policy {
+	trust := proxyproto.TrustPrefixes(prefixes...)
+	return func(_ string, peer, _ net.Addr) proxyproto.Policy { return trust(peer) }
 }
 
 func newOptions(opts []Option) options {
@@ -357,6 +388,8 @@ type Config struct {
 	// ClientPrefix4 and ClientPrefix6 are the arguments of WithClientPrefix.
 	ClientPrefix4 int
 	ClientPrefix6 int
+	// CloseEvents is the argument of WithCloseEvents.
+	CloseEvents bool
 }
 
 // EntryOptions returns the options that set the settings of c that an entry
@@ -379,15 +412,15 @@ func (c Config) EntryOptions() []EntryOption {
 }
 
 // Options returns the options that set the settings of c, for New and
-// Mux.SetOptions: those of EntryOptions, WithMaxPending and
-// WithClientPrefix. The functions of WithObserver and WithProxyProtocol,
+// Mux.SetOptions: those of EntryOptions, WithMaxPending, WithClientPrefix
+// and WithCloseEvents. The functions of WithObserver and WithProxyProtocol,
 // which Config does not hold, are not among them, so SetOptions keeps them.
 func (c Config) Options() []Option {
 	var opts []Option
 	for _, o := range c.EntryOptions() {
 		opts = append(opts, o)
 	}
-	return append(opts, WithMaxPending(c.MaxPending), WithClientPrefix(c.ClientPrefix4, c.ClientPrefix6))
+	return append(opts, WithMaxPending(c.MaxPending), WithClientPrefix(c.ClientPrefix4, c.ClientPrefix6), WithCloseEvents(c.CloseEvents))
 }
 
 func (o *options) config() Config {
@@ -409,5 +442,6 @@ func (o *options) config() Config {
 		ProxyProtocol:        o.proxyPolicy != nil,
 		ClientPrefix4:        o.clientBits4,
 		ClientPrefix6:        o.clientBits6,
+		CloseEvents:          o.closeEvents,
 	}
 }

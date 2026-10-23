@@ -130,8 +130,14 @@ func (m *Mux) Config() Config {
 // priority are tried in the order they were added, so for a static setup
 // Listen routes can simply be added from specific to general. After Close it
 // returns a closed route, whose Accept returns net.ErrClosed, as a listener
-// does. Listen panics on a nil matcher.
+// does. Listen panics on a nil matcher and without matchers, as a route
+// without them matches nothing: take every connection with AnyBytes or
+// Always, and add a route without matchers, such as a target of resolvers,
+// with Add.
 func (m *Mux) Listen(matchers ...Matcher) *Route {
+	if len(matchers) == 0 {
+		panic("portmux: Listen without matchers matches nothing; use AnyBytes or Always, or Add for a target of resolvers")
+	}
 	r, err := m.Add(RouteConfig{Matchers: matchers})
 	if err != nil && !errors.Is(err, net.ErrClosed) {
 		panic(err)
@@ -148,6 +154,17 @@ func (m *Mux) Add(cfg RouteConfig) (*Route, error) {
 	err := m.Batch(func(b *Batch) error {
 		var err error
 		r, err = b.Add(cfg)
+		return err
+	})
+	return r, err
+}
+
+// Upsert adds or changes the route named cfg.Name; see Batch.Upsert.
+func (m *Mux) Upsert(cfg RouteConfig) (*Route, error) {
+	var r *Route
+	err := m.Batch(func(b *Batch) error {
+		var err error
+		r, err = b.Upsert(cfg)
 		return err
 	})
 	return r, err
@@ -250,13 +267,13 @@ type admission struct {
 	// rules wait for serveConn, which calls the policy, the program's code,
 	// in the connection's goroutine, so that a slow or failing policy does
 	// not hold up the accept loop. proxy is its answer, and proxied that the
-	// rules then wait for the header, whose source is the client. peer is
-	// the key of the TCP peer, which failures before the header count
-	// against.
+	// rules then wait for the header, whose source is the client; header
+	// that there was one. The failures of a trusted peer itself, without a
+	// header, do not count toward bans.
 	policy  bool
 	proxy   proxyproto.Policy
 	proxied bool
-	peer    netip.Prefix
+	header  bool
 }
 
 // admit applies the listener's rate and the per-client rules to a connection
@@ -269,14 +286,10 @@ func (m *Mux) admit(c net.Conn, l *listener) (admission, error) {
 		return admission{}, ErrRateLimited
 	}
 	if o.proxyPolicy != nil {
-		a := admission{policy: true}
-		if ap, ok := addrPort(c.RemoteAddr()); ok {
-			a.peer = m.clientNet(ap.Addr())
-			if m.bans.banned(ap.Addr(), m.bans.now()) {
-				return admission{}, ErrBanned
-			}
+		if ap, ok := addrPort(c.RemoteAddr()); ok && m.bans.banned(ap.Addr(), m.bans.now()) {
+			return admission{}, ErrBanned
 		}
-		return a, nil
+		return admission{policy: true}, nil
 	}
 	a := admission{proxy: proxyproto.Ignore}
 	if o.maxPendingPerClient <= 0 && rate == nil && o.banFailures <= 0 && m.bans.size.Load() == 0 {
@@ -326,20 +339,23 @@ func (m *Mux) freeAdmitted(a *admission) {
 	m.slots.release()
 }
 
-// releaseAdmitted frees, when held, the pending slot and the pending count per client of
-// a connection accepted by Serve, and counts err, its failure if any, toward
-// banning the client, or the peer when the failure came before a PROXY
-// header named the client. It reports whether that banned the client.
+// releaseAdmitted frees, when held, the pending slot and the pending count
+// per client of a connection accepted by Serve, and counts err, its failure
+// if any, toward banning the client, unless the client is a peer trusted to
+// send PROXY headers that sent none. It reports whether that banned the
+// client.
 func (m *Mux) releaseAdmitted(l *listener, a admission, held bool, err error) (banned bool) {
 	if held {
 		m.freeAdmitted(&a)
 	}
-	key := a.client
-	if !key.IsValid() {
-		key = a.peer
+	// A peer trusted to send PROXY headers, such as a load balancer, is not
+	// banned for its own failures, which would refuse every client behind
+	// it: only the sources of its headers are.
+	if a.proxied && !a.header {
+		return false
 	}
-	if o, _ := m.settings(l.entry); err != nil && o.banFailures > 0 && o.banTime > 0 && key.IsValid() && banWorthy(err) {
-		return m.bans.fail(m.banKey(l.entry, key), m.bans.now(), o.banFailures, o.banWindow, o.banTime)
+	if o, _ := m.settings(l.entry); err != nil && o.banFailures > 0 && o.banTime > 0 && a.client.IsValid() && banWorthy(err) {
+		return m.bans.fail(m.banKey(l.entry, a.client), m.bans.now(), o.banFailures, o.banWindow, o.banTime)
 	}
 	return false
 }

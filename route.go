@@ -54,7 +54,8 @@ type RouteConfig struct {
 	Fallback bool
 	// MaxConns limits the connections the route has open: delivered, or
 	// waiting for Accept, and not closed yet. Connections over the limit are
-	// closed and reported with ErrConnLimit. Zero means no limit.
+	// closed and reported with ErrConnLimit. Zero means no limit; a negative
+	// value is not valid.
 	MaxConns int
 	// DispatchTimeout and MaxQueued override WithDispatchTimeout and
 	// WithMaxQueued for the route, so that a route whose server is
@@ -109,8 +110,6 @@ type Route struct {
 	open      atomic.Int64
 	reject    bool
 	fallback  bool
-	resolve   ResolveFunc
-	handler   func(*Conn)
 }
 
 // Accept waits for the next connection matched by the route. The connection
@@ -228,6 +227,18 @@ func (r *Route) SetMatchers(matchers ...Matcher) error {
 	return r.mux.Batch(func(b *Batch) error { return b.SetMatchers(r, matchers...) })
 }
 
+// SetHandler changes the route's handler; see Batch.SetHandler. It returns
+// net.ErrClosed for a removed route.
+func (r *Route) SetHandler(handler func(*Conn)) error {
+	return r.mux.Batch(func(b *Batch) error { return b.SetHandler(r, handler) })
+}
+
+// SetResolve changes the route's resolver; see Batch.SetResolve. It returns
+// net.ErrClosed for a removed route.
+func (r *Route) SetResolve(resolve ResolveFunc) error {
+	return r.mux.Batch(func(b *Batch) error { return b.SetResolve(r, resolve) })
+}
+
 // SetMaxConns changes the limit of open connections; see
 // RouteConfig.MaxConns. It returns net.ErrClosed for a removed route.
 func (r *Route) SetMaxConns(n int) error {
@@ -325,8 +336,8 @@ func (r *Route) info(t *table) RouteInfo {
 		Matchers:  make([]string, len(st.matchers)),
 		Reject:    r.reject,
 		Fallback:  r.fallback,
-		Resolver:  r.resolve != nil,
-		Handler:   r.handler != nil,
+		Resolver:  st.resolve != nil,
+		Handler:   st.handler != nil,
 		Removed:   !present,
 		Matched:   r.matched.Load(),
 		Queued:    r.queued.Load(),
@@ -343,7 +354,7 @@ func (r *Route) info(t *table) RouteInfo {
 	switch {
 	case r.fallback:
 		_, info.Active = t.fallbacks[r]
-	case r.resolve != nil:
+	case st.resolve != nil:
 		info.Active = present
 	default:
 		info.Active = present && len(st.matchers) > 0

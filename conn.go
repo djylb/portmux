@@ -29,6 +29,8 @@ type Conn struct {
 	req     *httphead.Request // HTTP/1.x
 	req2    *httphead.Request // h2c
 	values  []inputValue      // of Input.SetValue
+	name    *hostmatch.Name   // of Input.SetRequestedName, or nil
+	track   *connTrack        // for WithCloseEvents, or nil
 	proxy   *proxyproto.Header
 	route   *Route
 	mux     *Mux      // counts the connection while open, with ln
@@ -53,8 +55,22 @@ func (c *Conn) Unread() []byte {
 	return slices.Clone(c.pending)
 }
 
+// connTrack measures a delivered connection for its close event.
+type connTrack struct {
+	start         time.Time
+	read, written atomic.Int64
+}
+
 // Read reads the replayed bytes first, then from the client.
 func (c *Conn) Read(p []byte) (int, error) {
+	n, err := c.read(p)
+	if t := c.track; t != nil {
+		t.read.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *Conn) read(p []byte) (int, error) {
 	if !c.drained.Load() {
 		c.mu.Lock()
 		if len(c.pending) > 0 {
@@ -85,6 +101,14 @@ func (c *Conn) dropEmpty() {
 // WriteTo writes the replayed bytes and then copies the rest of the stream to
 // w, so io.Copy can still use the underlying connection's fast paths.
 func (c *Conn) WriteTo(w io.Writer) (int64, error) {
+	n, err := c.writeTo(w)
+	if t := c.track; t != nil {
+		t.read.Add(n)
+	}
+	return n, err
+}
+
+func (c *Conn) writeTo(w io.Writer) (int64, error) {
 	var written int64
 	if !c.drained.Load() {
 		c.mu.Lock()
@@ -110,32 +134,50 @@ func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 // ReadFrom copies r to the connection, so io.Copy can still use the underlying
 // connection's fast paths.
 func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
-	return io.Copy(c.conn, r)
+	n, err := io.Copy(c.conn, r)
+	if t := c.track; t != nil {
+		t.written.Add(n)
+	}
+	return n, err
 }
 
 // Write writes to the client.
 func (c *Conn) Write(p []byte) (int, error) {
-	return c.conn.Write(p)
+	n, err := c.conn.Write(p)
+	if t := c.track; t != nil {
+		t.written.Add(int64(n))
+	}
+	return n, err
 }
 
 // Close closes the connection.
-// The first Close ends the connection's count as open.
+// The first Close ends the connection's count as open and, with
+// WithCloseEvents, reports it to the observer.
 func (c *Conn) Close() error {
 	err := c.conn.Close()
 	c.mu.Lock()
 	c.pending = nil
 	c.releaseLocked()
 	c.mu.Unlock()
-	c.closeOpen()
+	if c.closeOpen() {
+		if t := c.track; t != nil {
+			c.mux.observe(Event{Entry: c.entry, Remote: c.RemoteAddr(), Local: c.LocalAddr(), Peer: c.conn.RemoteAddr(),
+				Route: c.route, Name: c.RequestedName(), ClientHello: c.hello, HTTPRequest: c.req, HTTP2Request: c.req2,
+				values: c.values, Closed: true, Duration: time.Since(t.start), Read: t.read.Load(), Written: t.written.Load()})
+		}
+	}
 	return err
 }
 
-// closeOpen ends the connection's count as open, once.
-func (c *Conn) closeOpen() {
+// closeOpen ends the connection's count as open, once, and reports whether
+// this call did.
+func (c *Conn) closeOpen() bool {
 	if c.open.CompareAndSwap(true, false) {
 		c.route.open.Add(-1)
 		c.mux.count(c.ln, c.stripe, func(n *counters) { n.open.Add(-1) })
+		return true
 	}
+	return false
 }
 
 // CloseWrite shuts down the writing side when the underlying connection
@@ -217,18 +259,20 @@ func (c *Conn) HTTP2Request() *httphead.Request {
 }
 
 // RequestedName returns the host name the client asked for, as
-// Input.RequestedName does: the SNI of the ClientHello, or the host of the
+// Input.RequestedName does: the name a matcher set with
+// Input.SetRequestedName, or the SNI of the ClientHello, or the host of the
 // HTTP request without its port, normalized, from what was parsed while
 // matching, or "" without one.
 func (c *Conn) RequestedName() string {
-	return requestedName(c.hello, c.req, c.req2)
+	return requestedName(c.name, c.hello, c.req, c.req2)
 }
 
-// requestedName returns the normalized name of the first that is parsed, or
-// "".
-func requestedName(hello *tlshello.Hello, req, req2 *httphead.Request) string {
+// requestedName returns the normalized name of the first that is set, or "".
+func requestedName(name *hostmatch.Name, hello *tlshello.Hello, req, req2 *httphead.Request) string {
 	var n hostmatch.Name
 	switch {
+	case name != nil:
+		n = *name
 	case hello != nil:
 		n = hello.Name()
 	case req != nil:

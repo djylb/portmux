@@ -332,7 +332,16 @@ func resolveSites(sites *hostmatch.Map[[2]*portmux.Route]) portmux.ResolveFunc {
   take no lock, and allocate nothing for lowercase names and those that
   `Input` prepared.
 - `ResolveHosts` and `ResolveDomain` route TLS, HTTP/1.x and h2c by the name
-  the client asks for. Paths are for the HTTP server behind the route.
+  the client asks for, and protocols of your own by the name a matcher sets
+  with `Input.SetRequestedName`. Paths are for the HTTP server behind the
+  route.
+- To replace the route of a name while serving, add the new route, point
+  the name table to it, then close the old one: `ResolveHosts` passes closed
+  routes over, so no connection reaches one.
+- `Mux.Upsert` and `Batch.Upsert` add or change routes by name, keeping the
+  listener of a route that stays, which suits reloading a configuration:
+  upsert the routes it has, then remove the routes it no longer has.
+  `SetHandler` and `SetResolve` change those of a route in place.
 
 ## Rules as Text
 
@@ -410,25 +419,49 @@ func serveInsideTLS(l net.Listener, cert tls.Certificate, proxies func(*portmux.
 ```
 
 Connections of the inner Mux keep the client address of the outer one,
-including one from a PROXY header.
+including one from a PROXY header. An `http.Server` behind the inner Mux
+gets `*portmux.Conn`s rather than `*tls.Conn`s, so `Request.TLS` is nil; take
+the state from the TLS connection under the Conn:
+
+```go
+type tlsStateKey struct{}
+
+// tlsState puts the TLS state of a connection inside TLS in its requests'
+// context, for handlers that need it, such as to set HSTS or Secure cookies.
+func tlsState(ctx context.Context, c net.Conn) context.Context {
+	if pc, ok := c.(*portmux.Conn); ok {
+		if tc, ok := pc.NetConn().(*tls.Conn); ok {
+			return context.WithValue(ctx, tlsStateKey{}, tc.ConnectionState())
+		}
+	}
+	return ctx
+}
+
+// Then: srv := &http.Server{Handler: h, ConnContext: tlsState}, and in h,
+// state, isTLS := r.Context().Value(tlsStateKey{}).(tls.ConnectionState).
+```
 
 ## PROXY Protocol
 
 ```go
 // behindLoadBalancer expects PROXY headers on the entry "lb", from the
-// balancer's subnet only.
+// balancer's subnet only; TrustPeers(lb) does it for every entry.
 func behindLoadBalancer(lb netip.Prefix) *portmux.Mux {
-	return portmux.New(portmux.WithProxyProtocol(func(entry string, peer, _ net.Addr) proxyproto.Policy {
-		if a, ok := peer.(*net.TCPAddr); ok && entry == "lb" && lb.Contains(a.AddrPort().Addr().Unmap()) {
-			return proxyproto.Required
+	trusted := portmux.TrustPeers(lb)
+	return portmux.New(portmux.WithProxyProtocol(func(entry string, peer, local net.Addr) proxyproto.Policy {
+		if entry != "lb" {
+			return proxyproto.Ignore
 		}
-		return proxyproto.Ignore
+		return trusted(entry, peer, local)
 	}))
 }
 ```
 
 Headers of version 1 and 2 are removed before matching, and their addresses are
 what address matchers and the `Conn` see. Allow them only from trusted peers.
+Per-client limits and bans apply to the sources in the headers; a trusted
+peer is not banned for its own connections without a valid header, so that a
+misconfigured balancer is not banned with every client behind it.
 
 ## Options
 
@@ -468,6 +501,7 @@ func tighten(m *portmux.Mux) portmux.Config {
 | `WithObserver(fn)`               | none    | Called with an `Event` for every connection delivered or closed           |           |
 | `WithProxyProtocol(policy)`      | none    | PROXY protocol v1/v2 per entry and peer                                   |           |
 | `WithClientPrefix(v4, v6)`       | 32, 64  | Networks counted as one client by the per-client limits and bans          |           |
+| `WithCloseEvents(on)`            | off     | An `Event` when a delivered connection closes, with duration and bytes    |           |
 
 - `SetOptions` changes options while serving; `Config` reads them back, and
   `Entry.Config` the settings of an entry.
@@ -488,9 +522,11 @@ func tighten(m *portmux.Mux) portmux.Config {
 - `Entry.ResetOptions` drops one or all of an entry's settings, `Mux.Entries`
   lists the entries in use, which catches a misspelt name, and
   `Config.Options` turns settings read back into options again.
-- An `Event` carries the name the client asked for and what matchers parsed,
-  for logs and fingerprints, and reports with `Banned` the failure that
-  banned its client.
+- An `Event` carries the name the client asked for, what matchers parsed and
+  stored (`Event.Value`) and the TCP peer, for logs and fingerprints, and
+  reports with `Banned` the failure that banned its client. With
+  `WithCloseEvents(true)` the observer also hears when a delivered connection
+  is closed, how long it was open and how many bytes it carried.
 - Rejected connections are reported with `ErrNoMatch`, `ErrRefused`,
   `ErrSniffTimeout`, `ErrDispatchTimeout`, `ErrEvicted`, `ErrPendingLimit`,
   `ErrRateLimited`, `ErrBanned`, `ErrQueueFull`, `ErrConnLimit`,
@@ -536,7 +572,7 @@ and delivered connections are the servers' to limit.
 
 | Function                                                        | Use                                                       |
 |-----------------------------------------------------------------|-----------------------------------------------------------|
-| `Peek(c, m, sniffOpts...)`                                      | Sniff one connection; the `Conn` replays what was read    |
+| `Peek(c, m, sniffOpts...)`, `PeekAny(c, ms, sniffOpts...)`      | Sniff one connection, and tell which matcher took it      |
 | `tlshello.Parse`, `httphead.Parse`, `httphead.ParseHTTP2`       | Parse the first bytes of a connection                     |
 | `tlshello.Scanner`, `httphead.Scanner`, `httphead.HTTP2Scanner` | Parse as bytes arrive                                     |
 | `fingerprint.JA4`, `fingerprint.JA3`                            | Fingerprint a client's TLS library                        |

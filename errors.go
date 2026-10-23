@@ -6,8 +6,9 @@ import (
 )
 
 var (
-	// ErrNoMatch is reported for a connection that no route accepted.
-	ErrNoMatch = errors.New("portmux: no route matched")
+	// ErrNoMatch is reported for a connection that no route accepted, and
+	// returned by Peek when its matchers ruled the connection out.
+	ErrNoMatch = errors.New("portmux: no match for the connection")
 
 	// ErrSniffTimeout is reported for a connection that did not send enough
 	// bytes to be routed before the sniff timeout. The reported error also

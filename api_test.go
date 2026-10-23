@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/internal/testutil"
 )
 
@@ -263,5 +264,217 @@ func TestConnCarriesParses(t *testing.T) {
 	}
 	if ev := <-events; ev.HTTP2Request == nil || !strings.HasPrefix(ev.Name, "h2c") {
 		t.Fatalf("event %+v", ev)
+	}
+}
+
+// TestResolveHostsPassesClosedRoutes replaces the route of a name while
+// connections arrive: a closed route is passed over, so none fails.
+func TestResolveHostsPassesClosedRoutes(t *testing.T) {
+	log := newErrorLog()
+	m := startMux(t, log.option())
+	var hosts hostmatch.Map[*Route]
+	old := mustAdd(t, m, RouteConfig{})
+	hosts.Set("*", old)
+	mustAdd(t, m, RouteConfig{Resolve: ResolveDomain(&hosts)})
+	other := m.Listen(HTTP1()) // after the resolver, for names it passes on
+	serve(t, m)
+
+	// The old route is closed, the table still names it: the name goes on.
+	_ = old.Close()
+	_, _ = dial(t, m).Write([]byte("GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"))
+	accept(t, other)
+
+	// The replacement order: add, point the name, close the old one.
+	next := mustAdd(t, m, RouteConfig{})
+	hosts.Set("*", next)
+	_, _ = dial(t, m).Write([]byte("GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"))
+	accept(t, next)
+}
+
+// TestRouteConfigChecks checks that Listen needs matchers and that MaxConns
+// is not negative.
+func TestRouteConfigChecks(t *testing.T) {
+	m := New()
+	defer func() { _ = m.Close() }()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("Listen without matchers did not panic")
+			}
+		}()
+		m.Listen()
+	}()
+	if _, err := m.Add(RouteConfig{MaxConns: -1}); !errors.Is(err, ErrInvalidRoute) {
+		t.Errorf("Add with MaxConns -1 = %v", err)
+	}
+	r := m.Listen(AnyBytes())
+	if err := r.SetMaxConns(-1); !errors.Is(err, ErrInvalidRoute) {
+		t.Errorf("SetMaxConns(-1) = %v", err)
+	}
+	if s := (MatcherFunc(func(*Input) Result { return NoMatch })).String(); s != "MatcherFunc" {
+		t.Errorf("MatcherFunc.String = %q", s)
+	}
+	if _, err := m.Upsert(RouteConfig{}); !errors.Is(err, ErrInvalidRoute) {
+		t.Errorf("Upsert without a name = %v", err)
+	}
+}
+
+type magicKey struct{}
+
+// TestRequestedNameOfYourOwn routes a protocol of its own by the name a
+// matcher sets, and reports it with the peer and values in events.
+func TestRequestedNameOfYourOwn(t *testing.T) {
+	events := make(chan Event, 4)
+	m := startMux(t, WithObserver(func(ev Event) { events <- ev }))
+	var hosts hostmatch.Map[*Route]
+	target := mustAdd(t, m, RouteConfig{})
+	hosts.Set("tunnel.example", target)
+	magic := MatcherFunc(func(in *Input) Result {
+		b := in.Bytes()
+		if len(b) < 6 {
+			return NeedMore
+		}
+		if string(b[:3]) != "MGC" {
+			return NoMatch
+		}
+		in.SetRequestedName(string(b[3:6]) + ".example")
+		in.SetValue(magicKey{}, "seen")
+		return Match
+	})
+	mustAdd(t, m, RouteConfig{Matchers: []Matcher{magic}, Resolve: ResolveDomain(&hosts)})
+	hosts.Set("Tun.example", target)
+	serve(t, m)
+
+	_, _ = dial(t, m).Write([]byte("MGCtun"))
+	c := accept(t, target)
+	if c.RequestedName() != "tun.example" {
+		t.Fatalf("RequestedName = %q", c.RequestedName())
+	}
+	ev := <-events
+	if ev.Name != "tun.example" || ev.Value(magicKey{}) != "seen" || ev.Peer == nil || ev.Peer.String() != ev.Remote.String() {
+		t.Fatalf("event %+v", ev)
+	}
+	in := NewInput(nil, nil)
+	in.SetRequestedName("not a host")
+	if _, res := in.RequestedName(); res != NoMatch {
+		t.Fatalf("invalid name RequestedName = %v", res)
+	}
+}
+
+// TestPeekAny tells which matcher took a connection.
+func TestPeekAny(t *testing.T) {
+	for data, want := range map[string]int{"SSH-2.0-x\r\n": 2, "GET / HTTP/1.1\r\nHost: h\r\n\r\n": 1, "\x00\x01": -1} {
+		a, b := net.Pipe()
+		go func() { _, _ = b.Write([]byte(data)); _ = b.Close() }()
+		conn, i, err := PeekAny(a, []Matcher{TLS(), HTTP1(), SSH()})
+		if i != want || (want >= 0) != (err == nil) {
+			t.Errorf("%q: PeekAny = %d, %v; want %d", data, i, err, want)
+		}
+		if want < 0 && !errors.Is(err, ErrNoMatch) {
+			t.Errorf("%q: error %v", data, err)
+		}
+		_ = conn.Close()
+	}
+}
+
+// TestUpsertKeepsListener reloads routes by name: a route that stays keeps
+// its listener, so a server waiting in Accept goes on, and one whose kind
+// changes is replaced.
+func TestUpsertKeepsListener(t *testing.T) {
+	log := newErrorLog()
+	m := startMux(t, log.option())
+	web, err := m.Upsert(RouteConfig{Name: "web", Matchers: []Matcher{Prefix("A")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serve(t, m)
+	accepted := make(chan *Conn)
+	go func() {
+		for {
+			c, err := web.AcceptConn()
+			if err != nil {
+				close(accepted)
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	// New matchers and priority, the same route and listener.
+	if r, err := m.Upsert(RouteConfig{Name: "web", Matchers: []Matcher{Prefix("B")}, Priority: 5}); err != nil || r != web {
+		t.Fatalf("Upsert = %v, %v; want the same route", r, err)
+	}
+	_, _ = dial(t, m).Write([]byte("B"))
+	if c := <-accepted; c == nil || web.Priority() != 5 {
+		t.Fatal("updated route did not deliver")
+	}
+
+	// A handler and a resolver change in place.
+	served := make(chan struct{}, 1)
+	if err := web.SetHandler(func(c *Conn) { _ = c.Close(); served <- struct{}{} }); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = dial(t, m).Write([]byte("B"))
+	<-served
+	if err := web.SetHandler(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Becoming a reject route replaces it: the old listener closes.
+	r, err := m.Upsert(RouteConfig{Name: "web", Matchers: []Matcher{Prefix("B")}, Reject: true})
+	if err != nil || r == web || !r.Reject() {
+		t.Fatalf("Upsert to reject = %v, %v", r, err)
+	}
+	if _, ok := <-accepted; ok {
+		t.Fatal("old listener still open")
+	}
+	c := dial(t, m)
+	_, _ = c.Write([]byte("B"))
+	expectClosed(t, c)
+	if err := log.wait(t); !errors.Is(err, ErrRefused) {
+		t.Fatalf("reported %v", err)
+	}
+	if err := r.SetHandler(func(*Conn) {}); !errors.Is(err, ErrInvalidRoute) {
+		t.Fatalf("SetHandler on a reject route = %v", err)
+	}
+}
+
+// TestCloseEvents checks the events of closed connections.
+func TestCloseEvents(t *testing.T) {
+	events := make(chan Event, 8)
+	m := startMux(t, WithCloseEvents(true), WithObserver(func(ev Event) { events <- ev }))
+	route := m.Listen(Prefix("PING"))
+	serve(t, m)
+
+	client := dial(t, m)
+	_, _ = client.Write([]byte("PING"))
+	c := accept(t, route)
+	if ev := <-events; ev.Closed || ev.Err != nil {
+		t.Fatalf("delivery event %+v", ev)
+	}
+	readN(t, c, 4)
+	_, _ = c.Write([]byte("PONG!"))
+	time.Sleep(10 * time.Millisecond)
+	_ = c.Close()
+	_ = c.Close() // reported once
+	ev := <-events
+	if !ev.Closed || ev.Read != 4 || ev.Written != 5 || ev.Duration < 10*time.Millisecond || ev.Route != route {
+		t.Fatalf("close event %+v", ev)
+	}
+	select {
+	case ev := <-events:
+		t.Fatalf("second close reported: %+v", ev)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	m.SetOptions(WithCloseEvents(false))
+	_, _ = dial(t, m).Write([]byte("PING"))
+	c = accept(t, route)
+	<-events
+	_ = c.Close()
+	select {
+	case ev := <-events:
+		t.Fatalf("close reported without WithCloseEvents: %+v", ev)
+	case <-time.After(20 * time.Millisecond):
 	}
 }
