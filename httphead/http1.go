@@ -381,7 +381,7 @@ func ambiguousPath(escaped string) bool {
 	}
 	for seg, rest, more := "", escaped, true; more; {
 		seg, rest, more = strings.Cut(rest, "/")
-		if seg == "." || seg == ".." || strings.IndexAny(seg, "%;") < 0 {
+		if seg == "." || seg == ".." || !strings.ContainsAny(seg, "%;") {
 			continue
 		}
 		decoded, err := url.PathUnescape(seg)

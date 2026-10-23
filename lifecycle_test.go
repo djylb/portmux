@@ -523,7 +523,7 @@ func TestShutdownKeepsAcceptedConnections(t *testing.T) {
 // a PROXY header, or nothing, to a route that needs no bytes: they keep no
 // read buffer.
 func TestDeliveredWithoutBytesHoldsNoBuffer(t *testing.T) {
-	header := proxyproto.V2Header(&net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 40000}, &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443})
+	header := v2Header(t, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 40000}, &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443})
 	m := New(WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Required }))
 	defer func() { _ = m.Close() }()
 	held := make(chan bool, 1)

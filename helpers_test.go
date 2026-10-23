@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/netx/proxyproto"
 	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/tlshello"
 )
@@ -181,6 +182,21 @@ func (l *errorLog) wait(t *testing.T) error {
 }
 
 // expectClosed checks that the peer closes c without sending data.
+// v2Header encodes a version 2 PROXY header for a connection from src to
+// dst.
+func v2Header(t *testing.T, src, dst net.Addr) []byte {
+	t.Helper()
+	h, err := proxyproto.NewHeader(proxyproto.V2, src, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := h.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 // waitUntil waits until cond holds, failing the test after a timeout.
 func waitUntil(t *testing.T, what string, cond func() bool) {
 	t.Helper()

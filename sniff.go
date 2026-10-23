@@ -255,7 +255,7 @@ func (s *sniffer) readProxyHeader(policy func(entry string, peer, local net.Addr
 		rs = s.rules
 	}
 	for {
-		h, n, err := proxyproto.Parse(s.buf)
+		h, n, err := proxyproto.Decode(s.buf)
 		switch {
 		case err == nil:
 			s.conn.proxy, s.off = h, n

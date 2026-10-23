@@ -631,7 +631,7 @@ func TestProxyProtocolOptionalAndNone(t *testing.T) {
 	if got := accept(t, bridge); got.ProxyHeader() != nil {
 		t.Fatal("header without PROXY bytes")
 	}
-	v2 := proxyproto.V2Header(&net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 40000}, &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443})
+	v2 := v2Header(t, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 40000}, &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443})
 	c = dial(t, m)
 	_, _ = c.Write(append(v2, "TST"...))
 	if got := accept(t, bridge); got.RemoteAddr().String() != "192.0.2.1:40000" {
@@ -813,7 +813,7 @@ func TestNewPanics(t *testing.T) {
 // sniff limit after a PROXY header, whose read may take more bytes, and that
 // the connection still replays all of them.
 func TestMaxSniffBytesAfterProxyHeader(t *testing.T) {
-	header := proxyproto.V2Header(&net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 40000}, &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443})
+	header := v2Header(t, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 40000}, &net.TCPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 443})
 	data := append(header, bytes.Repeat([]byte("x"), 1000)...)
 	m := New(WithMaxSniffBytes(16), WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Required }))
 	defer func() { _ = m.Close() }()
