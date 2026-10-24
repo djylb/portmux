@@ -262,15 +262,19 @@ type Event struct {
 	// PROXY header was parsed: the peer is then the proxy that sent it.
 	Peer net.Addr
 
-	// Closed reports an event of WithCloseEvents: the delivered connection
-	// was closed with Conn.Close, Duration after its delivery, having
-	// returned Read bytes to its server and taken Written from it.
-	Closed   bool
+	// Duration, Read and Written, of an event of WithCloseEvents that
+	// Closed reports, tell how long after its delivery the connection was
+	// closed with Conn.Close, and how many bytes it returned to its server
+	// and took from it.
 	Duration time.Duration
 	Read     int64
 	Written  int64
 
 	values []inputValue // of Input.SetValue
+
+	// Closed reports an event of WithCloseEvents: the delivered connection
+	// was closed.
+	Closed bool
 	// Banned reports that this connection's failure banned its client; see
 	// WithBanPerClient.
 	Banned bool

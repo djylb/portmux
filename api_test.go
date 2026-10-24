@@ -373,6 +373,9 @@ func TestPeekAny(t *testing.T) {
 		if want < 0 && !errors.Is(err, ErrNoMatch) {
 			t.Errorf("%q: error %v", data, err)
 		}
+		if conn == nil {
+			t.Fatalf("%q: PeekAny returned no Conn", data)
+		}
 		_ = conn.Close()
 	}
 }

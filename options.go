@@ -381,13 +381,13 @@ type Config struct {
 	BanFailures int
 	BanWindow   time.Duration
 	BanDuration time.Duration
+	// ClientPrefix4 and ClientPrefix6 are the arguments of WithClientPrefix.
+	ClientPrefix4 int
+	ClientPrefix6 int
 	// Observer and ProxyProtocol report whether WithObserver and
 	// WithProxyProtocol set a function.
 	Observer      bool
 	ProxyProtocol bool
-	// ClientPrefix4 and ClientPrefix6 are the arguments of WithClientPrefix.
-	ClientPrefix4 int
-	ClientPrefix6 int
 	// CloseEvents is the argument of WithCloseEvents.
 	CloseEvents bool
 }
