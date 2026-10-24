@@ -3,9 +3,11 @@ package portmux
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -38,8 +40,12 @@ func TestParseMatcherRoundTrip(t *testing.T) {
 		TLS(SNI("a", "*.b"), SNIRegexp(regexp.MustCompile(`^x`)), ALPN("h2"), MinTLSVersion(0x0303), MinTLSVersion(0x0300),
 			NoneOf(SNI("c"))),
 	}
+	called := make(map[string]bool)
 	for _, m := range matchers {
 		text := describe(m)
+		for _, c := range regexp.MustCompile(`(\w+)\(`).FindAllStringSubmatch(text, -1) {
+			called[c[1]] = true
+		}
 		got, err := ParseMatcher(text, nil)
 		if err != nil {
 			t.Errorf("%s: %v", text, err)
@@ -47,6 +53,16 @@ func TestParseMatcherRoundTrip(t *testing.T) {
 		}
 		if again := describe(got); again != text {
 			t.Errorf("%s parsed as %s", text, again)
+		}
+	}
+
+	// Every built-in name is among them.
+	for _, names := range [][]string{slices.Collect(maps.Keys(builtinMatchers)),
+		slices.Collect(maps.Keys(builtinHTTPFilters)), slices.Collect(maps.Keys(builtinTLSFilters))} {
+		for _, name := range names {
+			if !called[name] {
+				t.Errorf("built-in %s is not round-tripped", name)
+			}
 		}
 	}
 

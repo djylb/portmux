@@ -25,12 +25,8 @@ type Conn struct {
 	conn    net.Conn
 	pending []byte
 	buf     *[]byte
-	hello   *tlshello.Hello
-	req     *httphead.Request // HTTP/1.x
-	req2    *httphead.Request // h2c
-	values  []inputValue      // of Input.SetValue
-	name    *hostmatch.Name   // of Input.SetRequestedName, or nil
-	track   *connTrack        // for WithCloseEvents, or nil
+	parsed             // what matching found, set once it ended
+	track   *connTrack // for WithCloseEvents, or nil
 	proxy   *proxyproto.Header
 	route   *Route
 	mux     *Mux      // counts the connection while open, with ln
@@ -55,10 +51,12 @@ func (c *Conn) Unread() []byte {
 	return slices.Clone(c.pending)
 }
 
-// connTrack measures a delivered connection for its close event.
+// connTrack measures a delivered connection for its close event, which goes
+// to observe, the observer of the connection's settings.
 type connTrack struct {
 	start         time.Time
 	read, written atomic.Int64
+	observe       func(Event)
 }
 
 // Read reads the replayed bytes first, then from the client.
@@ -161,9 +159,9 @@ func (c *Conn) Close() error {
 	c.mu.Unlock()
 	if c.closeOpen() {
 		if t := c.track; t != nil {
-			c.mux.observe(Event{Entry: c.entry, Remote: c.RemoteAddr(), Local: c.LocalAddr(), Peer: c.conn.RemoteAddr(),
-				Route: c.route, Name: c.RequestedName(), ClientHello: c.hello, HTTPRequest: c.req, HTTP2Request: c.req2,
-				values: c.values, Closed: true, Duration: time.Since(t.start), Read: t.read.Load(), Written: t.written.Load()})
+			ev := c.event(nil)
+			ev.Closed, ev.Duration, ev.Read, ev.Written = true, time.Since(t.start), t.read.Load(), t.written.Load()
+			c.mux.observeWith(t.observe, ev)
 		}
 	}
 	return err
@@ -264,38 +262,73 @@ func (c *Conn) HTTP2Request() *httphead.Request {
 // HTTP request without its port, normalized, from what was parsed while
 // matching, or "" without one.
 func (c *Conn) RequestedName() string {
-	return requestedName(c.name, c.hello, c.req, c.req2)
-}
-
-// requestedName returns the normalized name of the first that is set, or "".
-func requestedName(name *hostmatch.Name, hello *tlshello.Hello, req, req2 *httphead.Request) string {
-	var n hostmatch.Name
-	switch {
-	case name != nil:
-		n = *name
-	case hello != nil:
-		n = hello.Name()
-	case req != nil:
-		n = req.Name()
-	case req2 != nil:
-		n = req2.Name()
-	}
-	if !n.Valid() {
-		return ""
-	}
-	return n.String()
+	return c.requestedName()
 }
 
 // Value returns the value that a matcher or resolver stored under key with
 // Input.SetValue while the connection was matched, or nil, so that what a
 // parser of your own found reaches the server of the route.
 func (c *Conn) Value(key any) any {
-	for _, v := range c.values {
-		if v.key == key {
-			return v.value
-		}
+	return c.value(key)
+}
+
+// event returns the event of the connection with err: its addresses, its
+// route and what matching found.
+func (c *Conn) event(err error) Event {
+	ev := c.eventOf(&c.parsed, err)
+	ev.Route = c.route
+	return ev
+}
+
+// eventOf returns the event of the connection with err and p, what matching
+// found, without its route, which only a delivered connection has.
+func (c *Conn) eventOf(p *parsed, err error) Event {
+	return Event{Entry: c.entry, Remote: c.RemoteAddr(), Local: c.LocalAddr(), Peer: c.conn.RemoteAddr(), Err: err,
+		Name: p.requestedName(), ClientHello: p.hello, HTTPRequest: p.req, HTTP2Request: p.req2, values: p.values}
+}
+
+// acceptEvent returns the event of c, accepted from a listener of entry and
+// refused with err before it was taken, as Conn.event would.
+func acceptEvent(entry string, c net.Conn, err error) Event {
+	peer := c.RemoteAddr()
+	return Event{Entry: entry, Remote: peer, Local: c.LocalAddr(), Peer: peer, Err: err}
+}
+
+// parsed is what matching found out about a connection: the protocol heads
+// that were parsed, the values of Input.SetValue and the name of
+// Input.SetRequestedName. Input.parsed fills it, and Conn and the events of
+// the connection carry it.
+type parsed struct {
+	hello  *tlshello.Hello
+	req    *httphead.Request // HTTP/1.x
+	req2   *httphead.Request // h2c
+	values valueList
+	name   *hostmatch.Name // or nil
+}
+
+// value returns the value stored under key, or nil.
+func (p *parsed) value(key any) any {
+	return p.values.get(key)
+}
+
+// requestedName returns the normalized name of the first of the name, the
+// hello and the requests that is set, or "".
+func (p *parsed) requestedName() string {
+	var n hostmatch.Name
+	switch {
+	case p.name != nil:
+		n = *p.name
+	case p.hello != nil:
+		n = p.hello.Name()
+	case p.req != nil:
+		n = p.req.Name()
+	case p.req2 != nil:
+		n = p.req2.Name()
 	}
-	return nil
+	if !n.Valid() {
+		return ""
+	}
+	return n.String()
 }
 
 // ProxyHeader returns the PROXY protocol header, or nil when none was parsed.

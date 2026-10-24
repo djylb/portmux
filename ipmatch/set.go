@@ -28,13 +28,9 @@ type addrRange struct {
 func NewSet(prefixes ...netip.Prefix) *Set {
 	ps := &Set{}
 	for _, p := range prefixes {
-		if !p.IsValid() {
-			continue
+		if p.IsValid() {
+			ps.list = append(ps.list, NormalizePrefix(p))
 		}
-		if a := p.Addr(); a.Is4In6() && p.Bits() >= 96 {
-			p = netip.PrefixFrom(a.Unmap(), p.Bits()-96)
-		}
-		ps.list = append(ps.list, p.Masked())
 	}
 	ps.count = len(ps.list)
 	if len(ps.list) < rangeMin {
@@ -64,12 +60,29 @@ func NewSet(prefixes ...netip.Prefix) *Set {
 	return ps
 }
 
+// NormalizeAddr returns a as a Set compares it: without a zone, and an
+// IPv4-mapped IPv6 address as IPv4.
+func NormalizeAddr(a netip.Addr) netip.Addr {
+	return a.Unmap().WithZone("")
+}
+
+// NormalizePrefix returns p as a Set keeps it: masked, and an IPv4-mapped
+// IPv6 prefix of at least 96 bits as IPv4. Shorter IPv4-mapped prefixes,
+// which hold more than IPv4 addresses, stay IPv6.
+func NormalizePrefix(p netip.Prefix) netip.Prefix {
+	addr, bits := p.Addr(), p.Bits()
+	if addr.Is4In6() && bits >= 96 {
+		addr, bits = addr.Unmap(), bits-96
+	}
+	return netip.PrefixFrom(addr, bits).Masked()
+}
+
 // Len returns the number of valid prefixes the set was built from.
 func (ps *Set) Len() int { return ps.count }
 
 // Contains reports whether a is inside one of the prefixes.
 func (ps *Set) Contains(a netip.Addr) bool {
-	a = a.Unmap().WithZone("")
+	a = NormalizeAddr(a)
 	if ps.ranges == nil {
 		for _, p := range ps.list {
 			if p.Contains(a) {

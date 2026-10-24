@@ -146,12 +146,18 @@ func (rs *ruleSet) add(r *Route, st routeState, silences []time.Duration) {
 	}
 	rs.rules = append(rs.rules, rule{route: r, matchers: st.matchers, resolve: st.resolve})
 	for _, d := range silences {
-		if !slices.Contains(rs.silences, d) {
-			rs.silences = append(rs.silences, d)
-		}
+		rs.addSilence(d)
 	}
 }
 
+// addSilence adds d to the times of the silence checks, unless it is there.
+func (rs *ruleSet) addSilence(d time.Duration) {
+	if !slices.Contains(rs.silences, d) {
+		rs.silences = append(rs.silences, d)
+	}
+}
+
+// finish completes rs once every route was added, and notes its fallback in t.
 func (rs *ruleSet) finish(t *table) {
 	slices.Sort(rs.silences)
 	if rs.fallback != nil {

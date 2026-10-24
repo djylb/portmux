@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/djylb/netx/proxyproto"
+	"github.com/djylb/portmux/ipmatch"
 )
 
 // banWorthy reports whether a connection failed in a way that counts toward
@@ -26,7 +27,7 @@ func banWorthy(err error) bool {
 // are not checked.
 func (m *Mux) Ban(client netip.Addr, d time.Duration) {
 	if client.IsValid() {
-		m.bans.set(banKey{client: m.clientNet(client)}, m.bans.now(), d)
+		m.bans.set(banKey{client: m.options().clientNet(client)}, m.bans.now(), d)
 	}
 }
 
@@ -35,7 +36,7 @@ func (m *Mux) Ban(client netip.Addr, d time.Duration) {
 // d lifts the ban of network.
 func (m *Mux) BanPrefix(network netip.Prefix, d time.Duration) {
 	if network.IsValid() {
-		m.bans.set(banKey{client: canonicalPrefix(network)}, m.bans.now(), d)
+		m.bans.set(banKey{client: ipmatch.NormalizePrefix(network)}, m.bans.now(), d)
 	}
 }
 
@@ -43,17 +44,7 @@ func (m *Mux) BanPrefix(network netip.Prefix, d time.Duration) {
 // reports whether it was banned. Bans of other networks that hold some of
 // its addresses stay; Unban lifts every ban of an address.
 func (m *Mux) UnbanPrefix(network netip.Prefix) bool {
-	return network.IsValid() && m.bans.set(banKey{client: canonicalPrefix(network)}, m.bans.now(), 0)
-}
-
-// canonicalPrefix returns p masked, without a zone, and IPv4-mapped IPv6
-// prefixes as IPv4.
-func canonicalPrefix(p netip.Prefix) netip.Prefix {
-	addr, bits := p.Addr().WithZone(""), p.Bits()
-	if addr.Is4In6() && bits >= 96 {
-		addr, bits = addr.Unmap(), bits-96
-	}
-	return netip.PrefixFrom(addr, bits).Masked()
+	return network.IsValid() && m.bans.set(banKey{client: ipmatch.NormalizePrefix(network)}, m.bans.now(), 0)
 }
 
 // Unban lifts the bans of the networks that hold client, of the prefix
@@ -126,7 +117,7 @@ func (l *banList) noteLength(key netip.Prefix) {
 
 // keys yields the networks of ip, of every length recorded for its family.
 func (l *banList) keys(ip netip.Addr) iter.Seq[netip.Prefix] {
-	ip = ip.Unmap().WithZone("")
+	ip = ipmatch.NormalizeAddr(ip)
 	return func(yield func(netip.Prefix) bool) {
 		ws := &l.lengths[family(ip)]
 		for i := range ws {
@@ -145,7 +136,7 @@ func (l *banList) keys(ip netip.Addr) iter.Seq[netip.Prefix] {
 
 type banShard struct {
 	mu      sync.Mutex
-	checks  int
+	checks  sweepCount
 	clients map[banKey]banEntry
 }
 
@@ -208,8 +199,7 @@ func (l *banList) fail(key banKey, now time.Duration, failures int, window, d ti
 	sh := l.shard(key.client)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	if sh.checks++; sh.checks >= rateSweepEvery {
-		sh.checks = 0
+	if sh.checks.due() {
 		l.sweep(sh, now)
 	}
 	ban := banKey{client: key.client}
@@ -271,8 +261,7 @@ func (l *banList) set(key banKey, now, d time.Duration) bool {
 	defer sh.mu.Unlock()
 	// Bans set by hand are swept here too, so that they do not pile up when
 	// no failures are counted.
-	if sh.checks++; sh.checks >= rateSweepEvery {
-		sh.checks = 0
+	if sh.checks.due() {
 		l.sweep(sh, now)
 	}
 	e, ok := sh.clients[key]

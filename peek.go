@@ -73,15 +73,13 @@ func peekTable(matchers []Matcher) (*table, []*Route) {
 	routes := make([]*Route, len(matchers))
 	for i, m := range matchers {
 		routes[i] = new(Route)
-		rs.rules = append(rs.rules, rule{route: routes[i], matchers: []Matcher{m}})
+		rs.add(routes[i], routeState{matchers: []Matcher{m}}, nil)
 	}
+	add := rs.addSilence
 	for _, r := range rs.rules {
-		reportSilences(r.matchers, func(d time.Duration) {
-			if !slices.Contains(rs.silences, d) {
-				rs.silences = append(rs.silences, d)
-			}
-		})
+		reportSilences(r.matchers, add)
 	}
-	slices.Sort(rs.silences)
-	return &table{other: rs}, routes
+	t := &table{other: rs}
+	rs.finish(t)
+	return t, routes
 }

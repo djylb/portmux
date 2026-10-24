@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/djylb/netx/proxyproto"
-	"github.com/djylb/portmux/hostmatch"
 )
 
 // errRouteGone reports that the chosen route was removed before it accepted
@@ -86,163 +85,46 @@ type arrival struct {
 	stripe uint8
 }
 
-// serveConn matches c, which the caller counted as pending, and delivers it.
-// Connections from Serve come with their listener, which counts them, and
-// their admission; they may be evicted while undecided. For a route with a
+// serveConn matches c, which the caller counted as pending, and delivers it,
+// with cs, the settings that the connection follows throughout. Connections
+// from Serve come with their listener, which counts them, and their
+// admission; they may be evicted while undecided. For a route with a
 // handler, serveConn returns the handler instead of calling it, so that the
 // connection no longer counts as pending while the handler runs.
-func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at arrival) (handler func(*Conn), conn *Conn, err error) {
-	stripe := at.stripe
-	conn = &Conn{conn: c, entry: entry, stripe: stripe}
-	// The caller counted the connection as pending.
-	o, rate := m.settings(entry)
-	s := newSniffer(conn, o, at.start)
+func (m *Mux) serveConn(c net.Conn, l *listener, a admission, cs *connSettings, entry string, at arrival) (handler func(*Conn), conn *Conn, err error) {
+	conn = &Conn{conn: c, entry: entry, stripe: at.stripe}
+	s := newSniffer(conn, cs.opts, at.start)
 	s.seq = at.seq
 	m.undelivered.add(s, l != nil)
-	delivered := false
 	// held reports that the connection holds the pending slot and the
 	// client's pending count of its admission; it gives them back once
 	// matched, so that one that waits for Accept holds neither.
-	held := l != nil
+	held, delivered := l != nil, false
 	defer func() {
 		if p := recover(); p != nil {
 			err = &PanicError{Value: p, Stack: debug.Stack()}
 		}
-		m.undelivered.remove(s)
-		if s.evicted.Load() && err != nil {
-			err = ErrEvicted
-		}
-		observed := s.opts.observer != nil
-		var ev Event
-		if observed {
-			ev = Event{Entry: entry, Err: err, Elapsed: time.Since(s.start), Sniffed: len(s.buf)}
-			var name *hostmatch.Name
-			if s.in.named {
-				name = &s.in.name
-			}
-			ev.Name = requestedName(name, s.in.hello, s.in.req, s.in.req2)
-			ev.Peer, ev.values = conn.conn.RemoteAddr(), s.in.values
-			ev.ClientHello, ev.HTTPRequest, ev.HTTP2Request = s.in.hello, s.in.req, s.in.req2
-			ev.Remote, ev.Local = conn.RemoteAddr(), conn.LocalAddr()
-		}
-		s.release()
-		// The outcome is counted before the connection leaves pending and
-		// before the client sees it closed, so that the counts add up for
-		// anyone who waited for either.
-		var reason rejectReason
-		if !delivered {
-			reason = reasonOf(err)
-		}
-		m.count(l, stripe, func(c *counters) {
-			if delivered {
-				c.delivered.Add(1)
-			} else {
-				c.rejected[reason].Add(1)
-			}
-			c.pending.Add(-1)
-		})
-		// The pending slot and the client's pending count are freed, and a
-		// failure counted toward a ban, before the client sees the
-		// connection closed, so that a client that connects again at once
-		// is held to the limits and bans that this connection leaves.
-		if l != nil {
-			ev.Banned = m.releaseAdmitted(l, a, held, err)
-		}
-		if delivered {
-			ev.Route = conn.route
-		} else {
-			_ = conn.Close()
-		}
-		if observed {
-			m.observe(ev)
-		}
+		err = m.settle(s, l, &a, cs, held, delivered, err)
 	}()
 	// Close may have run between add and here without seeing conn.
 	if m.closed.Load() {
 		return nil, conn, net.ErrClosed
 	}
-	switch {
-	case l == nil:
-		a.proxy = proxyPolicyFor(o, entry, c)
-	case a.policy:
-		// Here rather than in the accept loop, which a slow or panicking
-		// policy would hold up or bring down.
-		if a.proxy = proxyPolicyFor(o, entry, c); a.proxy != proxyproto.Ignore {
-			a.proxied = true
-		} else if a, err = m.admitClient(a, c.RemoteAddr(), o, rate); err != nil {
-			return nil, conn, err
-		}
-	}
-	if err = s.readProxyHeader(a.proxy, &m.table); err != nil {
+	// a is updated in place, so that settle sees what admission took
+	// even when a panic cuts the steps short.
+	if err = m.admitProxied(s, l, &a, cs); err != nil {
 		return nil, conn, err
-	}
-	if a.proxied {
-		// The client is the source of the header, if there was one.
-		a.header = conn.proxy != nil
-		if a, err = m.admitClient(a, conn.RemoteAddr(), o, rate); err != nil {
-			return nil, conn, err
-		}
 	}
 	for {
 		var r *Route
-		if r, err = s.match(&m.table, s.opts.maxSniffBytes); err != nil {
+		if r, err = m.decide(s); err != nil {
 			return nil, conn, err
 		}
-		if r.mux != m {
-			return nil, conn, errForeignRoute
+		var st routeState
+		if err = m.claim(s, r, &st); err != nil {
+			return nil, conn, err
 		}
-		if r.isClosed() {
-			switch {
-			case m.closed.Load():
-				return nil, conn, net.ErrClosed
-			case s.via != r:
-				// A resolver chose a route that is closed.
-				return nil, conn, ErrRouteClosed
-			}
-			continue // removed while matching: match against the new routes
-		}
-		if s.via != r {
-			// A resolver chose r: it must serve the connection's entry.
-			if st := m.table.Load().routes[r]; len(st.entries) > 0 && !slices.Contains(st.entries, entry) {
-				return nil, conn, ErrEntryMismatch
-			}
-		}
-		s.handOver(r)
-		// A decided connection leaves the pending set, so that Close does not
-		// close it once it is delivered.
-		m.undelivered.remove(s)
-		if f := leftPending.Load(); f != nil {
-			(*f)()
-		}
-		if s.evicted.Load() {
-			// Evicted while the last bytes were matched: the connection is
-			// already closed.
-			return nil, conn, ErrEvicted
-		}
-		// A connection that Close no longer reaches through the pending set
-		// is not handed over once Close began, and the done channels of the
-		// routes stop one that waits for Accept. One handed over is
-		// delivered before Close began.
-		if m.closed.Load() {
-			return nil, conn, net.ErrClosed
-		}
-		r.matched.Add(1)
-		if s.via != nil && s.via != r {
-			s.via.matched.Add(1)
-		}
-		if r.reject {
-			return nil, conn, ErrRefused
-		}
-		st := m.table.Load().routes[r]
-		if !r.tryOpen(st.maxConns) {
-			return nil, conn, ErrConnLimit
-		}
-		conn.mux, conn.ln = m, l
-		if mo := m.opts.Load(); mo.closeEvents && mo.observer != nil {
-			conn.track = &connTrack{start: time.Now()}
-		}
-		conn.open.Store(true)
-		m.count(l, stripe, func(c *counters) { c.open.Add(1) })
+		m.open(conn, l, cs)
 		// The buffer is dropped only once delivered: matched again, the
 		// connection still reads into it.
 		if st.handler != nil {
@@ -274,6 +156,172 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, entry string, at a
 			return nil, conn, net.ErrClosed
 		}
 	}
+}
+
+// settle ends serveConn for the connection of s, with l, a and cs as
+// serveConn got them, and err, why the connection was not delivered, if it
+// was not: it counts the outcome, gives back what the connection holds,
+// closes the connection unless delivered and reports it to the observer. held
+// reports that the connection still holds its pending slot and the client's
+// pending count. It returns err, or ErrEvicted for a connection evicted while
+// it was undecided.
+func (m *Mux) settle(s *sniffer, l *listener, a *admission, cs *connSettings, held, delivered bool, err error) error {
+	conn, stripe := s.conn, s.conn.stripe
+	m.undelivered.remove(s)
+	if s.evicted.Load() && err != nil {
+		err = ErrEvicted
+	}
+	// The event is taken before the sniffer, which holds what matching
+	// found, goes back to the pool.
+	observer := cs.opts.observer
+	var ev Event
+	if observer != nil {
+		p := s.in.parsed()
+		ev = conn.eventOf(&p, err)
+		ev.Elapsed, ev.Sniffed = time.Since(s.start), len(s.buf)
+	}
+	s.release()
+	// The outcome is counted before the connection leaves pending and
+	// before the client sees it closed, so that the counts add up for
+	// anyone who waited for either.
+	var reason rejectReason
+	if !delivered {
+		reason = reasonOf(err)
+	}
+	m.count(l, stripe, func(c *counters) {
+		if delivered {
+			c.delivered.Add(1)
+		} else {
+			c.rejected[reason].Add(1)
+		}
+		c.pending.Add(-1)
+	})
+	// The pending slot and the client's pending count are freed, and a
+	// failure counted toward a ban, before the client sees the
+	// connection closed, so that a client that connects again at once
+	// is held to the limits and bans that this connection leaves.
+	if l != nil {
+		ev.Banned = m.releaseAdmitted(l, a, cs, held, err)
+	}
+	if delivered {
+		ev.Route = conn.route
+	} else {
+		_ = conn.Close()
+	}
+	if observer != nil {
+		m.observeWith(observer, ev)
+	}
+	return err
+}
+
+// admitProxied calls the PROXY protocol policy, reads the header that it asks
+// for, and then applies the per-client rules that waited for the policy, to
+// the peer, or for the header, to its source; see admission. It records what
+// it learns in a as it goes, also on failure and on a panic, for what settle
+// gives back and counts toward bans.
+func (m *Mux) admitProxied(s *sniffer, l *listener, a *admission, cs *connSettings) error {
+	c, entry := s.conn.conn, s.in.entry
+	var err error
+	switch {
+	case l == nil:
+		a.proxy = proxyPolicyFor(cs.opts, entry, c)
+	case a.policy:
+		// Here rather than in the accept loop, which a slow or panicking
+		// policy would hold up or bring down.
+		if a.proxy = proxyPolicyFor(cs.opts, entry, c); a.proxy != proxyproto.Ignore {
+			a.proxied = true
+		} else if *a, err = m.admitClient(*a, c.RemoteAddr(), cs); err != nil {
+			return err
+		}
+	}
+	if err = s.readProxyHeader(a.proxy, &m.table); err != nil {
+		return err
+	}
+	if a.proxied {
+		// The client is the source of the header, if there was one.
+		a.header = s.conn.proxy != nil
+		*a, err = m.admitClient(*a, s.conn.RemoteAddr(), cs)
+	}
+	return err
+}
+
+// decide matches the connection of s until a route that is still open takes
+// it, and checks that a route a resolver chose may serve it.
+func (m *Mux) decide(s *sniffer) (*Route, error) {
+	for {
+		r, err := s.match(&m.table, s.opts.maxSniffBytes)
+		if err != nil {
+			return nil, err
+		}
+		if r.mux != m {
+			return nil, errForeignRoute
+		}
+		if r.isClosed() {
+			switch {
+			case m.closed.Load():
+				return nil, net.ErrClosed
+			case s.via != r:
+				// A resolver chose a route that is closed.
+				return nil, ErrRouteClosed
+			}
+			continue // removed while matching: match against the new routes
+		}
+		if s.via != r {
+			// A resolver chose r: it must serve the connection's entry.
+			if st := m.table.Load().routes[r]; len(st.entries) > 0 && !slices.Contains(st.entries, s.in.entry) {
+				return nil, ErrEntryMismatch
+			}
+		}
+		return r, nil
+	}
+}
+
+// claim hands the connection of s over to r, the route that decided it, takes
+// it out of the pending set and counts it as matched and open on r. It sets st
+// to the settings of r, or returns why r cannot take the connection.
+func (m *Mux) claim(s *sniffer, r *Route, st *routeState) error {
+	s.handOver(r)
+	// A decided connection leaves the pending set, so that Close does not
+	// close it once it is delivered.
+	m.undelivered.remove(s)
+	if f := leftPending.Load(); f != nil {
+		(*f)()
+	}
+	if s.evicted.Load() {
+		// Evicted while the last bytes were matched: the connection is
+		// already closed.
+		return ErrEvicted
+	}
+	// A connection that Close no longer reaches through the pending set
+	// is not handed over once Close began, and the done channels of the
+	// routes stop one that waits for Accept. One handed over is
+	// delivered before Close began.
+	if m.closed.Load() {
+		return net.ErrClosed
+	}
+	r.matched.Add(1)
+	if s.via != nil && s.via != r {
+		s.via.matched.Add(1)
+	}
+	if r.reject {
+		return ErrRefused
+	}
+	*st = m.table.Load().routes[r]
+	if !r.tryOpen(st.maxConns) {
+		return ErrConnLimit
+	}
+	return nil
+}
+
+// open counts conn, which its route counted as open, as open by the Mux and
+// its listener l, and measures it for its close event when cs asks for one.
+func (m *Mux) open(conn *Conn, l *listener, cs *connSettings) {
+	conn.mux, conn.ln = m, l
+	if o := cs.opts; o.closeEvents && o.observer != nil {
+		conn.track = &connTrack{start: time.Now(), observe: o.observer}
+	}
+	conn.open.Store(true)
+	m.count(l, conn.stripe, func(c *counters) { c.open.Add(1) })
 }
 
 // maxProxyHeaderLen is the longest PROXY header, a version 2 header with the
@@ -475,23 +523,18 @@ func (s *sniffer) handOver(r *Route) {
 		_ = s.conn.conn.SetReadDeadline(time.Time{})
 		s.armed = time.Time{}
 	}
-	c, in := s.conn, &s.in
+	c := s.conn
 	c.pending = s.buf[s.off:]
 	c.route = r
-	if in.tlsP.res == Match {
-		c.hello = in.hello
+	// The connection keeps what matching found once the sniffer, which
+	// holds it, goes back to the pool.
+	p := s.in.parsed()
+	p.values = slices.Clone(p.values) // nil, without allocating, when none were set
+	if p.name != nil {
+		name := *p.name
+		p.name = &name
 	}
-	if in.httpP.res == Match {
-		c.req = in.req
-	}
-	if in.h2P.res == Match {
-		c.req2 = in.req2
-	}
-	c.values = slices.Clone(in.values) // nil, without allocating, when none were set
-	if in.named {
-		name := in.name
-		c.name = &name
-	}
+	c.parsed = p
 }
 
 // deliver hands the connection to r's Accept, with the queue limit and the

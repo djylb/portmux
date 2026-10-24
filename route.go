@@ -108,8 +108,14 @@ type Route struct {
 	queued    atomic.Int64
 	accepting atomic.Int64
 	open      atomic.Int64
-	reject    bool
-	fallback  bool
+	routeKind
+}
+
+// routeKind is the part of a route's configuration that cannot change: a
+// route of another kind is a different route.
+type routeKind struct {
+	reject   bool
+	fallback bool
 }
 
 // Accept waits for the next connection matched by the route. The connection
@@ -266,15 +272,7 @@ func (r *Route) SetMaxQueued(n int) error {
 
 // tryOpen counts a connection as open unless max, when positive, are open.
 func (r *Route) tryOpen(max int) bool {
-	for {
-		n := r.open.Load()
-		if max > 0 && n >= int64(max) {
-			return false
-		}
-		if r.open.CompareAndSwap(n, n+1) {
-			return true
-		}
-	}
+	return addBelow(&r.open, max)
 }
 
 // SetPriority changes the route's priority. It returns net.ErrClosed for a

@@ -6,13 +6,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/djylb/portmux/ipmatch"
 )
 
 // clientNet returns the network of ip that per-client limits count it under,
 // of the prefix lengths of WithClientPrefix.
-func (m *Mux) clientNet(ip netip.Addr) netip.Prefix {
-	o := m.opts.Load()
-	ip = ip.Unmap().WithZone("")
+func (o *options) clientNet(ip netip.Addr) netip.Prefix {
+	ip = ipmatch.NormalizeAddr(ip)
 	bits := o.clientBits4
 	if ip.Is6() {
 		bits = o.clientBits6
@@ -45,12 +46,18 @@ func newSlotLimit() *slotLimit {
 
 // tryAcquire takes a slot unless max, when positive, are taken.
 func (l *slotLimit) tryAcquire(max int) bool {
+	return addBelow(&l.n, max)
+}
+
+// addBelow adds one to n unless max, when positive, is reached, and reports
+// whether it did.
+func addBelow(n *atomic.Int64, max int) bool {
 	for {
-		n := l.n.Load()
-		if max > 0 && n >= int64(max) {
+		v := n.Load()
+		if max > 0 && v >= int64(max) {
 			return false
 		}
-		if l.n.CompareAndSwap(n, n+1) {
+		if n.CompareAndSwap(v, v+1) {
 			return true
 		}
 	}
@@ -103,10 +110,45 @@ const (
 	// maxRateClients bounds the clients a rateLimit tracks. When they do not
 	// fit, new clients pass untracked rather than being refused.
 	maxRateClients = 1 << 16
-	// rateSweepEvery is how many checks a shard makes between removals of
-	// clients whose bucket has refilled.
-	rateSweepEvery = 1024
 )
+
+// sweepEvery is how many checks a shard of a rateLimit or a banList makes
+// between sweeps of the records it no longer needs.
+const sweepEvery = 1024
+
+// sweepCount counts the checks of a shard toward its next sweep.
+type sweepCount int
+
+// due counts a check and reports whether the shard is to be swept now.
+func (c *sweepCount) due() bool {
+	if *c++; *c < sweepEvery {
+		return false
+	}
+	*c = 0
+	return true
+}
+
+// tokenBucket is a token bucket, whose rate and burst each call is given and
+// whose times are those of the clock of its owner.
+type tokenBucket struct {
+	tokens float64
+	last   time.Duration
+}
+
+// refilled returns the tokens of b at now.
+func (b *tokenBucket) refilled(rate, burst float64, now time.Duration) float64 {
+	return min(burst, b.tokens+(now-b.last).Seconds()*rate)
+}
+
+// take refills b at now and takes a token, reporting whether there was one.
+func (b *tokenBucket) take(rate, burst float64, now time.Duration) bool {
+	b.tokens, b.last = b.refilled(rate, burst, now), now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
 
 // rateLimit is a token bucket per client for new connections.
 type rateLimit struct {
@@ -118,18 +160,13 @@ type rateLimit struct {
 
 type rateShard struct {
 	mu     sync.Mutex
-	checks int
+	checks sweepCount
 	// fullSweep is when a full shard was last swept. A full shard is swept
 	// at most once a second, so that many new clients cannot make every
 	// check sweep.
 	fullSweep time.Duration
 	swept     bool
 	bucket    map[netip.Prefix]tokenBucket
-}
-
-type tokenBucket struct {
-	tokens float64
-	last   time.Duration // since epoch
 }
 
 func newRateLimit(rate float64, burst int) *rateLimit {
@@ -150,14 +187,11 @@ func (l *rateLimit) allowAt(client netip.Prefix, now time.Duration) bool {
 	sh := &l.shards[shardOf(client, rateShards)]
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	if sh.checks++; sh.checks >= rateSweepEvery {
-		sh.checks = 0
+	if sh.checks.due() {
 		l.sweep(sh, now)
 	}
 	tb, ok := sh.bucket[client]
-	if ok {
-		tb.tokens = l.refill(tb, now)
-	} else {
+	if !ok {
 		if len(sh.bucket) >= maxRateClients/rateShards {
 			if sh.swept && now-sh.fullSweep < time.Second {
 				return true
@@ -168,27 +202,18 @@ func (l *rateLimit) allowAt(client netip.Prefix, now time.Duration) bool {
 				return true
 			}
 		}
-		tb.tokens = l.burst
+		tb = tokenBucket{tokens: l.burst, last: now}
 	}
-	tb.last = now
-	if tb.tokens < 1 {
-		sh.bucket[client] = tb
-		return false
-	}
-	tb.tokens--
+	allowed := tb.take(l.rate, l.burst, now)
 	sh.bucket[client] = tb
-	return true
-}
-
-func (l *rateLimit) refill(tb tokenBucket, now time.Duration) float64 {
-	return min(l.burst, tb.tokens+(now-tb.last).Seconds()*l.rate)
+	return allowed
 }
 
 // sweep forgets clients whose bucket is full again, which behave as unknown
 // clients.
 func (l *rateLimit) sweep(sh *rateShard, now time.Duration) {
 	for client, tb := range sh.bucket {
-		if l.refill(tb, now) >= l.burst {
+		if tb.refilled(l.rate, l.burst, now) >= l.burst {
 			delete(sh.bucket, client)
 		}
 	}

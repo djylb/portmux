@@ -28,15 +28,7 @@ type httpMatcher []HTTPFilter
 
 func (h httpMatcher) Match(in *Input) Result {
 	req, res := in.HTTPRequest()
-	if res != Match {
-		return res
-	}
-	for _, f := range h {
-		if !f.Match(req) {
-			return NoMatch
-		}
-	}
-	return Match
+	return allFilters(h, req, res)
 }
 
 func (h httpMatcher) String() string { return call("HTTP1", h, describe[HTTPFilter]) }
@@ -277,15 +269,7 @@ type http2Matcher []HTTPFilter
 
 func (h http2Matcher) Match(in *Input) Result {
 	req, res := in.HTTP2Request()
-	if res != Match {
-		return res
-	}
-	for _, f := range h {
-		if !f.Match(req) {
-			return NoMatch
-		}
-	}
-	return Match
+	return allFilters(h, req, res)
 }
 
 func (h http2Matcher) String() string { return call("HTTP2", h, describe[HTTPFilter]) }

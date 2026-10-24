@@ -109,22 +109,30 @@ func (b *Batch) do(op func(*routeSet) error) error {
 	return nil
 }
 
-// checkConfig reports why cfg is not a valid route, or nil.
-func checkConfig(cfg RouteConfig) error {
-	if err := checkMatchers(cfg.Matchers); err != nil {
-		return err
-	}
+// validate reports why st is not a valid configuration of a route of kind k,
+// or nil. It is the one check of every setting: Add and Upsert run it on the
+// whole configuration, and each change runs it on the result. Every value of
+// priority, entries, dispatchTimeout and maxQueued is valid; for the last two,
+// zero keeps the entry's setting and a negative value removes the limit.
+func (k routeKind) validate(st *routeState) error {
 	switch {
-	case cfg.Fallback && len(cfg.Matchers) > 0:
+	case slices.Contains(st.matchers, nil):
+		return errNilMatcher
+	case k.fallback && len(st.matchers) > 0:
 		return errFallbackConfig
-	case cfg.Resolve != nil && (cfg.Reject || cfg.Fallback):
+	case st.resolve != nil && (k.reject || k.fallback):
 		return errResolveConfig
-	case cfg.Handler != nil && cfg.Reject:
+	case st.handler != nil && k.reject:
 		return errHandlerConfig
-	case cfg.MaxConns < 0:
+	case st.maxConns < 0:
 		return errMaxConnsConfig
 	}
 	return nil
+}
+
+// kindOf returns the kind of route that cfg describes.
+func kindOf(cfg RouteConfig) routeKind {
+	return routeKind{reject: cfg.Reject, fallback: cfg.Fallback}
 }
 
 // stateOf returns the changeable settings of cfg.
@@ -138,19 +146,18 @@ func (b *Batch) Add(cfg RouteConfig) (*Route, error) {
 	if b.done {
 		return nil, errBatchDone
 	}
-	if err := checkConfig(cfg); err != nil {
+	st := stateOf(cfg)
+	if err := kindOf(cfg).validate(&st); err != nil {
 		return nil, err
 	}
 	r := &Route{
-		mux:      b.m,
-		name:     cfg.Name,
-		seq:      b.m.seq.Add(1),
-		ch:       make(chan *Conn),
-		done:     make(chan struct{}),
-		reject:   cfg.Reject,
-		fallback: cfg.Fallback,
+		mux:       b.m,
+		name:      cfg.Name,
+		seq:       b.m.seq.Add(1),
+		ch:        make(chan *Conn),
+		done:      make(chan struct{}),
+		routeKind: kindOf(cfg),
 	}
-	st := stateOf(cfg)
 	err := b.do(func(s *routeSet) error {
 		if r.name != "" {
 			if _, ok := s.names[r.name]; ok {
@@ -171,15 +178,6 @@ func (b *Batch) Add(cfg RouteConfig) (*Route, error) {
 
 // SetMatchers replaces the matchers of r.
 func (b *Batch) SetMatchers(r *Route, matchers ...Matcher) error {
-	if err := b.check(r); err != nil {
-		return err
-	}
-	if err := checkMatchers(matchers); err != nil {
-		return err
-	}
-	if r.fallback && len(matchers) > 0 {
-		return errFallbackConfig
-	}
 	ms := slices.Clone(matchers)
 	return b.update(r, func(st *routeState) { st.matchers = ms })
 }
@@ -205,9 +203,6 @@ func entryList(entries []string) []string {
 // SetMaxConns changes the limit of open connections of r; see
 // RouteConfig.MaxConns. Open connections over a lowered limit stay open.
 func (b *Batch) SetMaxConns(r *Route, n int) error {
-	if n < 0 {
-		return errMaxConnsConfig
-	}
 	return b.update(r, func(st *routeState) { st.maxConns = n })
 }
 
@@ -227,24 +222,12 @@ func (b *Batch) SetMaxQueued(r *Route, n int) error {
 // delivers to Accept with nil; see RouteConfig.Handler. Connections that
 // already wait for Accept stay there.
 func (b *Batch) SetHandler(r *Route, handler func(*Conn)) error {
-	if err := b.check(r); err != nil {
-		return err
-	}
-	if handler != nil && r.reject {
-		return errHandlerConfig
-	}
 	return b.update(r, func(st *routeState) { st.handler = handler })
 }
 
 // SetResolve changes the resolver of r, or removes it with nil; see
 // RouteConfig.Resolve.
 func (b *Batch) SetResolve(r *Route, resolve ResolveFunc) error {
-	if err := b.check(r); err != nil {
-		return err
-	}
-	if resolve != nil && (r.reject || r.fallback) {
-		return errResolveConfig
-	}
 	return b.update(r, func(st *routeState) { st.resolve = resolve })
 }
 
@@ -262,20 +245,22 @@ func (b *Batch) Upsert(cfg RouteConfig) (*Route, error) {
 	if cfg.Name == "" {
 		return nil, errUpsertName
 	}
-	if err := checkConfig(cfg); err != nil {
+	// Checked before anything changes, so that an invalid cfg removes no
+	// route that it would replace.
+	st := stateOf(cfg)
+	if err := kindOf(cfg).validate(&st); err != nil {
 		return nil, err
 	}
 	r := b.view.names[cfg.Name]
 	if r == nil {
 		return b.Add(cfg)
 	}
-	if r.reject != cfg.Reject || r.fallback != cfg.Fallback {
+	if r.routeKind != kindOf(cfg) {
 		if err := b.Remove(r); err != nil {
 			return nil, err
 		}
 		return b.Add(cfg)
 	}
-	st := stateOf(cfg)
 	if err := b.update(r, func(cur *routeState) { *cur = st }); err != nil {
 		return nil, err
 	}
@@ -287,17 +272,23 @@ func (b *Batch) SetPriority(r *Route, priority int) error {
 	return b.update(r, func(st *routeState) { st.priority = priority })
 }
 
-// update records a change to the configuration of r.
+// update records a change to the configuration of r, which the change must
+// leave valid.
 func (b *Batch) update(r *Route, change func(*routeState)) error {
 	if err := b.check(r); err != nil {
 		return err
 	}
 	return b.do(func(s *routeSet) error {
 		st, ok := s.routes[r]
+		change(&st)
+		// Checked before whether r is still there, so that an invalid change
+		// is reported as such for a removed route too.
+		if err := r.validate(&st); err != nil {
+			return err
+		}
 		if !ok {
 			return net.ErrClosed
 		}
-		change(&st)
 		s.routes[r] = st
 		return nil
 	})
@@ -347,13 +338,6 @@ func (b *Batch) check(r *Route) error {
 		return errNilRoute
 	case r.mux != b.m:
 		return errForeignRoute
-	}
-	return nil
-}
-
-func checkMatchers(matchers []Matcher) error {
-	if slices.Contains(matchers, nil) {
-		return errNilMatcher
 	}
 	return nil
 }

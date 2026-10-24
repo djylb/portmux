@@ -118,35 +118,43 @@ func (e *Entry) ResetOptions(opts ...EntryOption) {
 // Config returns the settings that apply to the connections of the entry:
 // those of the Mux with the entry's own on top.
 func (e *Entry) Config() Config {
-	o, _ := e.m.settings(e.name)
-	return o.config()
+	return e.m.settings(e.name).opts.config()
 }
 
 // entryConfig holds the options set for an entry and their result. It is
 // never modified: changes replace it.
 type entryConfig struct {
 	set     [numEntrySettings]func(*options) // the latest option of each setting
-	opts    *options                         // the Mux's options with set applied
-	rate    *rateLimit                       // the entry's own buckets, or nil
-	ownRate bool                             // whether rate replaces the Mux's
-	ownBan  bool                             // whether failures are counted apart
+	cs      connSettings                     // the Mux's options with set applied
+	ownRate bool                             // whether cs.rate replaces the Mux's buckets
 }
 
-// settings returns the options and the buckets of WithRateLimitPerClient for
-// the connections of an entry.
-func (m *Mux) settings(entry string) (*options, *rateLimit) {
+// connSettings are the settings of the connections of an entry. A connection
+// reads them once, when it is taken, so that every step of it, from its
+// admission to its events, follows the same options, which include those of
+// the Mux as a whole, such as the observer. They are never modified.
+type connSettings struct {
+	opts   *options
+	rate   *rateLimit // the buckets of WithRateLimitPerClient, or nil
+	ownBan bool       // whether the entry counts failures toward bans apart
+}
+
+// settings returns the settings of the connections of an entry.
+func (m *Mux) settings(entry string) *connSettings {
 	if c := m.entryConfig(entry); c != nil {
-		if c.ownRate {
-			return c.opts, c.rate
-		}
-		return c.opts, m.rate.Load()
+		return &c.cs
 	}
-	return m.opts.Load(), m.rate.Load()
+	return m.base.Load()
+}
+
+// options returns the options of the Mux.
+func (m *Mux) options() *options {
+	return m.base.Load().opts
 }
 
 // banKey returns the record that counts the failures of client on entry.
-func (m *Mux) banKey(entry string, client netip.Prefix) banKey {
-	if c := m.entryConfig(entry); c != nil && c.ownBan {
+func (cs *connSettings) banKey(entry string, client netip.Prefix) banKey {
+	if cs.ownBan {
 		return banKey{client: client, entry: entry, own: true}
 	}
 	return banKey{client: client}
@@ -163,21 +171,26 @@ func (m *Mux) entryConfig(entry string) *entryConfig {
 // The entry's own buckets are kept while its own rate is unchanged. It runs
 // with m.mu held.
 func (m *Mux) newEntryConfig(old *entryConfig, set [numEntrySettings]func(*options)) *entryConfig {
-	base := m.opts.Load()
-	o := *base
+	base := m.base.Load()
+	o := *base.opts
 	for _, apply := range set {
 		if apply != nil {
 			apply(&o)
 		}
 	}
 	o.normalize()
-	c := &entryConfig{set: set, opts: &o, ownRate: set[settingRateLimitPerClient] != nil, ownBan: set[settingBanPerClient] != nil}
+	c := &entryConfig{set: set, ownRate: set[settingRateLimitPerClient] != nil}
+	c.cs = connSettings{opts: &o, ownBan: set[settingBanPerClient] != nil}
 	switch {
-	case !c.ownRate || o.rate <= 0:
-	case old != nil && old.rate != nil && old.opts.rate == o.rate && old.opts.rateBurst == o.rateBurst:
-		c.rate = old.rate
+	case !c.ownRate:
+		// The Mux's buckets, which SetOptions stores before it rebuilds the
+		// entries.
+		c.cs.rate = base.rate
+	case o.rate <= 0:
+	case old != nil && old.ownRate && old.cs.rate != nil && old.cs.opts.rate == o.rate && old.cs.opts.rateBurst == o.rateBurst:
+		c.cs.rate = old.cs.rate
 	default:
-		c.rate = newRateLimit(o.rate, o.rateBurst)
+		c.cs.rate = newRateLimit(o.rate, o.rateBurst)
 	}
 	return c
 }

@@ -195,11 +195,166 @@ func (p *parser) node() (*node, error) {
 	}
 }
 
-// matcherArgs lists the matchers that take no arguments.
-var matcherArgs = map[string]func() Matcher{
-	"AnyBytes": AnyBytes, "Always": Always, "SSH": SSH, "HTTP2Preface": HTTP2Preface,
-	"SOCKS4": SOCKS4, "SOCKS5": SOCKS5, "PostgreSQL": PostgreSQL, "MQTT": MQTT,
-	"RDP": RDP, "OpenVPN": OpenVPN, "XMPP": XMPP, "DNS": DNS,
+// builtin is a built-in matcher or filter that ParseMatcher knows by name:
+// how many arguments its call takes, at least lo and, unless hi is negative,
+// at most hi, and how it is built from them. The String method of each type
+// writes the same name and arguments, which the tests of ParseMatcher hold
+// together.
+type builtin[T any] struct {
+	lo, hi int
+	build  func(p *parser, args []*node) (T, error)
+}
+
+// The built-in matchers, HTTP filters and TLS filters by name. They are set
+// in init: their builders parse nested calls with the parser, which looks
+// them up, so initializing them where they are declared would be an
+// initialization cycle.
+var (
+	builtinMatchers    map[string]builtin[Matcher]
+	builtinHTTPFilters map[string]builtin[HTTPFilter]
+	builtinTLSFilters  map[string]builtin[TLSFilter]
+)
+
+func init() {
+	builtinMatchers = map[string]builtin[Matcher]{
+		"AnyBytes": noArgs(AnyBytes), "Always": noArgs(Always), "SSH": noArgs(SSH), "HTTP2Preface": noArgs(HTTP2Preface),
+		"SOCKS4": noArgs(SOCKS4), "SOCKS5": noArgs(SOCKS5), "PostgreSQL": noArgs(PostgreSQL), "MQTT": noArgs(MQTT),
+		"RDP": noArgs(RDP), "OpenVPN": noArgs(OpenVPN), "XMPP": noArgs(XMPP), "DNS": noArgs(DNS),
+
+		"And":       variadic((*parser).matcher, And),
+		"Or":        variadic((*parser).matcher, Or),
+		"Prefix":    variadic((*parser).str, Prefix),
+		"Domain":    variadic((*parser).str, Domain),
+		"RemoteIP":  variadic((*parser).prefix, RemoteIP),
+		"LocalIP":   variadic((*parser).prefix, LocalIP),
+		"LocalPort": variadic((*parser).port, LocalPort),
+		"HTTP1":     variadic((*parser).httpFilter, HTTP1),
+		"HTTP2":     variadic((*parser).httpFilter, HTTP2),
+		"TLS":       variadic((*parser).tlsFilter, TLS),
+		"Not": {1, 1, func(p *parser, args []*node) (Matcher, error) {
+			m, err := p.matcher(args[0])
+			if err != nil {
+				return nil, err
+			}
+			return Not(m), nil
+		}},
+		"Regexp": {2, 2, func(p *parser, args []*node) (Matcher, error) {
+			re, err := p.regexp(args[0])
+			if err != nil {
+				return nil, err
+			}
+			size, err := p.int(args[1], maxRegexpBytes)
+			if err != nil {
+				return nil, err
+			}
+			return Regexp(re, size), nil
+		}},
+		"Silent": {1, 1, func(p *parser, args []*node) (Matcher, error) {
+			d, err := time.ParseDuration(args[0].text)
+			if err != nil || args[0].call || args[0].str {
+				return nil, p.fail(args[0].pos, "invalid duration")
+			}
+			return Silent(d), nil
+		}},
+	}
+	builtinHTTPFilters = map[string]builtin[HTTPFilter]{
+		"Host":       variadic((*parser).str, Host),
+		"Path":       variadic((*parser).str, Path),
+		"PathPrefix": variadic((*parser).str, PathPrefix),
+		"Method":     variadic((*parser).str, Method),
+		"HostRegexp": oneRegexp(HostRegexp),
+		"PathRegexp": oneRegexp(PathRegexp),
+		"Header":     nameAndStrings(Header),
+		"Query":      nameAndStrings(Query),
+		"WebSocket":  noArgs(WebSocket),
+		"HeaderRegexp": {2, 2, func(p *parser, args []*node) (HTTPFilter, error) {
+			name, err := p.str(args[0])
+			if err != nil {
+				return nil, err
+			}
+			re, err := p.regexp(args[1])
+			if err != nil {
+				return nil, err
+			}
+			return HeaderRegexp(name, re), nil
+		}},
+	}
+	addFilterSets(builtinHTTPFilters, (*parser).httpFilter)
+	builtinTLSFilters = map[string]builtin[TLSFilter]{
+		"SNI":       variadic((*parser).str, SNI),
+		"ALPN":      variadic((*parser).str, ALPN),
+		"SNIRegexp": oneRegexp(SNIRegexp),
+		"MinTLSVersion": {1, 1, func(p *parser, args []*node) (TLSFilter, error) {
+			v, ok := parseVersion(args[0].text)
+			if !ok || args[0].call || args[0].str {
+				return nil, p.fail(args[0].pos, "invalid TLS version")
+			}
+			return MinTLSVersion(v), nil
+		}},
+	}
+	addFilterSets(builtinTLSFilters, (*parser).tlsFilter)
+}
+
+// noArgs is a built-in without arguments.
+func noArgs[T any](f func() T) builtin[T] {
+	return builtin[T]{0, 0, func(*parser, []*node) (T, error) { return f(), nil }}
+}
+
+// variadic is a built-in of any number of arguments, each read with arg.
+func variadic[A, T any](arg func(*parser, *node) (A, error), f func(...A) T) builtin[T] {
+	return builtin[T]{0, -1, func(p *parser, args []*node) (T, error) {
+		vs, err := each(args, func(n *node) (A, error) { return arg(p, n) })
+		if err != nil {
+			var zero T
+			return zero, err
+		}
+		return f(vs...), nil
+	}}
+}
+
+// oneRegexp is a built-in of one regular expression.
+func oneRegexp[T any](f func(*regexp.Regexp) T) builtin[T] {
+	return builtin[T]{1, 1, func(p *parser, args []*node) (T, error) {
+		re, err := p.regexp(args[0])
+		if err != nil {
+			var zero T
+			return zero, err
+		}
+		return f(re), nil
+	}}
+}
+
+// nameAndStrings is a built-in of a name and any number of strings after it.
+func nameAndStrings[T any](f func(string, ...string) T) builtin[T] {
+	return builtin[T]{1, -1, func(p *parser, args []*node) (T, error) {
+		ss, err := each(args, p.str)
+		if err != nil {
+			var zero T
+			return zero, err
+		}
+		return f(ss[0], ss[1:]...), nil
+	}}
+}
+
+// addFilterSets adds AllOf, AnyOf and NoneOf of the filters that one reads.
+func addFilterSets[T any](builtins map[string]builtin[Filter[T]], one func(*parser, *node) (Filter[T], error)) {
+	builtins["AllOf"] = variadic(one, AllOf[T])
+	builtins["AnyOf"] = variadic(one, AnyOf[T])
+	builtins["NoneOf"] = variadic(one, NoneOf[T])
+}
+
+// buildBuiltin builds the built-in that the call n names; ok reports whether
+// n names one.
+func buildBuiltin[T any](p *parser, n *node, builtins map[string]builtin[T]) (v T, ok bool, err error) {
+	b, ok := builtins[n.text]
+	if !ok {
+		return v, false, nil
+	}
+	if err := p.count(n, b.lo, b.hi); err != nil {
+		return v, true, err
+	}
+	v, err = b.build(p, n.args)
+	return v, true, err
 }
 
 func (p *parser) matcher(n *node) (Matcher, error) {
@@ -216,95 +371,8 @@ func (p *parser) matcher(n *node) (Matcher, error) {
 		}
 		return Named(n.text, m), nil
 	}
-	if f, ok := matcherArgs[n.text]; ok {
-		if err := p.count(n, 0, 0); err != nil {
-			return nil, err
-		}
-		return f(), nil
-	}
-	switch n.text {
-	case "And", "Or":
-		ms, err := each(n.args, p.matcher)
-		if err != nil {
-			return nil, err
-		}
-		if n.text == "And" {
-			return And(ms...), nil
-		}
-		return Or(ms...), nil
-	case "Not":
-		if err := p.count(n, 1, 1); err != nil {
-			return nil, err
-		}
-		m, err := p.matcher(n.args[0])
-		if err != nil {
-			return nil, err
-		}
-		return Not(m), nil
-	case "Prefix", "Domain":
-		ss, err := each(n.args, p.str)
-		if err != nil {
-			return nil, err
-		}
-		if n.text == "Prefix" {
-			return Prefix(ss...), nil
-		}
-		return Domain(ss...), nil
-	case "Regexp":
-		if err := p.count(n, 2, 2); err != nil {
-			return nil, err
-		}
-		re, err := p.regexp(n.args[0])
-		if err != nil {
-			return nil, err
-		}
-		size, err := p.int(n.args[1], maxRegexpBytes)
-		if err != nil {
-			return nil, err
-		}
-		return Regexp(re, size), nil
-	case "Silent":
-		if err := p.count(n, 1, 1); err != nil {
-			return nil, err
-		}
-		d, err := time.ParseDuration(n.args[0].text)
-		if err != nil || n.args[0].call || n.args[0].str {
-			return nil, p.fail(n.args[0].pos, "invalid duration")
-		}
-		return Silent(d), nil
-	case "RemoteIP", "LocalIP":
-		prefixes, err := each(n.args, p.prefix)
-		if err != nil {
-			return nil, err
-		}
-		if n.text == "RemoteIP" {
-			return RemoteIP(prefixes...), nil
-		}
-		return LocalIP(prefixes...), nil
-	case "LocalPort":
-		ports, err := each(n.args, func(a *node) (uint16, error) {
-			v, err := p.int(a, 65535)
-			return uint16(v), err
-		})
-		if err != nil {
-			return nil, err
-		}
-		return LocalPort(ports...), nil
-	case "HTTP1", "HTTP2":
-		fs, err := each(n.args, p.httpFilter)
-		if err != nil {
-			return nil, err
-		}
-		if n.text == "HTTP1" {
-			return HTTP1(fs...), nil
-		}
-		return HTTP2(fs...), nil
-	case "TLS":
-		fs, err := each(n.args, p.tlsFilter)
-		if err != nil {
-			return nil, err
-		}
-		return TLS(fs...), nil
+	if m, ok, err := buildBuiltin(p, n, builtinMatchers); ok {
+		return m, err
 	}
 	return custom(p, n, p.names.MatcherFuncs, "matcher")
 }
@@ -338,7 +406,10 @@ func custom[T any](p *parser, n *node, funcs map[string]func(args ...string) (T,
 }
 
 func (p *parser) httpFilter(n *node) (HTTPFilter, error) {
-	if !n.call && !n.str {
+	switch {
+	case n.str:
+		return nil, p.fail(n.pos, "expected an HTTP filter, found a string")
+	case !n.call:
 		f, ok := p.names.HTTPFilters[n.text]
 		switch {
 		case !ok:
@@ -348,67 +419,17 @@ func (p *parser) httpFilter(n *node) (HTTPFilter, error) {
 		}
 		return namedFilter[*httphead.Request]{name: n.text, f: f}, nil
 	}
-	if f, ok, err := filterSetOf(n, p.httpFilter); ok || err != nil {
+	if f, ok, err := buildBuiltin(p, n, builtinHTTPFilters); ok {
 		return f, err
-	}
-	if !n.call {
-		return nil, p.fail(n.pos, "expected an HTTP filter, found a string")
-	}
-	switch n.text {
-	case "Host", "Path", "PathPrefix", "Method":
-		ss, err := each(n.args, p.str)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]func(...string) HTTPFilter{"Host": Host, "Path": Path, "PathPrefix": PathPrefix, "Method": Method}[n.text](ss...), nil
-	case "HostRegexp", "PathRegexp":
-		if err := p.count(n, 1, 1); err != nil {
-			return nil, err
-		}
-		re, err := p.regexp(n.args[0])
-		if err != nil {
-			return nil, err
-		}
-		if n.text == "HostRegexp" {
-			return HostRegexp(re), nil
-		}
-		return PathRegexp(re), nil
-	case "HeaderRegexp":
-		if err := p.count(n, 2, 2); err != nil {
-			return nil, err
-		}
-		name, err := p.str(n.args[0])
-		if err != nil {
-			return nil, err
-		}
-		re, err := p.regexp(n.args[1])
-		if err != nil {
-			return nil, err
-		}
-		return HeaderRegexp(name, re), nil
-	case "Header", "Query":
-		if err := p.count(n, 1, -1); err != nil {
-			return nil, err
-		}
-		ss, err := each(n.args, p.str)
-		if err != nil {
-			return nil, err
-		}
-		if n.text == "Header" {
-			return Header(ss[0], ss[1:]...), nil
-		}
-		return Query(ss[0], ss[1:]...), nil
-	case "WebSocket":
-		if err := p.count(n, 0, 0); err != nil {
-			return nil, err
-		}
-		return WebSocket(), nil
 	}
 	return custom(p, n, p.names.HTTPFilterFuncs, "HTTP filter")
 }
 
 func (p *parser) tlsFilter(n *node) (TLSFilter, error) {
-	if !n.call && !n.str {
+	switch {
+	case n.str:
+		return nil, p.fail(n.pos, "expected a TLS filter, found a string")
+	case !n.call:
 		f, ok := p.names.TLSFilters[n.text]
 		switch {
 		case !ok:
@@ -418,77 +439,10 @@ func (p *parser) tlsFilter(n *node) (TLSFilter, error) {
 		}
 		return namedFilter[*tlshello.Hello]{name: n.text, f: f}, nil
 	}
-	if f, ok, err := filterSetOf(n, p.tlsFilter); ok || err != nil {
+	if f, ok, err := buildBuiltin(p, n, builtinTLSFilters); ok {
 		return f, err
 	}
-	if !n.call {
-		return nil, p.fail(n.pos, "expected a TLS filter, found a string")
-	}
-	switch n.text {
-	case "SNI", "ALPN":
-		ss, err := each(n.args, p.str)
-		if err != nil {
-			return nil, err
-		}
-		if n.text == "SNI" {
-			return SNI(ss...), nil
-		}
-		return ALPN(ss...), nil
-	case "SNIRegexp":
-		if err := p.count(n, 1, 1); err != nil {
-			return nil, err
-		}
-		re, err := p.regexp(n.args[0])
-		if err != nil {
-			return nil, err
-		}
-		return SNIRegexp(re), nil
-	case "MinTLSVersion":
-		if err := p.count(n, 1, 1); err != nil {
-			return nil, err
-		}
-		v, ok := parseVersion(n.args[0].text)
-		if !ok || n.args[0].call || n.args[0].str {
-			return nil, p.fail(n.args[0].pos, "invalid TLS version")
-		}
-		return MinTLSVersion(v), nil
-	}
 	return custom(p, n, p.names.TLSFilterFuncs, "TLS filter")
-}
-
-// filterSetOf parses AllOf, AnyOf and NoneOf; ok reports whether n is one.
-func filterSetOf[T any](n *node, one func(*node) (Filter[T], error)) (f Filter[T], ok bool, err error) {
-	if !n.call {
-		return nil, false, nil
-	}
-	var kind setKind
-	switch n.text {
-	case "AllOf":
-		kind = allOf
-	case "AnyOf":
-		kind = anyOf
-	case "NoneOf":
-		kind = noneOf
-	default:
-		return nil, false, nil
-	}
-	fs, err := each(n.args, one)
-	if err != nil {
-		return nil, false, err
-	}
-	return newFilterSet(kind, fs), true, nil
-}
-
-// parseVersion reads a TLS version as versionName writes it.
-func parseVersion(s string) (uint16, bool) {
-	if minor, ok := strings.CutPrefix(s, "1."); ok && len(minor) == 1 && minor[0] >= '0' && minor[0] <= '3' {
-		return 0x0301 + uint16(minor[0]-'0'), true
-	}
-	if hexText, ok := strings.CutPrefix(s, "0x"); ok {
-		v, err := strconv.ParseUint(hexText, 16, 16)
-		return uint16(v), err == nil
-	}
-	return 0, false
 }
 
 func each[T any](args []*node, parse func(*node) (T, error)) ([]T, error) {
@@ -583,6 +537,12 @@ func (p *parser) int(n *node, maxValue int) (int, error) {
 		return 0, p.fail(n.pos, "expected a number up to %d", maxValue)
 	}
 	return v, nil
+}
+
+// port reads a port number.
+func (p *parser) port(n *node) (uint16, error) {
+	v, err := p.int(n, 65535)
+	return uint16(v), err
 }
 
 // prefix reads an IP prefix, or an address that stands for a single one.

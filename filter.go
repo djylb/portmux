@@ -59,6 +59,20 @@ func NoneOf[T any](filters ...Filter[T]) Filter[T] {
 	return newFilterSet(noneOf, filters)
 }
 
+// allFilters returns the result of a matcher whose parser returned v and res:
+// res unless it is Match, and then whether v passes every filter.
+func allFilters[T any](filters []Filter[T], v T, res Result) Result {
+	if res != Match {
+		return res
+	}
+	for _, f := range filters {
+		if !f.Match(v) {
+			return NoMatch
+		}
+	}
+	return Match
+}
+
 type setKind uint8
 
 const (

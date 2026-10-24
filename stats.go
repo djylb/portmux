@@ -253,8 +253,9 @@ type Event struct {
 	// returns it, from what matchers parsed, or "".
 	Name string
 	// ClientHello, HTTPRequest and HTTP2Request are what matchers parsed of
-	// the connection, or nil, for example to log the fingerprint of a client
-	// that was refused.
+	// the connection, for example to log the fingerprint of a client that
+	// was refused. Each is set only when its parse succeeded, that is,
+	// matched a complete head, and is nil otherwise.
 	ClientHello  *tlshello.Hello
 	HTTPRequest  *httphead.Request
 	HTTP2Request *httphead.Request
@@ -270,7 +271,7 @@ type Event struct {
 	Read     int64
 	Written  int64
 
-	values []inputValue // of Input.SetValue
+	values valueList // of Input.SetValue
 
 	// Closed reports an event of WithCloseEvents: the delivered connection
 	// was closed.
@@ -284,17 +285,19 @@ type Event struct {
 // Input.SetValue while the connection was matched, or nil, as Conn.Value
 // does.
 func (e Event) Value(key any) any {
-	for _, v := range e.values {
-		if v.key == key {
-			return v.value
-		}
-	}
-	return nil
+	return e.values.get(key)
 }
 
-// observe passes ev to the observer, unless the Mux was closed.
+// observe passes ev, which no connection's settings cover, such as an Accept
+// error, to the current observer.
 func (m *Mux) observe(ev Event) {
-	if fn := m.opts.Load().observer; fn != nil && (ev.Err == nil || !m.closed.Load()) {
+	m.observeWith(m.options().observer, ev)
+}
+
+// observeWith passes ev to fn, the observer of the settings that ev is of,
+// unless fn is nil or ev reports a failure after the Mux was closed.
+func (m *Mux) observeWith(fn func(Event), ev Event) {
+	if fn != nil && (ev.Err == nil || !m.closed.Load()) {
 		fn(ev)
 	}
 }

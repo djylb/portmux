@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -138,4 +139,102 @@ func TestSnapshotWithNestedListener(t *testing.T) {
 	if a := route.Addr().String(); a != m.Addr().String()+","+m.Addr().String() {
 		t.Fatalf("Addr = %s", a)
 	}
+}
+
+// TestEventsCarryTheConnection checks that every kind of event of a
+// connection carries its addresses, its peer and what matching found: one
+// refused at admission, one rejected after sniffing, a delivered one, its
+// close event and the event of a panicking handler.
+func TestEventsCarryTheConnection(t *testing.T) {
+	type valueKey struct{}
+	events := make(chan Event, 16)
+	m := startMux(t, WithCloseEvents(true), WithObserver(func(ev Event) { events <- ev }))
+	tag := MatcherFunc(func(in *Input) Result {
+		in.SetValue(valueKey{}, "tagged")
+		return Match
+	})
+	route := func(host string) []Matcher { return []Matcher{And(tag, HTTP1(Host(host)))} }
+	mustAdd(t, m, RouteConfig{Matchers: route("refused.example"), Reject: true})
+	mustAdd(t, m, RouteConfig{Matchers: route("panic.example"), Handler: func(*Conn) { panic("handler failed") }})
+	ok := mustAdd(t, m, RouteConfig{Matchers: route("ok.example")})
+	serve(t, m)
+
+	next := func(what string) Event {
+		t.Helper()
+		select {
+		case ev := <-events:
+			return ev
+		case <-time.After(5 * time.Second):
+			t.Fatalf("no event for %s", what)
+			return Event{}
+		}
+	}
+	// check checks the addresses of ev and, when parsed, what matching found.
+	check := func(what string, ev Event, client net.Conn, host string) {
+		t.Helper()
+		peer := client.LocalAddr().String()
+		if ev.Peer == nil || ev.Peer.String() != peer || ev.Remote == nil || ev.Remote.String() != peer || ev.Local == nil {
+			t.Fatalf("%s: addresses of %+v, want peer %s", what, ev, peer)
+		}
+		if host == "" {
+			return
+		}
+		if ev.Name != host || ev.HTTPRequest == nil || ev.HTTPRequest.Host != host || ev.Value(valueKey{}) != "tagged" {
+			t.Fatalf("%s: parses of %+v", what, ev)
+		}
+	}
+	request := func(host string) net.Conn {
+		t.Helper()
+		c := dial(t, m)
+		if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	m.Ban(netip.MustParseAddr("127.0.0.1"), time.Hour)
+	c := dial(t, m)
+	expectClosed(t, c)
+	ev := next("admission")
+	if !errors.Is(ev.Err, ErrBanned) {
+		t.Fatalf("admission event %+v", ev)
+	}
+	check("admission", ev, c, "")
+	m.Unban(netip.MustParseAddr("127.0.0.1"))
+
+	c = request("refused.example")
+	expectClosed(t, c)
+	if ev = next("rejection"); !errors.Is(ev.Err, ErrRefused) {
+		t.Fatalf("rejection event %+v", ev)
+	}
+	check("rejection", ev, c, "refused.example")
+
+	c = request("ok.example")
+	conn := accept(t, ok)
+	if ev = next("delivery"); ev.Err != nil || ev.Route != ok {
+		t.Fatalf("delivery event %+v", ev)
+	}
+	check("delivery", ev, c, "ok.example")
+	_ = conn.Close()
+	if ev = next("close"); !ev.Closed || ev.Route != ok {
+		t.Fatalf("close event %+v", ev)
+	}
+	check("close", ev, c, "ok.example")
+
+	c = request("panic.example")
+	expectClosed(t, c)
+	if ev = next("handler delivery"); ev.Err != nil {
+		t.Fatalf("handler delivery event %+v", ev)
+	}
+	check("handler delivery", ev, c, "panic.example")
+	// The handler's connection was closed, which WithCloseEvents reports
+	// too, before the panic.
+	if ev = next("handler close"); !ev.Closed {
+		t.Fatalf("handler close event %+v", ev)
+	}
+	var pe *PanicError
+	if ev = next("panic"); !errors.As(ev.Err, &pe) || ev.Route == nil {
+		t.Fatalf("panic event %+v", ev)
+	}
+	check("panic", ev, c, "panic.example")
 }

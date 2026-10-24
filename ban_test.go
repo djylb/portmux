@@ -111,7 +111,7 @@ func TestBanListBounds(t *testing.T) {
 	if n := l.size.Load(); n > maxBanClients {
 		t.Fatalf("size %d", n)
 	}
-	for i := range rateSweepEvery * banShards {
+	for i := range sweepEvery * banShards {
 		ip := netip.AddrFrom4([4]byte{172, 16, byte(i >> 8), byte(i)})
 		l.fail(banKey{client: host(ip)}, time.Hour, 5, time.Second, time.Minute)
 	}
@@ -138,7 +138,7 @@ func TestBanListScopes(t *testing.T) {
 		t.Fatal("banned by failures in separate windows")
 	}
 	// Sweeps after failures with a short window keep the Mux's count.
-	for i := range rateSweepEvery * banShards {
+	for i := range sweepEvery * banShards {
 		ip := netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)})
 		l.fail(banKey{client: host(ip), entry: "fast", own: true}, time.Minute, 3, time.Second, time.Hour)
 	}

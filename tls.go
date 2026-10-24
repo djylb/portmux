@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/tlshello"
@@ -24,15 +25,7 @@ type tlsMatcher []TLSFilter
 
 func (t tlsMatcher) Match(in *Input) Result {
 	hello, res := in.ClientHello()
-	if res != Match {
-		return res
-	}
-	for _, f := range t {
-		if !f.Match(hello) {
-			return NoMatch
-		}
-	}
-	return Match
+	return allFilters(t, hello, res)
 }
 
 func (t tlsMatcher) String() string { return call("TLS", t, describe[TLSFilter]) }
@@ -100,6 +93,18 @@ func versionName(v uint16) string {
 		return "1." + strconv.Itoa(int(v-0x0301))
 	}
 	return fmt.Sprintf("0x%04x", v)
+}
+
+// parseVersion reads a TLS version as versionName writes it.
+func parseVersion(s string) (uint16, bool) {
+	if minor, ok := strings.CutPrefix(s, "1."); ok && len(minor) == 1 && minor[0] >= '0' && minor[0] <= '3' {
+		return 0x0301 + uint16(minor[0]-'0'), true
+	}
+	if hexText, ok := strings.CutPrefix(s, "0x"); ok {
+		v, err := strconv.ParseUint(hexText, 16, 16)
+		return uint16(v), err == nil
+	}
+	return 0, false
 }
 
 func (f sniFilter) String() string { return call("SNI", f.patterns, quote) }

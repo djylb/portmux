@@ -221,7 +221,7 @@ func TestRateLimitTracksBoundedClients(t *testing.T) {
 func TestClientKeyGroupsIPv6Networks(t *testing.T) {
 	m := New()
 	defer func() { _ = m.Close() }()
-	key := func(ip string) netip.Prefix { return m.clientNet(netip.MustParseAddr(ip)) }
+	key := func(ip string) netip.Prefix { return m.options().clientNet(netip.MustParseAddr(ip)) }
 	k1, k2, k3, k4 := key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff::9"), key("2001:db8:1:3::1"), key("::ffff:192.0.2.1")
 	if k1 != k2 || k1 == k3 || k1 != netip.MustParsePrefix("2001:db8:1:2::/64") || k4 != netip.MustParsePrefix("192.0.2.1/32") {
 		t.Fatalf("keys %v %v %v %v", k1, k2, k3, k4)
@@ -762,4 +762,59 @@ func TestProxyPolicyRunsOutsideAcceptLoop(t *testing.T) {
 	}
 	_, _ = dial(t, m).Write([]byte("A"))
 	accept(t, route)
+}
+
+// TestPanicAfterAdmissionFreesTheClient checks that a connection whose
+// net.Conn panics after the per-client rules counted it, here in RemoteAddr
+// while the addresses that matchers see are set, gives its client's pending
+// count back.
+func TestPanicAfterAdmissionFreesTheClient(t *testing.T) {
+	// Without an observer, whose event would read the address again.
+	m := startMux(t, WithMaxPendingPerClient(1),
+		WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Ignore }))
+	route := m.Listen(Prefix("A"))
+	var wrapped atomic.Bool
+	m.ln = &wrapListener{Listener: m.ln, wrap: func(c net.Conn) net.Conn {
+		if wrapped.Swap(true) {
+			return c
+		}
+		return &counterPanicConn{Conn: c, m: m.Mux}
+	}}
+	serve(t, m)
+
+	expectClosed(t, dial(t, m))
+	waitUntil(t, "the panic is counted", func() bool { return m.Stats().Failed == 1 })
+	_, _ = dial(t, m).Write([]byte("A"))
+	accept(t, route)
+}
+
+// wrapListener wraps the connections it accepts with wrap.
+type wrapListener struct {
+	net.Listener
+	wrap func(net.Conn) net.Conn
+}
+
+func (l *wrapListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return l.wrap(c), nil
+}
+
+// counterPanicConn panics in RemoteAddr once m counts a pending connection of
+// some client.
+type counterPanicConn struct {
+	net.Conn
+	m *Mux
+}
+
+func (c *counterPanicConn) RemoteAddr() net.Addr {
+	c.m.perClient.mu.Lock()
+	counted := len(c.m.perClient.count) > 0
+	c.m.perClient.mu.Unlock()
+	if counted {
+		panic("RemoteAddr failed")
+	}
+	return c.Conn.RemoteAddr()
 }

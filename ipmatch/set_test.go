@@ -96,3 +96,21 @@ func TestSetPrefixes(t *testing.T) {
 		t.Fatalf("Prefixes = %v", got)
 	}
 }
+
+func TestNormalize(t *testing.T) {
+	if got := NormalizeAddr(netip.MustParseAddr("::ffff:192.0.2.1")); got != netip.MustParseAddr("192.0.2.1") {
+		t.Errorf("NormalizeAddr of a mapped address = %v", got)
+	}
+	if got := NormalizeAddr(netip.MustParseAddr("fe80::1%eth0")); got != netip.MustParseAddr("fe80::1") {
+		t.Errorf("NormalizeAddr of a zoned address = %v", got)
+	}
+	for in, want := range map[string]string{
+		"::ffff:192.0.2.7/120": "192.0.2.0/24",
+		"::ffff:0:0/95":        "::fffe:0:0/95",
+		"10.1.2.3/8":           "10.0.0.0/8",
+	} {
+		if got := NormalizePrefix(netip.MustParsePrefix(in)); got != netip.MustParsePrefix(want) {
+			t.Errorf("NormalizePrefix(%s) = %v, want %s", in, got, want)
+		}
+	}
+}

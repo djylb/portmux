@@ -260,7 +260,10 @@ func WithMaxQueued(n int) EntryOption {
 // synchronously, for limit errors in the accept loop, so it must be cheap
 // under attack: prefer counting to logging every rejected connection. It may
 // call the methods of the Mux, but not wait for Shutdown, which waits for
-// the Serve call that may be calling it: start Shutdown in a goroutine.
+// the Serve call that may be calling it: start Shutdown in a goroutine. A
+// connection reports to the observer that was set when it was accepted,
+// including the event of WithCloseEvents when it is closed, so setting
+// another observer, or none, does not affect the connections already taken.
 func WithObserver(fn func(Event)) Option {
 	return optionFunc(func(o *options) {
 		o.observer = fn
@@ -272,7 +275,8 @@ func WithObserver(fn func(Event)) Option {
 // with Closed set, how long it was open and how many bytes it carried, for
 // access logs. The Mux then counts the bytes of delivered connections, which
 // costs an atomic addition per read and write; without it, they are not
-// counted. It applies to connections delivered after it is set.
+// counted. It applies to connections accepted after it is set, whose close
+// events go to the observer of that time; see WithObserver.
 func WithCloseEvents(on bool) Option {
 	return optionFunc(func(o *options) {
 		o.closeEvents = on

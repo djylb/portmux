@@ -36,7 +36,7 @@ type Input struct {
 	h2P   parseState
 
 	// values are the ones of SetValue, in the order set.
-	values []inputValue
+	values valueList
 	// name is the name of SetRequestedName, when named.
 	name  hostmatch.Name
 	named bool
@@ -50,15 +50,44 @@ type Input struct {
 
 type inputValue struct{ key, value any }
 
-// Value returns the value that SetValue stored under key for this
-// connection, or nil.
-func (in *Input) Value(key any) any {
-	for _, v := range in.values {
+// valueList holds the values of SetValue.
+type valueList []inputValue
+
+// get returns the value stored under key, or nil.
+func (l valueList) get(key any) any {
+	for _, v := range l {
 		if v.key == key {
 			return v.value
 		}
 	}
 	return nil
+}
+
+// Value returns the value that SetValue stored under key for this
+// connection, or nil.
+func (in *Input) Value(key any) any {
+	return in.values.get(key)
+}
+
+// parsed returns what matching found so far, sharing it with in: the parses
+// that succeeded, the values and the requested name. A parse counts once it
+// returned Match, so a connection and its events report the same heads
+// whatever the outcome.
+func (in *Input) parsed() parsed {
+	p := parsed{values: in.values}
+	if in.tlsP.res == Match {
+		p.hello = in.hello
+	}
+	if in.httpP.res == Match {
+		p.req = in.req
+	}
+	if in.h2P.res == Match {
+		p.req2 = in.req2
+	}
+	if in.named {
+		p.name = &in.name
+	}
+	return p
 }
 
 // SetValue stores value under key for the rest of the matching of this

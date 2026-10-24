@@ -20,7 +20,10 @@ import (
 // connections handed over with ServeConn. Routes can be added, changed and
 // removed at any time. Its methods are safe for concurrent use.
 type Mux struct {
-	opts  atomic.Pointer[options]
+	// base holds the options of the Mux and its buckets of
+	// WithRateLimitPerClient, the settings of the entries without options of
+	// their own.
+	base  atomic.Pointer[connSettings]
 	table atomic.Pointer[table]
 
 	quit      chan struct{} // closed when no new connections are taken
@@ -33,7 +36,6 @@ type Mux struct {
 	accepts     atomic.Uint64 // numbers the connections from Serve
 	slots       *slotLimit
 	perClient   pendingLimit
-	rate        atomic.Pointer[rateLimit]
 	entries     atomic.Pointer[map[string]*entryConfig] // entries with options of their own
 	bans        *banList
 	total       stripedCounters
@@ -53,26 +55,20 @@ type listener struct {
 	// with m.mu.
 	addr   net.Addr
 	counts stripedCounters
-	// The token bucket of WithRateLimitPerListener, used by Serve alone.
-	tokens float64
-	last   time.Time
+	// The token bucket of WithRateLimitPerListener, used by Serve alone, and
+	// the start of its clock, zero until its first use.
+	tokens tokenBucket
+	epoch  time.Time
 }
 
 // allow takes a token of the listener's bucket and reports whether there was
 // one.
 func (l *listener) allow(rate float64, burst int, now time.Time) bool {
 	b := float64(max(burst, 1))
-	if l.last.IsZero() {
-		l.tokens = b
-	} else {
-		l.tokens = min(b, l.tokens+now.Sub(l.last).Seconds()*rate)
+	if l.epoch.IsZero() {
+		l.epoch, l.tokens = now, tokenBucket{tokens: b}
 	}
-	l.last = now
-	if l.tokens < 1 {
-		return false
-	}
-	l.tokens--
-	return true
+	return l.tokens.take(rate, b, now.Sub(l.epoch))
 }
 
 // New returns a Mux without listeners or routes.
@@ -85,35 +81,40 @@ func New(opts ...Option) *Mux {
 		bans:      newBanList(),
 	}
 	o := newOptions(opts)
-	m.opts.Store(&o)
+	base := &connSettings{opts: &o}
 	if o.rate > 0 {
-		m.rate.Store(newRateLimit(o.rate, o.rateBurst))
+		base.rate = newRateLimit(o.rate, o.rateBurst)
 	}
+	m.base.Store(base)
 	m.table.Store(newTable(routeSet{}, nil))
 	return m
 }
 
 // SetOptions changes options while the Mux serves; options that are not
-// given keep their values. Limits apply to the connections accepted from then
-// on, and connections being matched keep the timeouts and sizes they started
-// with. Lowering WithMaxPending closes nothing at once: for each connection it
-// accepts over the limit, Serve evicts the oldest undecided one, as at the
-// limit, and waits until enough pending connections are gone. A new
-// WithRateLimitPerClient starts every client with a full bucket.
+// given keep their values. The options apply to the connections accepted from
+// then on: a connection keeps the settings in effect when it was accepted,
+// its timeouts, sizes and limits, its observer and whether its close is
+// reported, so a new observer does not see the events of connections already
+// taken, including their close events. WithMaxPending, which bounds the Mux
+// as a whole, applies at once, but lowering it closes nothing at once: for
+// each connection it accepts over the limit, Serve evicts the oldest
+// undecided one, as at the limit, and waits until enough pending connections
+// are gone. A new WithRateLimitPerClient starts every client with a full
+// bucket.
 func (m *Mux) SetOptions(opts ...Option) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	old := m.opts.Load()
-	o := *old
+	old := m.base.Load()
+	o := *old.opts
 	o.apply(opts)
-	m.opts.Store(&o)
-	if o.rate != old.rate || o.rateBurst != old.rateBurst {
-		var l *rateLimit
+	base := &connSettings{opts: &o, rate: old.rate}
+	if o.rate != old.opts.rate || o.rateBurst != old.opts.rateBurst {
+		base.rate = nil
 		if o.rate > 0 {
-			l = newRateLimit(o.rate, o.rateBurst)
+			base.rate = newRateLimit(o.rate, o.rateBurst)
 		}
-		m.rate.Store(l)
 	}
+	m.base.Store(base)
 	m.rebuildEntriesLocked()
 	// A higher pending limit lets a waiting Serve go on.
 	m.slots.signal()
@@ -122,7 +123,7 @@ func (m *Mux) SetOptions(opts ...Option) {
 // Config returns the settings of the Mux, as its options set them; see
 // Entry.Config for those of an entry with options of its own.
 func (m *Mux) Config() Config {
-	return m.opts.Load().config()
+	return m.options().config()
 }
 
 // Listen adds an unnamed route with priority 0 for the matchers and returns
@@ -229,15 +230,17 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 		// Numbered in accept order, which the clock may not tell apart.
 		seq := m.accepts.Add(1)
 		stripe := uint8(seq % counterStripes)
+		// The connection follows the settings of this moment throughout.
+		cs := m.settings(entry)
 		// A connection counts as accepted once it is served or rejected, so
 		// that one waiting for a pending slot is not counted yet.
-		a, err := m.admit(c, l)
+		a, err := m.admit(c, l, cs)
 		if err != nil {
-			ev := Event{Entry: entry, Remote: c.RemoteAddr(), Local: c.LocalAddr(), Err: err}
+			ev := acceptEvent(entry, c, err)
 			m.count(l, stripe, func(c *counters) { c.accepted.Add(1) })
 			m.reject(l, stripe, err)
 			_ = c.Close()
-			m.observe(ev)
+			m.observeWith(cs.opts.observer, ev)
 			continue
 		}
 		if !m.acquireSlot() {
@@ -255,7 +258,7 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 		})
 		// The sniff timeout runs from here, so that the wait for a slot does
 		// not use it up.
-		go m.serveAccepted(c, a, l, arrival{start: time.Now(), seq: seq, stripe: stripe})
+		go m.serveAccepted(c, a, cs, l, arrival{start: time.Now(), seq: seq, stripe: stripe})
 	}
 }
 
@@ -280,8 +283,8 @@ type admission struct {
 // accepted by Serve. With a PROXY protocol policy, it checks only that the
 // peer is not banned: serveConn calls the policy and applies the rules, to
 // the source of the header for a peer that sends one.
-func (m *Mux) admit(c net.Conn, l *listener) (admission, error) {
-	o, rate := m.settings(l.entry)
+func (m *Mux) admit(c net.Conn, l *listener, cs *connSettings) (admission, error) {
+	o := cs.opts
 	if o.listenerRate > 0 && !l.allow(o.listenerRate, o.listenerBurst, time.Now()) {
 		return admission{}, ErrRateLimited
 	}
@@ -292,10 +295,10 @@ func (m *Mux) admit(c net.Conn, l *listener) (admission, error) {
 		return admission{policy: true}, nil
 	}
 	a := admission{proxy: proxyproto.Ignore}
-	if o.maxPendingPerClient <= 0 && rate == nil && o.banFailures <= 0 && m.bans.size.Load() == 0 {
+	if o.maxPendingPerClient <= 0 && cs.rate == nil && o.banFailures <= 0 && m.bans.size.Load() == 0 {
 		return a, nil
 	}
-	return m.admitClient(a, c.RemoteAddr(), o, rate)
+	return m.admitClient(a, c.RemoteAddr(), cs)
 }
 
 // proxyPolicyFor returns the PROXY protocol policy of o for c on entry.
@@ -308,21 +311,21 @@ func proxyPolicyFor(o *options, entry string, c net.Conn) proxyproto.Policy {
 
 // admitClient applies the per-client rules to client, the peer of a
 // connection or the source of its PROXY header, and records the client in a.
-func (m *Mux) admitClient(a admission, client net.Addr, o *options, rate *rateLimit) (admission, error) {
+func (m *Mux) admitClient(a admission, client net.Addr, cs *connSettings) (admission, error) {
 	ap, ok := addrPort(client)
 	if !ok {
 		return a, nil
 	}
-	key := m.clientNet(ap.Addr())
+	key := cs.opts.clientNet(ap.Addr())
 	a.client = key
 	switch {
 	case m.bans.banned(ap.Addr(), m.bans.now()):
 		return a, ErrBanned
-	case rate != nil && !rate.allow(key):
+	case cs.rate != nil && !cs.rate.allow(key):
 		return a, ErrRateLimited
-	case o.maxPendingPerClient <= 0:
+	case cs.opts.maxPendingPerClient <= 0:
 		return a, nil
-	case !m.perClient.acquire(key, o.maxPendingPerClient):
+	case !m.perClient.acquire(key, cs.opts.maxPendingPerClient):
 		return a, ErrPendingLimit
 	}
 	a.counted = true
@@ -344,9 +347,9 @@ func (m *Mux) freeAdmitted(a *admission) {
 // if any, toward banning the client, unless the client is a peer trusted to
 // send PROXY headers that sent none. It reports whether that banned the
 // client.
-func (m *Mux) releaseAdmitted(l *listener, a admission, held bool, err error) (banned bool) {
+func (m *Mux) releaseAdmitted(l *listener, a *admission, cs *connSettings, held bool, err error) (banned bool) {
 	if held {
-		m.freeAdmitted(&a)
+		m.freeAdmitted(a)
 	}
 	// A peer trusted to send PROXY headers, such as a load balancer, is not
 	// banned for its own failures, which would refuse every client behind
@@ -354,30 +357,30 @@ func (m *Mux) releaseAdmitted(l *listener, a admission, held bool, err error) (b
 	if a.proxied && !a.header {
 		return false
 	}
-	if o, _ := m.settings(l.entry); err != nil && o.banFailures > 0 && o.banTime > 0 && a.client.IsValid() && banWorthy(err) {
-		return m.bans.fail(m.banKey(l.entry, a.client), m.bans.now(), o.banFailures, o.banWindow, o.banTime)
+	if o := cs.opts; err != nil && o.banFailures > 0 && o.banTime > 0 && a.client.IsValid() && banWorthy(err) {
+		return m.bans.fail(cs.banKey(l.entry, a.client), m.bans.now(), o.banFailures, o.banWindow, o.banTime)
 	}
 	return false
 }
 
 // serveAccepted serves a connection from Serve in its own goroutine, which
 // then runs the handler of its route, if any.
-func (m *Mux) serveAccepted(c net.Conn, a admission, l *listener, at arrival) {
-	handler, conn, _ := m.serveConn(c, l, a, l.entry, at)
+func (m *Mux) serveAccepted(c net.Conn, a admission, cs *connSettings, l *listener, at arrival) {
+	handler, conn, _ := m.serveConn(c, l, a, cs, l.entry, at)
 	if handler != nil {
-		_ = m.runHandler(handler, conn)
+		_ = m.runHandler(handler, conn, cs)
 	}
 }
 
-// runHandler calls the handler of a route with conn. A panic is recovered:
-// the connection is closed and the panic reported as a *PanicError, to the
-// observer and to the caller.
-func (m *Mux) runHandler(handler func(*Conn), conn *Conn) (err error) {
+// runHandler calls the handler of a route with conn, a connection of the
+// settings cs. A panic is recovered: the connection is closed and the panic
+// reported as a *PanicError, to the observer and to the caller.
+func (m *Mux) runHandler(handler func(*Conn), conn *Conn, cs *connSettings) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = &PanicError{Value: p, Stack: debug.Stack()}
 			_ = conn.Close()
-			m.observe(Event{Entry: conn.entry, Remote: conn.RemoteAddr(), Local: conn.LocalAddr(), Route: conn.route, Err: err})
+			m.observeWith(cs.opts.observer, conn.event(err))
 		}
 	}()
 	handler(conn)
@@ -414,9 +417,10 @@ func (m *Mux) serveOne(entry string, c net.Conn) error {
 		return net.ErrClosed
 	}
 	counts.accepted.Add(1)
-	handler, conn, err := m.serveConn(c, nil, admission{}, entry, at)
+	cs := m.settings(entry)
+	handler, conn, err := m.serveConn(c, nil, admission{}, cs, entry, at)
 	if handler != nil {
-		err = m.runHandler(handler, conn)
+		err = m.runHandler(handler, conn, cs)
 	}
 	return err
 }
@@ -568,8 +572,10 @@ func addrString(a net.Addr) string {
 // acquireSlot takes a pending slot for a new connection. At the limit it
 // closes the oldest undecided connection, whose goroutine frees its slot as it
 // exits, and waits. It reports false when the Mux stops taking connections.
+// The limit, which bounds the Mux as a whole, is read again at each try, so
+// that a higher one lets a waiting Serve go on.
 func (m *Mux) acquireSlot() bool {
-	if m.slots.tryAcquire(m.opts.Load().maxPending) {
+	if m.slots.tryAcquire(m.options().maxPending) {
 		return true
 	}
 	m.undelivered.evictOldest()
@@ -578,7 +584,7 @@ func (m *Mux) acquireSlot() bool {
 	for {
 		// Checked after registering as a waiter, so that no release is
 		// missed.
-		if m.slots.tryAcquire(m.opts.Load().maxPending) {
+		if m.slots.tryAcquire(m.options().maxPending) {
 			if m.slots.waiters.Load() > 1 {
 				m.slots.signal() // another slot may be free for the next waiter
 			}
