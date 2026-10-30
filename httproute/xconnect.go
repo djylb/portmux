@@ -74,7 +74,7 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 	}
 	if res.StatusCode != http.StatusSwitchingProtocols {
 		// A refusal goes to the client as it is.
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 		w.WriteHeader(res.StatusCode)
 		_, _ = io.Copy(w, res.Body)
 		return
@@ -82,7 +82,7 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 	if b, ok := res.Body.(io.ReadWriteCloser); ok {
 		backend = b // with the idle timeout of modifyResponse
 	}
-	defer backend.Close()
+	defer func() { _ = backend.Close() }()
 	defer context.AfterFunc(req.Context(), func() { _ = backend.Close() })()
 	rs.status = http.StatusOK
 	w.WriteHeader(http.StatusOK)

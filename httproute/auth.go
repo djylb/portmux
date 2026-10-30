@@ -236,7 +236,12 @@ func (c *authCache) add(id [32]byte) {
 	}
 	c.index[id] = c.order.PushFront(&cached{id: id, expires: expires})
 	for c.order.Len() > c.size {
+		// order and index hold the same entries, so a list longer than
+		// size has a last one.
 		last := c.order.Back()
+		if last == nil {
+			break
+		}
 		c.order.Remove(last)
 		delete(c.index, last.Value.(*cached).id)
 	}

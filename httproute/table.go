@@ -23,11 +23,11 @@ import (
 // use, also by several Routers.
 type Table struct {
 	routes     []*route
-	levels     bool                     // some route has an exact path or a regexp
 	hosts      *hostmatch.Map[[]*route] // filled by Build, never changed after
 	upstreams  []*upstream
 	errorPages map[int]*page
 	resolver   *forwarded.Resolver
+	levels     bool // some route has an exact path or a regexp
 	abort      bool // AbortNoRoute
 }
 
@@ -36,10 +36,7 @@ type route struct {
 	name     string
 	index    int
 	path     string
-	exact    bool
 	upgrades []string
-	ci       bool           // CaseInsensitivePath
-	raw      bool           // Path ended with '*': a prefix of bytes, not segments
 	tls      *bool          // the TLS filter
 	re       *regexp.Regexp // PathRegexp
 	methods  []string
@@ -56,6 +53,9 @@ type route struct {
 	rewriter *httprewrite.Rewriter
 	handler  http.Handler // the action, wrapped
 	table    *Table
+	exact    bool
+	ci       bool // CaseInsensitivePath
+	raw      bool // Path ended with '*': a prefix of bytes, not segments
 }
 
 // upstream is an Upstream as a Table holds it, with defaults applied.
