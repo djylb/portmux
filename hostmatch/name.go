@@ -59,29 +59,6 @@ var hostTable = func() (t [128]bool) {
 	return t
 }()
 
-// glob reports whether name matches pattern, in which each '*' stands for one
-// or more bytes.
-func glob(pattern, name string) bool {
-	pi, ni := 0, 0
-	star, end := -1, 0 // the last star, and the end of the bytes it took
-	for ni < len(name) {
-		switch {
-		case pi < len(pattern) && pattern[pi] == '*':
-			star, end = pi, ni+1
-			pi, ni = pi+1, ni+1
-		case pi < len(pattern) && pattern[pi] == name[ni]:
-			pi, ni = pi+1, ni+1
-		case star >= 0:
-			// Let the last star take one more byte.
-			end++
-			pi, ni = star+1, end
-		default:
-			return false
-		}
-	}
-	return pi == len(pattern)
-}
-
 // NormalizeHost prepares an HTTP Host value or URL authority for matching:
 // its name as SplitHost returns it, normalized. A value with a port or
 // brackets but without a name, such as ":80" or "[]", is invalid, rather than

@@ -156,6 +156,7 @@ func TestPathIsResolved(t *testing.T) {
 		"/admin/..%2Fpublic", "/admin/%2e%2e/public", "/admin/x%2F..%2F..%2Fpublic", "/%2e/x",
 		"/public/..;/admin", "/public/.;x/admin", "/;x/admin", "/public\\..\\admin", "/a%5Cb",
 		"/public#/../admin", "/p?x=1#&admin=1", "/a/%zz", "http://h/a/%2e%2e/b",
+		"/api%00.php", "/a%0Ab", "/a%7F", "http://h/a%0Db",
 	} {
 		if _, err := Parse([]byte("GET " + target + " HTTP/1.1\r\nHost: h\r\n\r\n")); !errors.Is(err, ErrInvalid) {
 			t.Errorf("%s: %v", target, err)

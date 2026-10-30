@@ -328,16 +328,11 @@ func (r *Request) finish() bool {
 		if i := strings.IndexByte(raw, '?'); i >= 0 {
 			raw = raw[:i]
 		}
-		if ambiguousPath(raw) {
+		p, err := CleanPath(raw)
+		if err != nil {
 			return false
 		}
-		if strings.IndexByte(raw, '%') >= 0 {
-			var err error
-			if raw, err = url.PathUnescape(raw); err != nil {
-				return false
-			}
-		}
-		r.Path = cleanPath(raw)
+		r.Path = p
 	case target == "*":
 		r.Path = "*"
 	case r.Method == "CONNECT":
@@ -360,13 +355,54 @@ func (r *Request) finish() bool {
 			}
 			r.Host = u.Host
 		}
-		if ambiguousPath(u.EscapedPath()) {
+		p, err := CleanPath(u.EscapedPath())
+		if err != nil {
 			return false
 		}
-		r.Path = cleanPath(u.Path)
+		r.Path = p
 	}
 	r.name, r.prepared = hostmatch.NormalizeHost(r.Host), true
 	return true
+}
+
+// CleanPath decodes an escaped request path, such as the path of an
+// origin-form request target, and resolves it as Request.Path is resolved:
+// "." and ".." segments and repeated slashes are removed, a trailing slash
+// is kept and an empty path becomes "/". It returns ErrInvalid for a path
+// that servers resolve differently, as Parse rejects it: a segment that
+// becomes "." or ".." only once decoded, a backslash, an empty segment with
+// ";" parameters before another segment, an invalid escape, or a control
+// character (0x00 to 0x1F and 0x7F) once decoded. A path that
+// is clean and has no escapes is returned without allocating.
+func CleanPath(escaped string) (string, error) {
+	if ambiguousPath(escaped) {
+		return "", ErrInvalid
+	}
+	p := escaped
+	if strings.IndexByte(p, '%') >= 0 {
+		var err error
+		if p, err = url.PathUnescape(p); err != nil {
+			return "", ErrInvalid
+		}
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < ' ' || p[i] == 0x7f {
+			return "", ErrInvalid
+		}
+	}
+	return cleanPath(p), nil
+}
+
+// HasPathPrefix reports whether path, as CleanPath returns it, is prefix or
+// lies below it by whole segments: "/api" has the prefix "/api" and is below
+// it, as are "/api/v1" and "/api;v=1", whose ";" starts the parameters that
+// Tomcat and Jetty remove, but "/apis" is not; a prefix that ends with "/",
+// such as "/api/", takes only paths below it.
+func HasPathPrefix(path, prefix string) bool {
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	return len(path) == len(prefix) || strings.HasSuffix(prefix, "/") || path[len(prefix)] == '/' || path[len(prefix)] == ';'
 }
 
 // ambiguousPath reports whether an escaped path has a segment that servers

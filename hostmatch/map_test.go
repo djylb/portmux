@@ -11,19 +11,20 @@ import (
 
 func TestMapPrecedence(t *testing.T) {
 	var m Map[string]
-	for _, p := range []string{"*", "*.example.com", "*.api.example.com", "api-*.example.com", "a*.example.com", "WWW.Example.com.", "", "*-*.example.com"} {
+	for _, p := range []string{"*", "*.example.com", "*.api.example.com", ".api.example.com", ".shop.example.com", "WWW.Example.com.", "", "shop.example.com"} {
 		m.Set(p, p)
 	}
 	tests := []struct{ host, want string }{
-		{"www.example.com", "WWW.Example.com."},    // exact, compared lowercased
-		{"WWW.EXAMPLE.COM.", "WWW.Example.com."},   // normalized like the patterns
-		{"x.api.example.com", "*.api.example.com"}, // the longer suffix
-		{"api-1.example.com", "api-*.example.com"}, // more literal characters than *.example.com
-		{"ab.example.com", "a*.example.com"},       // 13 literal characters against 12
-		{"x-y.example.com", "*-*.example.com"},     // likewise
+		{"www.example.com", "WWW.Example.com."},      // exact, compared lowercased
+		{"WWW.EXAMPLE.COM.", "WWW.Example.com."},     // normalized like the patterns
+		{"x.api.example.com", "*.api.example.com"},   // the longer suffix; "*." before "."
+		{"a.b.api.example.com", "*.api.example.com"}, // any depth
+		{"api.example.com", ".api.example.com"},      // "." takes the name itself
+		{"shop.example.com", "shop.example.com"},     // the exact name before "."
+		{"x.shop.example.com", ".shop.example.com"},  // a longer suffix than *.example.com
+		{"api-1.example.com", "*.example.com"},
 		{"b.example.com", "*.example.com"},
-		{"api-x.api.example.com", "*.api.example.com"}, // the suffix has more literal characters
-		{"example.com", "*"},                           // '*' takes at least one byte
+		{"example.com", "*"}, // "*." needs a label before it
 		{"other.org", "*"},
 		{"", ""},                 // no name
 		{"a@b.example.com", "-"}, // never matches
@@ -45,7 +46,7 @@ func TestMapPrecedence(t *testing.T) {
 		t.Fatalf("Len = %d", m.Len())
 	}
 	all := maps.Collect(m.All())
-	if len(all) != 8 || all["www.example.com"] != "WWW.Example.com." || all["*.api.example.com"] != "*.api.example.com" {
+	if len(all) != 8 || all["www.example.com"] != "WWW.Example.com." || all[".api.example.com"] != ".api.example.com" {
 		t.Fatalf("All = %v", all)
 	}
 
@@ -54,7 +55,7 @@ func TestMapPrecedence(t *testing.T) {
 	if v, ok := m.Get("*.EXAMPLE.com"); !ok || v != "suffix" || m.Len() != 8 {
 		t.Fatalf("Get = %q, %v, Len %d", v, ok, m.Len())
 	}
-	for _, p := range []string{"api-*.example.com", "*.example.com", "*", "www.example.com"} {
+	for _, p := range []string{".api.example.com", "*.api.example.com", "*", "www.example.com"} {
 		if !m.Delete(p) {
 			t.Fatalf("Delete(%q) = false", p)
 		}
@@ -62,13 +63,16 @@ func TestMapPrecedence(t *testing.T) {
 	if m.Delete("*") || m.Delete("nothing") || m.Len() != 4 {
 		t.Fatalf("second Delete, Len %d", m.Len())
 	}
-	if v, _, _ := m.Lookup("api-1.example.com"); v != "a*.example.com" {
+	if v, _, _ := m.Lookup("x.api.example.com"); v != "suffix" {
 		t.Fatalf("after Delete: %q", v)
+	}
+	if _, _, ok := m.Lookup("api.example.com"); !ok {
+		t.Fatal("api.example.com lost *.example.com")
 	}
 	if _, _, ok := m.Lookup("other.org"); ok {
 		t.Fatal("other.org matched after deleting *")
 	}
-	for _, p := range []string{"*", "api-*.example.com", "x.example.com"} {
+	for _, p := range []string{"*", ".api.example.com", "x.example.com"} {
 		if _, ok := m.Get(p); ok {
 			t.Fatalf("Get(%q) after Delete", p)
 		}
@@ -83,7 +87,7 @@ func TestMapConcurrent(t *testing.T) {
 			for i := range 200 {
 				p := fmt.Sprintf("*.h%d-%d.example.com", w, i)
 				m.Set(p, i)
-				m.Set(fmt.Sprintf("x*.h%d-%d.example.com", w, i), i)
+				m.Set(fmt.Sprintf(".x.h%d-%d.example.com", w, i), i)
 				if v, _, ok := m.Lookup(fmt.Sprintf("a.h%d-%d.example.com", w, i)); !ok || v != i {
 					t.Errorf("Lookup = %d, %v", v, ok)
 					return
@@ -110,14 +114,15 @@ func TestMapLongNames(t *testing.T) {
 	}
 	m.Set("*.example.com", 1)
 	m.Set("*.a.a.a.x.example.com", 2)
-	m.Set("a*.x.example.com", 3)
+	m.Set(".x.example.com", 3)
 	for _, tt := range []struct {
 		name string
 		want int
 	}{
 		{long, 2},
+		{"x.example.com", 3},
 		{"ab.x.example.com", 3},
-		{"b.x.example.com", 1},
+		{"b.example.com", 1},
 	} {
 		if v, _, ok := m.Lookup(tt.name); !ok || v != tt.want {
 			t.Errorf("Lookup(%.20q) = %d, %v, want %d", tt.name, v, ok, tt.want)
@@ -169,14 +174,14 @@ func BenchmarkMapLookup(b *testing.B) {
 
 func TestMapMatches(t *testing.T) {
 	var m Map[int]
-	for i, p := range []string{"*", "*.example.com", "*.b.example.com", "a.b.example.com", "a*.example.com", "*-*.example.com", "*.com", "a.b.*.com", ""} {
+	for i, p := range []string{"*", "*.example.com", "*.b.example.com", "a.b.example.com", ".example.com", ".a.b.example.com", "*.com", ""} {
 		m.Set(p, i)
 	}
 	var got []string
 	for pattern := range m.Matches("A.B.Example.COM.") {
 		got = append(got, pattern)
 	}
-	want := []string{"a.b.example.com", "*.b.example.com", "a*.example.com", "*.example.com", "a.b.*.com", "*.com", "*"}
+	want := []string{"a.b.example.com", ".a.b.example.com", "*.b.example.com", "*.example.com", ".example.com", "*.com", "*"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("Matches = %q, want %q", got, want)
 	}
@@ -205,12 +210,15 @@ func TestMapMatches(t *testing.T) {
 // FuzzMap checks Matches and Lookup against Set: every pattern that
 // matches is yielded once, most specific first, and Lookup returns the first.
 func FuzzMap(f *testing.F) {
-	f.Add("*.example.com|a*.example.com|*-*.example.com|*|www.example.com", "a-b.example.com")
-	f.Add("*.b.c|*.c|a.*.c|*c", "a.b.c")
+	f.Add("*.example.com|.example.com|.b.example.com|*|www.example.com", "a.b.example.com")
+	f.Add("*.b.c|*.c|.c|.b.c|a.b.c", "a.b.c")
 	f.Fuzz(func(t *testing.T, patterns, host string) {
 		var m Map[string]
 		set := map[string]string{} // normalized pattern -> the last one set
 		for p := range strings.SplitSeq(patterns, "|") {
+			if CheckPattern(p) != nil {
+				continue
+			}
 			m.Set(p, p)
 			set[parseHostPattern(p).String()] = p
 		}
@@ -230,19 +238,19 @@ func FuzzMap(f *testing.F) {
 		if len(got) != len(want) {
 			t.Fatalf("Matches(%q) = %q, matching patterns %q", host, got, want)
 		}
+		name := Normalize(host).String()
 		rank := func(p string) [3]int {
 			switch {
 			case p == "*":
 				return [3]int{0, 0, 0}
-			case !strings.Contains(p, "*"):
+			case strings.HasPrefix(p, "*."):
+				return [3]int{1, len(p) - 1, 1}
+			case strings.HasPrefix(p, ".") && p[1:] != name:
+				return [3]int{1, len(p), 0}
+			case strings.HasPrefix(p, "."):
 				return [3]int{2, 0, 0}
 			}
-			lit := len(p) - strings.Count(p, "*")
-			suffix := 0
-			if strings.HasPrefix(p, "*.") && !strings.Contains(p[2:], "*") {
-				suffix = 1
-			}
-			return [3]int{1, lit, suffix}
+			return [3]int{3, 0, 0}
 		}
 		for i := 1; i < len(got); i++ {
 			a, b := rank(got[i-1]), rank(got[i])

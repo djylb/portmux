@@ -1,6 +1,7 @@
 package hostmatch
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -54,20 +55,45 @@ func TestSetWildcards(t *testing.T) {
 		pattern, host string
 		want          bool
 	}{
-		{"api-*.example.com", "api-1.example.com", true},
-		{"api-*.example.com", "API-x.y.Example.com.", true},
-		{"api-*.example.com", "api-.example.com", false},
-		{"api-*.example.com", "www.example.com", false},
-		{"*.*.example.com", "a.b.example.com", true},
-		{"*.*.example.com", "a.example.com", false},
-		{"*example.com", "myexample.com", true},
-		{"*example.com", "example.com", false},
-		{"www.*", "www.example.org", true},
+		{"*.example.com", "a.b.example.com", true}, // any depth
+		{"*.example.com", "example.com", false},
+		{".example.com", "example.com", true},
+		{".example.com", "A.b.Example.com.", true},
+		{".example.com", "badexample.com", false},
 		{"*.example.com", "evil@x.example.com", false},
 	}
 	for _, tt := range tests {
 		if got := NewSet(tt.pattern).Match(tt.host); got != tt.want {
 			t.Errorf("%q on %q = %v, want %v", tt.pattern, tt.host, got, tt.want)
+		}
+	}
+}
+
+func TestRefusedPatternsPanic(t *testing.T) {
+	for _, f := range []func(){
+		func() { NewSet("api-*.example.com") },
+		func() { var m Map[int]; m.Set("*a.example.com", 1) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Error("no panic")
+				}
+			}()
+			f()
+		}()
+	}
+}
+
+func TestCheckPattern(t *testing.T) {
+	for _, p := range []string{"", "*", "a.com", "*.a.com", ".a.com", "A.Com.", "x_y.a.com", "::1", "10.0.0.1"} {
+		if err := CheckPattern(p); err != nil {
+			t.Errorf("%q: %v", p, err)
+		}
+	}
+	for _, p := range []string{"*a.com", "*-x.a.com", "api-*.a.com", "a.*.com", "**.a.com", "a..com", "*.", ".", "bücher.de", "a@b.com", "a b.com", "[::1]", "a%b.com"} {
+		if err := CheckPattern(p); !errors.Is(err, ErrPattern) {
+			t.Errorf("%q: %v", p, err)
 		}
 	}
 }

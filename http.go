@@ -35,9 +35,10 @@ func (h httpMatcher) String() string { return call("HTTP1", h, describe[HTTPFilt
 
 // Host accepts requests whose host, without its port, matches one of the
 // patterns. Patterns work as in SNI; the empty pattern accepts a request
-// without a host.
+// without a host. It panics on a pattern that hostmatch.CheckPattern
+// refuses.
 func Host(patterns ...string) HTTPFilter {
-	return hostFilter{patterns: slices.Clone(patterns), hosts: hostmatch.NewSet(patterns...)}
+	return hostFilter{patterns: slices.Clone(patterns), hosts: hostSet(patterns)}
 }
 
 type hostFilter struct {
@@ -76,22 +77,11 @@ type listFilter struct {
 func (f listFilter) Match(r *httphead.Request) bool {
 	v := f.field(r)
 	for _, want := range f.values {
-		if v == want || f.prefix && hasPathPrefix(v, want) {
+		if v == want || f.prefix && httphead.HasPathPrefix(v, want) {
 			return true
 		}
 	}
 	return false
-}
-
-// hasPathPrefix reports whether path is prefix or lies below it, at a
-// segment boundary.
-func hasPathPrefix(path, prefix string) bool {
-	if !strings.HasPrefix(path, prefix) {
-		return false
-	}
-	// ';' starts the parameters of the last segment, which Tomcat and Jetty
-	// remove.
-	return len(path) == len(prefix) || strings.HasSuffix(prefix, "/") || path[len(prefix)] == '/' || path[len(prefix)] == ';'
 }
 
 // Query accepts requests whose query string has the parameter with one of

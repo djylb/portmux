@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/tlshello"
 )
@@ -224,7 +225,7 @@ func init() {
 		"And":       variadic((*parser).matcher, And),
 		"Or":        variadic((*parser).matcher, Or),
 		"Prefix":    variadic((*parser).str, Prefix),
-		"Domain":    variadic((*parser).str, Domain),
+		"Domain":    variadic((*parser).hostPattern, Domain),
 		"RemoteIP":  variadic((*parser).prefix, RemoteIP),
 		"LocalIP":   variadic((*parser).prefix, LocalIP),
 		"LocalPort": variadic((*parser).port, LocalPort),
@@ -258,7 +259,7 @@ func init() {
 		}},
 	}
 	builtinHTTPFilters = map[string]builtin[HTTPFilter]{
-		"Host":       variadic((*parser).str, Host),
+		"Host":       variadic((*parser).hostPattern, Host),
 		"Path":       variadic((*parser).str, Path),
 		"PathPrefix": variadic((*parser).str, PathPrefix),
 		"Method":     variadic((*parser).str, Method),
@@ -281,7 +282,7 @@ func init() {
 	}
 	addFilterSets(builtinHTTPFilters, (*parser).httpFilter)
 	builtinTLSFilters = map[string]builtin[TLSFilter]{
-		"SNI":       variadic((*parser).str, SNI),
+		"SNI":       variadic((*parser).hostPattern, SNI),
 		"ALPN":      variadic((*parser).str, ALPN),
 		"SNIRegexp": oneRegexp(SNIRegexp),
 		"MinTLSVersion": {1, 1, func(p *parser, args []*node) (TLSFilter, error) {
@@ -481,6 +482,18 @@ func (p *parser) str(n *node) (string, error) {
 		return "", p.fail(n.pos, "expected a string")
 	}
 	return n.text, nil
+}
+
+// hostPattern is a string that hostmatch.CheckPattern accepts.
+func (p *parser) hostPattern(n *node) (string, error) {
+	s, err := p.str(n)
+	if err != nil {
+		return "", err
+	}
+	if err := hostmatch.CheckPattern(s); err != nil {
+		return "", p.fail(n.pos, "%v", err)
+	}
+	return s, nil
 }
 
 func (p *parser) regexp(n *node) (*regexp.Regexp, error) {

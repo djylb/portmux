@@ -7,9 +7,21 @@ import "github.com/djylb/portmux/hostmatch"
 // HTTP/1.x and h2c requests by their host, so that one matcher routes a
 // site's HTTPS and HTTP traffic. Patterns work as in hostmatch.Set; it is short for
 // Or(TLS(SNI(patterns...)), HTTP1(Host(patterns...)),
-// HTTP2(Host(patterns...))).
+// HTTP2(Host(patterns...))). It panics on a pattern that
+// hostmatch.CheckPattern refuses.
 func Domain(patterns ...string) Matcher {
-	return domainMatcher{set: hostmatch.NewSet(patterns...)}
+	return domainMatcher{set: hostSet(patterns)}
+}
+
+// hostSet returns the set of patterns, which must pass
+// hostmatch.CheckPattern; ParseMatcher checks them before.
+func hostSet(patterns []string) *hostmatch.Set {
+	for _, p := range patterns {
+		if err := hostmatch.CheckPattern(p); err != nil {
+			panic("portmux: " + err.Error())
+		}
+	}
+	return hostmatch.NewSet(patterns...)
 }
 
 type domainMatcher struct {

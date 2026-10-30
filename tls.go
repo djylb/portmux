@@ -30,12 +30,14 @@ func (t tlsMatcher) Match(in *Input) Result {
 
 func (t tlsMatcher) String() string { return call("TLS", t, describe[TLSFilter]) }
 
-// SNI accepts ClientHellos whose server name matches one of the patterns. A
-// pattern is a host name, "*.example.com" for any name below example.com, or
-// "*" for any name. The empty pattern accepts a ClientHello without SNI.
-// Names compare case-insensitively.
+// SNI accepts ClientHellos whose server name matches one of the patterns,
+// as hostmatch.Set matches them: a host name, "*.example.com" for any name
+// below example.com, ".example.com" for example.com and the names below
+// it, or "*" for any name. The empty pattern accepts a ClientHello without
+// SNI. Names compare case-insensitively. It panics on a pattern that
+// hostmatch.CheckPattern refuses.
 func SNI(patterns ...string) TLSFilter {
-	return sniFilter{patterns: slices.Clone(patterns), hosts: hostmatch.NewSet(patterns...)}
+	return sniFilter{patterns: slices.Clone(patterns), hosts: hostSet(patterns)}
 }
 
 type sniFilter struct {

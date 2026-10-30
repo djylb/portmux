@@ -1,45 +1,44 @@
 package hostmatch
 
 import (
-	"cmp"
 	"iter"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
 
 // Map maps host name patterns to values and looks names up by specificity,
-// as virtual hosts are chosen. Patterns are those of Set.
-// The patterns that match a name rank, most specific first:
+// as virtual hosts are chosen. Patterns are those of Set. The patterns that
+// match a name rank, most specific first:
 //
 //   - the exact name;
-//   - the patterns with '*' by the number of their literal characters, so
-//     that "*.api.example.com" comes before "*.example.com" and
-//     "api-*.example.com" before both for "api-1.example.com"; on a tie a
-//     "*." pattern comes first, then the pattern with fewer '*', then the
-//     lower one in byte order;
+//   - ".name", which takes the name itself as well as the names below it;
+//   - the wildcards by the length of their suffix, so that
+//     "*.api.example.com" comes before "*.example.com" for
+//     "v1.api.example.com", and ".api.example.com" before "*.example.com";
+//     of a "*." and a "." pattern with the same suffix, the "*." one first;
 //   - "*", which matches any name.
 //
 // Lookup returns the first of them, LookupFunc the first whose value a
 // function accepts, and Matches all of them in this order, so that a policy
-// of your own can skip patterns whose values do not apply. The
-// empty pattern matches a ClientHello or request without a name. Names with
-// bytes that no DNS name has match no pattern.
+// of your own can skip patterns whose values do not apply. The empty pattern
+// matches a ClientHello or request without a name. Names with bytes that no
+// DNS name has match no pattern. Set panics on patterns that CheckPattern
+// refuses, such as "api-*.example.com", which older versions matched.
 //
-// A Map is safe for concurrent use, and its zero value is an empty map
-// ready to use. Lookups take no lock; exact names and "*." patterns cost a few
-// map lookups whatever their number, while the other patterns with '*' are
-// tried one by one, and setting or deleting one of those copies them.
-// Patterns can be set and deleted while lookups run.
+// A Map is safe for concurrent use, and its zero value is an empty map ready
+// to use. Lookups take no lock and cost a few map lookups whatever the
+// number of patterns. Patterns can be set and deleted while lookups run.
 type Map[V any] struct {
 	exact    sync.Map // name -> *hostEntry[V]
+	self     sync.Map // "example.com" -> *hostEntry[V], for ".example.com"
 	suffixes sync.Map // ".example.com" -> *hostEntry[V], for "*.example.com"
+	dots     sync.Map // ".example.com" -> *hostEntry[V], for ".example.com"
 	// longest is the length of the longest suffix ever set, so that a lookup
 	// tries only the dots at which a suffix can start, however long the name.
 	longest atomic.Int64
-	mu      sync.Mutex
-	rest    atomic.Pointer[hostRest[V]] // the other patterns, replaced on change
+	any     atomic.Pointer[hostEntry[V]]
+	mu      sync.Mutex // serialises changes of "*" and ".name" patterns
 	n       atomic.Int64
 }
 
@@ -49,42 +48,34 @@ type hostEntry[V any] struct {
 	value   V
 }
 
-// hostRest holds the patterns that are not exact names or "*." suffixes.
-type hostRest[V any] struct {
-	globs []hostGlob[V] // in matching order
-	any   *hostEntry[V] // "*", or nil
-}
-
-type hostGlob[V any] struct {
-	hostEntry[V]
-	literal int // number of bytes that are not '*'
-	stars   int
-}
-
 // hostPattern is a pattern normalized as Set compares it.
 type hostPattern struct {
-	key  string // the name, the suffix with its leading dot, or the pattern
+	key  string // the name, or the suffix with its leading dot
 	kind uint8
 }
 
 const (
-	patternExact uint8 = iota
-	patternSuffix
-	patternGlob
-	patternAny
+	patternExact  uint8 = iota // also patterns that match nothing
+	patternSuffix              // "*.example.com"
+	patternDot                 // ".example.com"
+	patternAny                 // "*"
 )
 
 func parseHostPattern(p string) hostPattern {
-	p = strings.ToLower(strings.TrimSuffix(p, "."))
+	p = strings.ToLower(p)
+	if p != "." {
+		p = strings.TrimSuffix(p, ".")
+	}
 	switch {
 	case p == "*":
 		return hostPattern{kind: patternAny}
-	case !strings.Contains(p, "*"):
-		return hostPattern{key: p, kind: patternExact}
-	case strings.HasPrefix(p, "*.") && !strings.Contains(p[2:], "*"):
+	case strings.HasPrefix(p, "*.") && len(p) > 2:
 		return hostPattern{key: p[1:], kind: patternSuffix}
+	case strings.HasPrefix(p, ".") && len(p) > 1:
+		return hostPattern{key: p, kind: patternDot}
 	}
-	return hostPattern{key: p, kind: patternGlob}
+	// A name, or a pattern with '*' elsewhere, which no name matches.
+	return hostPattern{key: p, kind: patternExact}
 }
 
 // String returns the pattern as it compares.
@@ -94,55 +85,45 @@ func (p hostPattern) String() string {
 		return "*" + p.key
 	case patternAny:
 		return "*"
-	default: // patternExact and patternGlob
+	default: // patternExact and patternDot
 		return p.key
 	}
 }
 
-// Set maps pattern to v, replacing the value it had.
+// Set maps pattern to v, replacing the value it had. It panics on a
+// pattern that CheckPattern refuses.
 func (m *Map[V]) Set(pattern string, v V) {
+	mustPattern(pattern)
 	p := parseHostPattern(pattern)
 	e := &hostEntry[V]{pattern: p.String(), value: v}
+	var loaded bool
 	switch p.kind {
 	case patternExact:
-		if _, loaded := m.exact.Swap(p.key, e); !loaded {
-			m.n.Add(1)
-		}
+		_, loaded = m.exact.Swap(p.key, e)
 	case patternSuffix:
-		// Raised before the suffix is stored, so that lookups that find it
-		// also try its dot.
-		for n := int64(len(p.key)); ; {
-			if cur := m.longest.Load(); cur >= n || m.longest.CompareAndSwap(cur, n) {
-				break
-			}
+		m.raiseLongest(len(p.key))
+		_, loaded = m.suffixes.Swap(p.key, e)
+	case patternDot:
+		m.mu.Lock()
+		m.raiseLongest(len(p.key))
+		_, loaded = m.dots.Swap(p.key, e)
+		m.self.Store(p.key[1:], e)
+		m.mu.Unlock()
+	case patternAny:
+		loaded = m.any.Swap(e) != nil
+	}
+	if !loaded {
+		m.n.Add(1)
+	}
+}
+
+// raiseLongest raises longest before a suffix is stored, so that lookups
+// that find the suffix also try its dot.
+func (m *Map[V]) raiseLongest(n int) {
+	for {
+		if cur := m.longest.Load(); cur >= int64(n) || m.longest.CompareAndSwap(cur, int64(n)) {
+			return
 		}
-		if _, loaded := m.suffixes.Swap(p.key, e); !loaded {
-			m.n.Add(1)
-		}
-	default:
-		m.changeRest(func(r *hostRest[V]) bool {
-			if p.kind == patternAny {
-				added := r.any == nil
-				r.any = e
-				return added
-			}
-			if i := r.index(p.key); i >= 0 {
-				r.globs[i].hostEntry = *e
-				return false
-			}
-			literal := len(p.key) - strings.Count(p.key, "*")
-			r.globs = append(r.globs, hostGlob[V]{hostEntry: *e, literal: literal, stars: len(p.key) - literal})
-			slices.SortFunc(r.globs, func(a, b hostGlob[V]) int {
-				if c := cmp.Compare(b.literal, a.literal); c != 0 {
-					return c
-				}
-				if c := cmp.Compare(a.stars, b.stars); c != 0 {
-					return c
-				}
-				return strings.Compare(a.pattern, b.pattern)
-			})
-			return true
-		})
 	}
 }
 
@@ -155,41 +136,18 @@ func (m *Map[V]) Delete(pattern string) bool {
 		_, deleted = m.exact.LoadAndDelete(p.key)
 	case patternSuffix:
 		_, deleted = m.suffixes.LoadAndDelete(p.key)
-	default:
-		m.changeRest(func(r *hostRest[V]) bool {
-			if p.kind == patternAny {
-				deleted, r.any = r.any != nil, nil
-			} else if i := r.index(p.key); i >= 0 {
-				r.globs = slices.Delete(r.globs, i, i+1)
-				deleted = true
-			}
-			return false
-		})
+	case patternDot:
+		m.mu.Lock()
+		_, deleted = m.dots.LoadAndDelete(p.key)
+		m.self.Delete(p.key[1:])
+		m.mu.Unlock()
+	case patternAny:
+		deleted = m.any.Swap(nil) != nil
 	}
 	if deleted {
 		m.n.Add(-1)
 	}
 	return deleted
-}
-
-func (r *hostRest[V]) index(pattern string) int {
-	return slices.IndexFunc(r.globs, func(g hostGlob[V]) bool { return g.pattern == pattern })
-}
-
-// changeRest replaces the other patterns with a changed copy. change reports
-// whether it added a pattern.
-func (m *Map[V]) changeRest(change func(*hostRest[V]) bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var r hostRest[V]
-	if cur := m.rest.Load(); cur != nil {
-		r = *cur
-		r.globs = slices.Clone(cur.globs)
-	}
-	if change(&r) {
-		m.n.Add(1)
-	}
-	m.rest.Store(&r)
 }
 
 // Get returns the value of pattern itself, without matching.
@@ -200,17 +158,10 @@ func (m *Map[V]) Get(pattern string) (V, bool) {
 		e = loadEntry[V](&m.exact, p.key)
 	case patternSuffix:
 		e = loadEntry[V](&m.suffixes, p.key)
-	default:
-		r := m.rest.Load()
-		switch {
-		case r == nil:
-		case p.kind == patternAny:
-			e = r.any
-		default:
-			if i := r.index(p.key); i >= 0 {
-				e = &r.globs[i].hostEntry
-			}
-		}
+	case patternDot:
+		e = loadEntry[V](&m.dots, p.key)
+	case patternAny:
+		e = m.any.Load()
 	}
 	if e == nil {
 		var zero V
@@ -277,39 +228,24 @@ func (m *Map[V]) walk(n Name, yield func(string, V) bool) {
 	if n.name == "" {
 		return
 	}
-	r := m.rest.Load()
-	var globs []hostGlob[V]
-	if r != nil {
-		globs = r.globs
+	if e := loadEntry[V](&m.self, n.name); e != nil && !yield(e.pattern, e.value) {
+		return
 	}
-	// Suffixes come longest first, from the first dot on; a glob comes before
-	// a suffix with fewer literal characters than it has. Dots further from
+	// Suffixes come longest first, from the first dot on. Dots further from
 	// the end than the longest suffix start none.
-	g := 0
 	for i := max(1, len(n.name)-int(m.longest.Load())); i < len(n.name); i++ {
 		if n.name[i] != '.' {
 			continue
 		}
-		e := loadEntry[V](&m.suffixes, n.name[i:])
-		if e == nil {
-			continue
+		if e := loadEntry[V](&m.suffixes, n.name[i:]); e != nil && !yield(e.pattern, e.value) {
+			return
 		}
-		for ; g < len(globs) && globs[g].literal > len(n.name)-i; g++ {
-			if glob(globs[g].pattern, n.name) && !yield(globs[g].pattern, globs[g].value) {
-				return
-			}
-		}
-		if !yield(e.pattern, e.value) {
+		if e := loadEntry[V](&m.dots, n.name[i:]); e != nil && !yield(e.pattern, e.value) {
 			return
 		}
 	}
-	for ; g < len(globs); g++ {
-		if glob(globs[g].pattern, n.name) && !yield(globs[g].pattern, globs[g].value) {
-			return
-		}
-	}
-	if r != nil && r.any != nil {
-		yield(r.any.pattern, r.any.value)
+	if e := m.any.Load(); e != nil {
+		yield(e.pattern, e.value)
 	}
 }
 
@@ -337,23 +273,13 @@ func (m *Map[V]) All() iter.Seq2[string, V] {
 			more = yield(e.pattern, e.value)
 			return more
 		}
-		if m.exact.Range(each); !more {
-			return
-		}
-		if m.suffixes.Range(each); !more {
-			return
-		}
-		r := m.rest.Load()
-		if r == nil {
-			return
-		}
-		for _, g := range r.globs {
-			if !yield(g.pattern, g.value) {
+		for _, sm := range []*sync.Map{&m.exact, &m.suffixes, &m.dots} {
+			if sm.Range(each); !more {
 				return
 			}
 		}
-		if r.any != nil {
-			yield(r.any.pattern, r.any.value)
+		if e := m.any.Load(); e != nil {
+			yield(e.pattern, e.value)
 		}
 	}
 }

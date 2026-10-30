@@ -24,10 +24,11 @@ go get github.com/djylb/portmux
 | `portmux/tlshello`    | TLS ClientHello parser                                                     |
 | `portmux/httphead`    | HTTP/1.x and h2c request head parsers, with HPACK                          |
 | `portmux/fingerprint` | JA4 and JA3 fingerprints of ClientHellos, and filters by them              |
+| `portmux/httproute`   | HTTP request routing: reverse proxy, redirects, header rules, error pages  |
 
 A program carries only the packages it imports: the tool packages work without
-a Mux, only `fingerprint` imports hash functions, and nothing imports
-`net/http` or `crypto/tls`.
+a Mux, only `fingerprint` imports hash functions, and only `httproute` imports
+`net/http` and `crypto/tls`.
 
 ## Usage
 
@@ -129,12 +130,21 @@ func forward(l net.Listener, addr string) {
 | HTTP       | `Host`, `HostRegexp`, `Path`, `PathPrefix`, `PathRegexp`, `Method`, `Header`, `HeaderRegexp`, `Query`, `WebSocket` |
 | TLS        | `SNI`, `SNIRegexp`, `ALPN`, `MinTLSVersion`, `fingerprint.MatchJA4`, `fingerprint.MatchJA3`                        |
 
-- Host patterns are exact names or contain `*` for one or more characters:
-  `*.example.com`, `api-*.example.com`, `*`; `""` matches a hello or request
-  without a name. Names compare case-insensitively, and names with bytes that
-  no host name has, such as `@`, match nothing.
+- Host patterns are those of nginx and Envoy: an exact name;
+  `*.example.com`, any name below example.com at any depth (`a.b.example.com`
+  too) but not example.com itself; `.example.com`, example.com and every
+  name below it; `*`, any name; and `""`, a hello or request without a name.
+  No other wildcards exist: `*a.example.com`, `api-*.example.com` and
+  `a.*.com` are refused: `hostmatch.CheckPattern` reports them, and
+  `Host`, `SNI`, `Domain`, `hostmatch.NewSet` and `hostmatch.Map.Set` panic
+  on them, so check patterns from configurations first; `ParseMatcher`
+  and `httproute.Build` return errors. Note that a wildcard
+  certificate covers one level only: `*.example.com` routes `a.b.example.com`
+  but a certificate for `*.example.com` does not cover it. Names compare
+  case-insensitively and without a trailing dot, and names with bytes that
+  no host name has, such as `@` or any non-ASCII byte, match nothing.
 - Paths are decoded and resolved as servers resolve them, so `/public/../admin/`
-  is `/admin/`, and `PathPrefix("/api")` matches `/api` and `/api/v1` but not
+  is `/admin/`, a path with a control character once decoded is ruled out, and `PathPrefix("/api")` matches `/api` and `/api/v1` but not
   `/apis`.
 - Each protocol is parsed once per connection, incrementally, however many
   routes look at it.
@@ -327,7 +337,8 @@ func resolveSites(sites *hostmatch.Map[[2]*portmux.Route]) portmux.ResolveFunc {
 - A `ResolveFunc` sees everything about the connection and returns a route,
   `NeedMore` or `NoMatch`. Its matchers, if any, are conditions checked first.
 - `hostmatch.Map` looks a name up by the most specific pattern: the exact name,
-  then the pattern with the most literal characters, then `*`. `LookupFunc`
+  then `.name` for the name itself, then the wildcards by the length of
+  their suffix (`*.` before `.` on a tie), then `*`. `LookupFunc`
   and `Matches` fall back to wider patterns for policies of your own. Lookups
   take no lock, and allocate nothing for lowercase names and those that
   `Input` prepared.
@@ -568,12 +579,145 @@ reason. `Mux.Bans` lists the banned clients.
 portmux sees established TCP connections only: SYN floods are for the kernel,
 and delivered connections are the servers' to limit.
 
+## HTTP Routing
+
+`httproute` routes the requests on the connections that routes hand over, as
+a reverse proxy does: by host, path, method and header fields, to a backend
+that your dial function reaches, to a redirect or to a fixed response.
+
+```go
+// serveSites routes the HTTP and HTTPS connections of m by request.
+func serveSites(m *portmux.Mux, config *tls.Config, dial httproute.DialFunc) (*httproute.Router, error) {
+	headers, err := httprewrite.ParseRules(`
+X-Real-IP: ${remote_addr}
+X-Forwarded-Proto: ${scheme}
+`, httproute.Vars())
+	if err != nil {
+		return nil, err
+	}
+	table, err := httproute.Build(httproute.Config{
+		Upstreams: []httproute.Upstream{{Name: "app", Dial: dial, ResponseHeaderTimeout: 30 * time.Second}},
+		Routes: []httproute.Route{
+			{Name: "api", Hosts: []string{"*.example.com"}, Path: "/api", RedirectHTTPS: &httproute.HTTPSRedirect{},
+				Proxy: &httproute.Proxy{Upstream: "app", ReplacePath: "/"}, RequestHeaders: headers},
+			{Name: "old", Path: "/old", Redirect: &httproute.Redirect{
+				To: httprewrite.MustCompile("https://${host}/new${path_rest}", httproute.Vars()), Status: 301}},
+			{Name: "health", Path: "/healthz", Respond: &httproute.Respond{Body: []byte("ok")}},
+		},
+		ErrorPages: map[int]httproute.ErrorPage{502: {Body: []byte("<h1>Backend down</h1>")}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	router := httproute.New(httproute.Options{})
+	if err := router.Update(table); err != nil {
+		return nil, err
+	}
+	_, err = m.Add(portmux.RouteConfig{Name: "https", Matchers: []portmux.Matcher{portmux.TLS()},
+		Handler: func(c *portmux.Conn) { _ = router.ServeConn(tls.Server(c, config)) }})
+	if err != nil {
+		return nil, err
+	}
+	_, err = m.Add(portmux.RouteConfig{Name: "http", Matchers: []portmux.Matcher{portmux.HTTP1()},
+		Handler: func(c *portmux.Conn) { _ = router.ServeConn(c) }})
+	return router, err
+}
+```
+
+Of the routes whose host patterns match the request, and whose `Methods` and
+`Headers` fit it, the router takes:
+
+1. a route whose `Exact` path is the request's path;
+2. else the first route whose `PathRegexp` (Go `regexp`, linear time)
+   matches it;
+3. else the route with the longest `Path` prefix, by whole segments: `/api`
+   takes `/api`, `/api/v1` and `/api;v=1` but not `/apix`; `/api/` takes
+   only paths below it; `/api*` is a prefix of bytes and also takes `/apix`.
+
+Within a level, the most specific host pattern wins, as `hostmatch.Map`
+ranks them: the exact name, then the longer wildcard suffix
+(`*.api.example.com` before `*.example.com`), then `*`; then the route
+listed first. `Hosts: ["*"]` is the same as no `Hosts`: it takes requests
+without a host too. `PathRegexp` is not anchored, as nginx's `~` is not:
+`/admin` matches `/public/admin-ui`, so write `^/admin$` for whole paths.
+
+| Routes                                                      | Request                | Route                      |
+|-------------------------------------------------------------|------------------------|----------------------------|
+| `a.example.com` `/`, `*.example.com` `/api`                 | `a.example.com/api/x`  | `*.example.com` `/api`     |
+| `a.example.com` `/api`, `*.example.com` `/api`              | `a.example.com/api`    | `a.example.com` `/api`     |
+| `.example.com` `/`, `*` `/`                                 | `example.com/`         | `.example.com` `/`         |
+| `*.example.com` `= /login`, `a.example.com` `/login`        | `a.example.com/login`  | `*.example.com` `= /login` |
+| `a.example.com` `~ ^/u/\d+$`, `*.example.com` `~ ^/u/`      | `a.example.com/u/x`    | `*.example.com` `~ ^/u/`   |
+| `*` `/img*`, `*` `/`                                        | `x.org/img2/a.png`     | `*` `/img*`                |
+| `a.example.com` `/` with `Methods: POST`, `*` `/`           | `GET a.example.com/`   | `*` `/`                    |
+
+Paths are decoded and resolved as `httphead.CleanPath` does: requests
+whose path servers read differently, or that holds a control character once
+decoded, get 400, and so do hosts that are not ASCII host names. The
+backend gets the path the route was chosen by, with the client's escapes
+where they fit, unless `Proxy.SendRawPath` is set. `CaseInsensitivePath`
+serves backends that ignore case. `TLS` filters on whether the request came
+over TLS, by the connection or a trusted proxy alone. `Build` refuses
+routes that match the same requests as one before them for a host, and
+routes that one before them hides entirely.
+
+- `Build` checks a `Config` and returns an immutable `Table`; `Update`
+  replaces the table while serving, and requests keep the table they were
+  matched with. Upstreams whose settings stay the same keep their idle
+  connections.
+- A `DialFunc` gets the request's context and a `DialInfo` with the route,
+  host and client; it is where load balancing goes. A `*StatusError` it
+  returns sets the status, such as 503 for a backend that is offline;
+  other errors give 502 and timeouts 504. A connection serves later
+  requests of the upstream unless `DisableKeepAlives` is set.
+- Header rules, redirect targets, `Proxy.PathTemplate` and the `${...}` of
+  error pages are `httprewrite` variables, its own and those of `Vars`:
+  `route`, `route_path`, `path_rest`, `match_1` to `match_9` (the groups
+  of a `PathRegexp`) and `request_id`. Error pages escape values for HTML.
+  A rule on `Host` rewrites the host; without one the client's goes on.
+  Forwarding fields that clients send are dropped; rules add them, with
+  the client that `Config.Resolver` finds behind trusted proxies.
+- `Upstream.Addr` alone is enough to dial a backend over TCP. With `TLS`,
+  the server name is `ServerName`, else the name in `Addr`, else the
+  outgoing Host. `HTTP2` speaks HTTP/2 by ALPN over TLS and h2c without it,
+  upgrades staying on HTTP/1.1; `ProxyProtocol` sends a PROXY header of
+  version 1 or 2 with the client's address on each connection.
+- `Route.BasicAuth` checks Basic credentials against hashes from
+  `HashPassword` (PBKDF2-HMAC-SHA256 in a self-describing form), or a
+  `Verify` function of yours. Verified credentials are remembered for
+  `CacheTTL`, at most `CacheSize` of them, the least recently used dropped
+  first, until the table is replaced; at most one hash per CPU runs at a
+  time.
+- Upgrades are limited to `Route.Upgrades`, `websocket` by default; other
+  Upgrade fields and `HTTP2-Settings` are removed, so that no h2c upgrade
+  gets past the routes. Plain CONNECT gets 405; WebSockets over HTTP/2
+  (extended CONNECT) are routed by their path and passed to the backend
+  over HTTP/1.1. `net/http` accepts them when the program starts with
+  `GODEBUG=http2xconnect=1`.
+- `Config.AbortNoRoute` closes the connection, or resets the HTTP/2
+  stream, instead of answering 404 when no route matches.
+- `${request_id}` is the `X-Request-Id` of a trusted proxy, else random.
+- `Route.UpgradeIdleTimeout` closes upgraded connections, such as
+  WebSockets, that carry nothing for a while.
+- Hop-by-hop fields are removed; upgrades such as WebSocket, trailers,
+  `Expect: 100-continue` and streaming responses pass through. With "h2" in
+  the TLS config's `NextProtos`, clients may use HTTP/2.
+- `ServeConn` serves a connection that a route hands over, plain or as a
+  `*tls.Conn`; `Serve` serves a listener such as a route; the Router is
+  also an `http.Handler`. A connection that wraps a TLS connection and has
+  a `NetConn` method, such as a `*portmux.Conn` of a nested Mux, gives its
+  requests the TLS state. `Route.Wrap` adds authentication, limits or
+  metrics of your own, and `Options.Observer` reports every request.
+- `Shutdown` and `Close` end upgraded connections too and wait for the
+  requests in progress to return.
+
 ## Without a Mux
 
 | Function                                                        | Use                                                       |
 |-----------------------------------------------------------------|-----------------------------------------------------------|
 | `Peek(c, m, sniffOpts...)`, `PeekAny(c, ms, sniffOpts...)`      | Sniff one connection, and tell which matcher took it      |
 | `tlshello.Parse`, `httphead.Parse`, `httphead.ParseHTTP2`       | Parse the first bytes of a connection                     |
+| `httphead.CleanPath`, `httphead.HasPathPrefix`                  | Resolve request paths and compare them as routes do       |
 | `tlshello.Scanner`, `httphead.Scanner`, `httphead.HTTP2Scanner` | Parse as bytes arrive                                     |
 | `fingerprint.JA4`, `fingerprint.JA3`                            | Fingerprint a client's TLS library                        |
 | `hostmatch.Set`, `hostmatch.Map`, `ipmatch.Set`                 | Match host names and IP addresses as the routes do        |
