@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // DefaultIterations is the PBKDF2 iteration count of HashPassword when it
@@ -163,7 +165,11 @@ func (b *basicAuth) check(r *http.Request) bool {
 	mac.Write([]byte(password))
 	var id [32]byte
 	mac.Sum(id[:0])
-	if b.cache.has(id) {
+	now := timeshim.Real.Now
+	if rs := stateOf(r.Context()); rs != nil {
+		now = rs.router.clock.Now
+	}
+	if b.cache.has(id, now()) {
 		return true
 	}
 	select {
@@ -183,7 +189,7 @@ func (b *basicAuth) check(r *http.Request) bool {
 	}
 	<-b.slots
 	if ok {
-		b.cache.add(id)
+		b.cache.add(id, now())
 	}
 	return ok
 }
@@ -203,7 +209,7 @@ type cached struct {
 	expires time.Time
 }
 
-func (c *authCache) has(id [32]byte) bool {
+func (c *authCache) has(id [32]byte, now time.Time) bool {
 	if c == nil {
 		return false
 	}
@@ -213,7 +219,7 @@ func (c *authCache) has(id [32]byte) bool {
 	if e == nil {
 		return false
 	}
-	if time.Now().After(e.Value.(*cached).expires) {
+	if now.After(e.Value.(*cached).expires) {
 		c.order.Remove(e)
 		delete(c.index, id)
 		return false
@@ -222,13 +228,13 @@ func (c *authCache) has(id [32]byte) bool {
 	return true
 }
 
-func (c *authCache) add(id [32]byte) {
+func (c *authCache) add(id [32]byte, now time.Time) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	expires := time.Now().Add(c.ttl)
+	expires := now.Add(c.ttl)
 	if e := c.index[id]; e != nil {
 		e.Value.(*cached).expires = expires
 		c.order.MoveToFront(e)

@@ -190,7 +190,7 @@ func (m *Mux) newEntryConfig(old *entryConfig, set [numEntrySettings]func(*optio
 	case old != nil && old.ownRate && old.cs.rate != nil && old.cs.opts.rate == o.rate && old.cs.opts.rateBurst == o.rateBurst:
 		c.cs.rate = old.cs.rate
 	default:
-		c.cs.rate = newRateLimit(o.rate, o.rateBurst)
+		c.cs.rate = newRateLimit(o.rate, o.rateBurst, o.clock)
 	}
 	return c
 }

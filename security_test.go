@@ -16,6 +16,7 @@ import (
 
 	"github.com/djylb/netx/proxyproto"
 	"github.com/djylb/portmux/internal/testutil"
+	"github.com/djylb/timeshim"
 )
 
 // TestEvictionUnderSilentFlood fills the pending limit with idle connections
@@ -167,7 +168,7 @@ func TestRateLimitPerClient(t *testing.T) {
 }
 
 func TestRateLimitBuckets(t *testing.T) {
-	l := newRateLimit(10, 2)
+	l := newRateLimit(10, 2, timeshim.Real)
 	a := netip.MustParseAddr("192.0.2.1")
 	b := netip.MustParseAddr("192.0.2.2")
 	at := func(ms int) time.Duration { return time.Duration(ms) * time.Millisecond }
@@ -202,7 +203,7 @@ func TestRateLimitBuckets(t *testing.T) {
 }
 
 func TestRateLimitTracksBoundedClients(t *testing.T) {
-	l := newRateLimit(1, 1)
+	l := newRateLimit(1, 1, timeshim.Real)
 	// Fill the tracked clients with exhausted buckets, then check that new
 	// clients pass untracked instead of growing the maps.
 	for i := range maxRateClients * 2 {

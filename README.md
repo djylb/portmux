@@ -6,7 +6,8 @@ databases and custom prefixes — and routing them to separate `net.Listener`s
 or handlers. Routes, limits and options change while serving.
 
 Requires Go 1.26. Besides the standard library it uses only
-[netx](https://github.com/djylb/netx) for PROXY protocol headers.
+[netx](https://github.com/djylb/netx) for PROXY protocol headers and
+[timeshim](https://github.com/djylb/timeshim) as its injectable clock.
 
 ## Install
 
@@ -512,6 +513,7 @@ func tighten(m *portmux.Mux) portmux.Config {
 | `WithObserver(fn)`               | none    | Called with an `Event` for every connection delivered or closed           |           |
 | `WithProxyProtocol(policy)`      | none    | PROXY protocol v1/v2 per entry and peer                                   |           |
 | `WithClientPrefix(v4, v6)`       | 32, 64  | Networks counted as one client by the per-client limits and bans          |           |
+| `WithClock(c)`                   | system  | Time of bans, rate limits and close events; `timeshim.Fake` in tests      |           |
 | `WithCloseEvents(on)`            | off     | An `Event` when a delivered connection closes, with duration and bytes    |           |
 
 - `SetOptions` changes options while serving; `Config` reads them back, and

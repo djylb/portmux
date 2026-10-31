@@ -318,7 +318,7 @@ func (m *Mux) claim(s *sniffer, r *Route, st *routeState) error {
 func (m *Mux) open(conn *Conn, l *listener, cs *connSettings) {
 	conn.mux, conn.ln = m, l
 	if o := cs.opts; o.closeEvents && o.observer != nil {
-		conn.track = &connTrack{start: time.Now(), observe: o.observer}
+		conn.track = &connTrack{clock: o.clock, start: o.clock.Now(), observe: o.observer}
 	}
 	conn.open.Store(true)
 	m.count(l, conn.stripe, func(c *counters) { c.open.Add(1) })

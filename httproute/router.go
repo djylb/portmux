@@ -19,6 +19,7 @@ import (
 	"github.com/djylb/netx/forwarded"
 	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/httphead"
+	"github.com/djylb/timeshim"
 )
 
 // StatusClientClosedRequest is the status that events report for requests
@@ -39,6 +40,11 @@ type Options struct {
 	// ErrorLog receives the server's and the proxy's errors; nil discards
 	// them.
 	ErrorLog *log.Logger
+	// Clock is the source of time of the router: of event durations, the
+	// timeouts of upgraded connections, the expiry of remembered Basic
+	// credentials and the closing of replaced connection pools; nil means
+	// timeshim.Real. Server timeouts and dial deadlines use the system clock.
+	Clock timeshim.Clock
 	// Observer, if set, is called once for every request when it is done.
 	// It must not block.
 	Observer func(Event)
@@ -68,6 +74,7 @@ type Event struct {
 // Router routes requests by a Table. Create it with New.
 type Router struct {
 	opts  Options
+	clock timeshim.Clock
 	state atomic.Pointer[state]
 
 	mu         sync.Mutex // guards transports, retired and closed
@@ -158,6 +165,7 @@ func New(o Options) *Router {
 	}
 	r := &Router{
 		opts:       o,
+		clock:      timeshim.Or(o.Clock),
 		transports: map[transportKey]*pool{},
 		retired:    map[*pool]struct{}{},
 		ln:         netx.NewChanListener(nil, 64),
@@ -250,7 +258,7 @@ func (r *Router) Update(t *Table) error {
 		if p.open.Load() == 0 {
 			delete(r.retired, p)
 		} else if p.drain == nil {
-			p.drain = time.AfterFunc(retireTick, func() { r.drainRetired(p) })
+			p.drain = r.clock.AfterFunc(retireTick, func() { r.drainRetired(p) })
 		}
 	}
 	r.transports = next
@@ -402,12 +410,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.route(w, req, st, rs)
 		return
 	}
-	start := time.Now()
+	start := r.clock.Now()
 	rec := &recorder{ResponseWriter: w}
 	r.route(rec, req, st, rs)
 	ev := Event{Method: req.Method, Host: rs.host.String(), Path: rs.path, Client: rs.client,
 		Status: cmp.Or(rs.status, rec.status, http.StatusOK), Written: rec.written,
-		Duration: time.Since(start), Err: rs.err}
+		Duration: r.clock.Now().Sub(start), Err: rs.err}
 	if rs.route != nil {
 		ev.Route = rs.route.name
 	}

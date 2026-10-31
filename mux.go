@@ -78,12 +78,12 @@ func New(opts ...Option) *Mux {
 		listeners: make(map[net.Listener]*listener),
 		slots:     newSlotLimit(),
 		perClient: pendingLimit{count: make(map[netip.Prefix]int)},
-		bans:      newBanList(),
 	}
 	o := newOptions(opts)
+	m.bans = newBanList(o.clock)
 	base := &connSettings{opts: &o}
 	if o.rate > 0 {
-		base.rate = newRateLimit(o.rate, o.rateBurst)
+		base.rate = newRateLimit(o.rate, o.rateBurst, o.clock)
 	}
 	m.base.Store(base)
 	m.table.Store(newTable(routeSet{}, nil))
@@ -102,16 +102,22 @@ func New(opts ...Option) *Mux {
 // are gone. A new WithRateLimitPerClient starts every client with a full
 // bucket.
 func (m *Mux) SetOptions(opts ...Option) {
+	for _, o := range opts {
+		if _, ok := o.(clockOption); ok {
+			panic("portmux: WithClock is an option of New, not of SetOptions")
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	old := m.base.Load()
 	o := *old.opts
 	o.apply(opts)
+	o.clock = old.opts.clock // fixed by New
 	base := &connSettings{opts: &o, rate: old.rate}
 	if o.rate != old.opts.rate || o.rateBurst != old.opts.rateBurst {
 		base.rate = nil
 		if o.rate > 0 {
-			base.rate = newRateLimit(o.rate, o.rateBurst)
+			base.rate = newRateLimit(o.rate, o.rateBurst, o.clock)
 		}
 	}
 	m.base.Store(base)
@@ -285,7 +291,7 @@ type admission struct {
 // the source of the header for a peer that sends one.
 func (m *Mux) admit(c net.Conn, l *listener, cs *connSettings) (admission, error) {
 	o := cs.opts
-	if o.listenerRate > 0 && !l.allow(o.listenerRate, o.listenerBurst, time.Now()) {
+	if o.listenerRate > 0 && !l.allow(o.listenerRate, o.listenerBurst, o.clock.Now()) {
 		return admission{}, ErrRateLimited
 	}
 	if o.proxyPolicy != nil {

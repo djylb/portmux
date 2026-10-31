@@ -8,6 +8,8 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func TestBanPerClient(t *testing.T) {
@@ -90,7 +92,7 @@ func TestBanAppliesAtOnce(t *testing.T) {
 }
 
 func TestBanListBounds(t *testing.T) {
-	l := newBanList()
+	l := newBanList(timeshim.Real)
 	now := time.Duration(0)
 	a := netip.MustParseAddr("192.0.2.1")
 	l.fail(banKey{client: host(a)}, now, 3, time.Second, time.Minute)
@@ -123,7 +125,7 @@ func TestBanListBounds(t *testing.T) {
 // TestBanListScopes counts the failures of an entry with its own rule apart
 // from the Mux's, each with its own window, and bans the client everywhere.
 func TestBanListScopes(t *testing.T) {
-	l := newBanList()
+	l := newBanList(timeshim.Real)
 	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
 	mux, own := banKey{client: host(a)}, banKey{client: host(a), entry: "fast", own: true}
 	// Two failures toward the Mux's rule of three in ten minutes.
@@ -158,7 +160,7 @@ func TestBanListScopes(t *testing.T) {
 // TestExpiredBansAreForgotten checks that bans set by hand are forgotten once
 // they ended, also when no failures are counted.
 func TestExpiredBansAreForgotten(t *testing.T) {
-	l := newBanList()
+	l := newBanList(timeshim.Real)
 	const n = 100000
 	for i := range n {
 		ip := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
@@ -181,5 +183,23 @@ func TestBanForever(t *testing.T) {
 	m.bans.fail(banKey{client: host(b)}, m.bans.now(), 1, time.Minute, math.MaxInt64)
 	if !m.bans.banned(a, m.bans.now()) || !m.bans.banned(b, m.bans.now()) || len(m.Bans()) != 2 {
 		t.Fatalf("bans %+v", m.Bans())
+	}
+}
+
+// TestBanFakeClock lets a ban expire by moving a fake clock, without waiting.
+func TestBanFakeClock(t *testing.T) {
+	start := time.Unix(1_000_000, 0)
+	fc := timeshim.NewFake(start)
+	m := New(WithClock(fc))
+	defer func() { _ = m.Close() }()
+	client := netip.MustParseAddr("192.0.2.7")
+	m.Ban(client, time.Minute)
+	bans := m.Bans()
+	if len(bans) != 1 || !bans[0].Until.Equal(start.Add(time.Minute)) {
+		t.Fatalf("bans %+v", bans)
+	}
+	fc.Advance(time.Minute + time.Second)
+	if bans := m.Bans(); len(bans) != 0 {
+		t.Fatalf("bans after they ended: %+v", bans)
 	}
 }

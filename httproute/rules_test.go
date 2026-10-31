@@ -114,18 +114,17 @@ func TestRequestIDUntrusted(t *testing.T) {
 }
 
 func TestAuthCache(t *testing.T) {
-	c := &authCache{size: 2, ttl: time.Hour, index: map[[32]byte]*list.Element{}, order: list.New()}
+	c := &authCache{size: 2, ttl: time.Minute, index: map[[32]byte]*list.Element{}, order: list.New()}
+	now := time.Unix(1000, 0)
 	a, b, d := [32]byte{1}, [32]byte{2}, [32]byte{3}
-	c.add(a)
-	c.add(b)
-	_ = c.has(a) // a is now the most recent
-	c.add(d)
-	if !c.has(a) || c.has(b) || !c.has(d) {
+	c.add(a, now)
+	c.add(b, now)
+	_ = c.has(a, now) // a is now the most recent
+	c.add(d, now)
+	if !c.has(a, now) || c.has(b, now) || !c.has(d, now) {
 		t.Error("not the least recently used evicted")
 	}
-	c.ttl = -time.Second
-	c.add(b)
-	if c.has(b) {
+	if c.has(a, now.Add(time.Minute+time.Second)) {
 		t.Error("expired entry found")
 	}
 }

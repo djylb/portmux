@@ -4,6 +4,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // TestSetMaxPendingWhileServing raises the pending limit of a running Mux:
@@ -67,4 +69,15 @@ func TestSetOptionsWhileServing(t *testing.T) {
 	_, _ = dial(t, m).Write([]byte("A"))
 	accept(t, stuck)
 	accept(t, stuck)
+}
+
+func TestSetOptionsRefusesClock(t *testing.T) {
+	m := New()
+	defer func() { _ = m.Close() }()
+	defer func() {
+		if recover() == nil {
+			t.Error("SetOptions took WithClock")
+		}
+	}()
+	m.SetOptions(WithClock(timeshim.Real))
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/tlshello"
+	"github.com/djylb/timeshim"
 )
 
 // Conn is a connection with the bytes that were read while matching it placed
@@ -54,6 +55,7 @@ func (c *Conn) Unread() []byte {
 // connTrack measures a delivered connection for its close event, which goes
 // to observe, the observer of the connection's settings.
 type connTrack struct {
+	clock         timeshim.Clock
 	start         time.Time
 	read, written atomic.Int64
 	observe       func(Event)
@@ -160,7 +162,7 @@ func (c *Conn) Close() error {
 	if c.closeOpen() {
 		if t := c.track; t != nil {
 			ev := c.event(nil)
-			ev.Closed, ev.Duration, ev.Read, ev.Written = true, time.Since(t.start), t.read.Load(), t.written.Load()
+			ev.Closed, ev.Duration, ev.Read, ev.Written = true, t.clock.Now().Sub(t.start), t.read.Load(), t.written.Load()
 			c.mux.observeWith(t.observe, ev)
 		}
 	}

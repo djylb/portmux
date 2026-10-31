@@ -12,6 +12,7 @@ import (
 
 	"github.com/djylb/netx/proxyproto"
 	"github.com/djylb/portmux/ipmatch"
+	"github.com/djylb/timeshim"
 )
 
 // banWorthy reports whether a connection failed in a way that counts toward
@@ -89,6 +90,7 @@ const (
 // banList counts the failed connections of each client and bans clients for
 // a while, automatically or on request.
 type banList struct {
+	clock  timeshim.Clock
 	epoch  time.Time
 	size   atomic.Int64 // records, so that an empty list costs nothing
 	shards [banShards]banShard
@@ -156,15 +158,15 @@ type banEntry struct {
 	failures int
 }
 
-func newBanList() *banList {
-	l := &banList{epoch: time.Now()}
+func newBanList(clk timeshim.Clock) *banList {
+	l := &banList{clock: clk, epoch: clk.Now()}
 	for i := range l.shards {
 		l.shards[i].clients = make(map[banKey]banEntry)
 	}
 	return l
 }
 
-func (l *banList) now() time.Duration { return time.Since(l.epoch) }
+func (l *banList) now() time.Duration { return l.clock.Now().Sub(l.epoch) }
 
 func (l *banList) shard(client netip.Prefix) *banShard {
 	return &l.shards[shardOf(client, banShards)]

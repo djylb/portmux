@@ -17,6 +17,7 @@ import (
 
 	"github.com/djylb/netx/forwarded"
 	"github.com/djylb/netx/proxyproto"
+	"github.com/djylb/timeshim"
 )
 
 func TestErrorPageVariables(t *testing.T) {
@@ -58,25 +59,23 @@ func TestPathRegexpTemplate(t *testing.T) {
 
 func TestUpgradeIdleTimeout(t *testing.T) {
 	checkLeaks(t)
-	_, base := startRouter(t, Options{}, Config{Upstreams: []Upstream{wsBackend(t)},
+	fc := timeshim.NewFake(time.Unix(1000, 0))
+	_, base := startRouter(t, Options{Clock: fc}, Config{Upstreams: []Upstream{wsBackend(t)},
 		Routes: []Route{{Proxy: &Proxy{Upstream: "ws"}, UpgradeIdleTimeout: 100 * time.Millisecond}}})
 	conn, br := rawRequest(t, base, "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
 	if res, err := http.ReadResponse(br, nil); err != nil || res.StatusCode != 101 {
 		t.Fatalf("%v %v", res, err)
 	}
 	for range 3 { // traffic keeps it open past the timeout
-		time.Sleep(60 * time.Millisecond)
+		fc.Advance(60 * time.Millisecond)
 		_, _ = io.WriteString(conn, "x\n")
 		if line, err := br.ReadString('\n'); line != "x\n" {
 			t.Fatalf("%q %v", line, err)
 		}
 	}
-	start := time.Now()
+	fc.Advance(100 * time.Millisecond)
 	if _, err := br.ReadByte(); err == nil {
 		t.Fatal("read after idle timeout")
-	}
-	if d := time.Since(start); d > 2*time.Second {
-		t.Errorf("closed after %v", d)
 	}
 }
 

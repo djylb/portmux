@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/djylb/portmux/ipmatch"
+	"github.com/djylb/timeshim"
 )
 
 // clientNet returns the network of ip that per-client limits count it under,
@@ -152,6 +153,7 @@ func (b *tokenBucket) take(rate, burst float64, now time.Duration) bool {
 
 // rateLimit is a token bucket per client for new connections.
 type rateLimit struct {
+	clock  timeshim.Clock
 	rate   float64 // tokens per second
 	burst  float64
 	epoch  time.Time
@@ -169,8 +171,8 @@ type rateShard struct {
 	bucket    map[netip.Prefix]tokenBucket
 }
 
-func newRateLimit(rate float64, burst int) *rateLimit {
-	l := &rateLimit{rate: rate, burst: float64(max(burst, 1)), epoch: time.Now()}
+func newRateLimit(rate float64, burst int, clk timeshim.Clock) *rateLimit {
+	l := &rateLimit{rate: rate, burst: float64(max(burst, 1)), clock: clk, epoch: clk.Now()}
 	for i := range l.shards {
 		l.shards[i].bucket = make(map[netip.Prefix]tokenBucket)
 	}
@@ -180,7 +182,7 @@ func newRateLimit(rate float64, burst int) *rateLimit {
 // allow takes a token for a new connection of client and reports whether
 // there was one.
 func (l *rateLimit) allow(client netip.Prefix) bool {
-	return l.allowAt(client, time.Since(l.epoch))
+	return l.allowAt(client, l.clock.Now().Sub(l.epoch))
 }
 
 func (l *rateLimit) allowAt(client netip.Prefix, now time.Duration) bool {

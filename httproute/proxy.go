@@ -21,6 +21,7 @@ import (
 	"github.com/djylb/netx/httprewrite"
 	"github.com/djylb/netx/proxyproto"
 	"github.com/djylb/portmux/hostmatch"
+	"github.com/djylb/timeshim"
 )
 
 // upstreamHost is the host of outbound URLs. Each upstream has a transport
@@ -232,7 +233,7 @@ func modifyResponse(res *http.Response) error {
 	if res.StatusCode == http.StatusSwitchingProtocols {
 		rs.status = http.StatusSwitchingProtocols
 		if rwc, ok := res.Body.(io.ReadWriteCloser); ok && rt.idle > 0 {
-			res.Body = newIdleConn(rwc, rt.idle)
+			res.Body = newIdleConn(rwc, rt.idle, rs.router.clock)
 		}
 	}
 	if err := rt.rewriter.ModifyResponse(res); err != nil {
@@ -298,7 +299,7 @@ type pool struct {
 	main  *http.Transport
 	h1    *http.Transport // for upgrades when main speaks HTTP/2, else nil
 	open  atomic.Int64
-	drain *time.Timer // of a replaced pool with connections; under Router.mu
+	drain timeshim.Timer // of a replaced pool with connections; under Router.mu
 }
 
 func (p *pool) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -462,12 +463,12 @@ func sendProxyHeader(ctx context.Context, c net.Conn, v proxyproto.Version, rs *
 type idleConn struct {
 	io.ReadWriteCloser
 	d     time.Duration
-	timer *time.Timer
+	timer timeshim.Timer
 }
 
-func newIdleConn(c io.ReadWriteCloser, d time.Duration) *idleConn {
+func newIdleConn(c io.ReadWriteCloser, d time.Duration, clk timeshim.Clock) *idleConn {
 	ic := &idleConn{ReadWriteCloser: c, d: d}
-	ic.timer = time.AfterFunc(d, func() { _ = c.Close() })
+	ic.timer = clk.AfterFunc(d, func() { _ = c.Close() })
 	return ic
 }
 

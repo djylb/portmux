@@ -4,8 +4,8 @@
   `go test -race ./...` and the js/wasm tests
   (`GOOS=js GOARCH=wasm go test ./...` with `$(go env GOROOT)/lib/wasm` on
   `PATH`) must pass.
-- The only dependency is github.com/djylb/netx; add no other, also not for
-  tests.
+- The only dependencies are github.com/djylb/netx and
+  github.com/djylb/timeshim; add no other, also not for tests.
 - The per-connection path adds no allocation, lock or atomic operation:
   compare `BenchmarkLoopback`, `BenchmarkDelivery` and
   `BenchmarkServeConnHandler` before and after a change.

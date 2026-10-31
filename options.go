@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/djylb/netx/proxyproto"
+	"github.com/djylb/timeshim"
 )
 
 // Defaults applied by New when the matching option is not given.
@@ -38,6 +39,7 @@ type options struct {
 	proxyPolicy         func(entry string, peer, local net.Addr) proxyproto.Policy
 	clientBits4         int
 	clientBits6         int
+	clock               timeshim.Clock
 	closeEvents         bool
 }
 
@@ -270,6 +272,19 @@ func WithObserver(fn func(Event)) Option {
 	})
 }
 
+// WithClock makes the Mux take the time of its bans, rate limits and close
+// events from c instead of the system clock, so that tests can drive them
+// with a timeshim.Fake. Only New takes it: SetOptions panics on it.
+// Sniff and dispatch timeouts follow the system clock, as they are deadlines
+// of the connections.
+func WithClock(c timeshim.Clock) Option {
+	return clockOption{c}
+}
+
+type clockOption struct{ c timeshim.Clock }
+
+func (c clockOption) apply(o *options) { o.clock = c.c }
+
 // WithCloseEvents makes the observer of WithObserver receive one more Event
 // for each delivered connection, when its server closes it with Conn.Close:
 // with Closed set, how long it was open and how many bytes it carried, for
@@ -339,6 +354,7 @@ func newOptions(opts []Option) options {
 		clientBits6:     64,
 	}
 	cfg.apply(opts)
+	cfg.clock = timeshim.Or(cfg.clock)
 	return cfg
 }
 
