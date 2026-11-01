@@ -687,9 +687,9 @@ routes that one before them hides entirely.
 - `Route.BasicAuth` checks Basic credentials against hashes from
   `HashPassword` (PBKDF2-HMAC-SHA256 in a self-describing form), or a
   `Verify` function of yours. Verified credentials are remembered for
-  `CacheTTL`, at most `CacheSize` of them, the least recently used dropped
-  first, until the table is replaced; at most one hash per CPU runs at a
-  time.
+  `CacheTTL`, at most `CacheSize` of them (1024; `DisableCache` remembers
+  none), the least recently used dropped first, until the table is
+  replaced; at most one hash per CPU runs at a time.
 - Upgrades are limited to `Route.Upgrades`, `websocket` by default; other
   Upgrade fields and `HTTP2-Settings` are removed, so that no h2c upgrade
   gets past the routes. Plain CONNECT gets 405; WebSockets over HTTP/2

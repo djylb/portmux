@@ -313,9 +313,12 @@ type BasicAuth struct {
 	// against a store of the caller's. It must not block for long.
 	Verify func(r *http.Request, user, password string) bool
 	// CacheSize bounds the credentials of Users remembered as verified,
-	// the least recently used dropped first; 0 means 1024, and a negative
-	// value turns remembering off.
+	// the least recently used dropped first; 0 means 1024, as
+	// DisableCache is how to remember none, and a negative size is an
+	// invalid config.
 	CacheSize int
+	// DisableCache remembers no credentials: each request is verified.
+	DisableCache bool
 	// CacheTTL is how long verified credentials are remembered; 0 means
 	// five minutes.
 	CacheTTL time.Duration

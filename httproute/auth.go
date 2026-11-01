@@ -141,7 +141,10 @@ func compileAuth(a *BasicAuth) (*basicAuth, error) {
 	if a.CacheTTL < 0 {
 		return nil, invalid("negative CacheTTL")
 	}
-	if a.CacheSize >= 0 {
+	if a.CacheSize < 0 {
+		return nil, invalid("negative CacheSize")
+	}
+	if !a.DisableCache {
 		b.cache = &authCache{size: cmp.Or(a.CacheSize, 1024), ttl: cmp.Or(a.CacheTTL, 5*time.Minute),
 			index: map[[32]byte]*list.Element{}, order: list.New()}
 	}
