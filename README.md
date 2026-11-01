@@ -707,6 +707,8 @@ routes that one before them hides entirely.
   are an invalid config unless the field gives them a meaning.
   `Upstream.MaxIdleConns` and `IdleConnTimeout` default to 64 and 90 s,
   unlike `http.Transport`, where 0 means no limit.
+  The zero value is no bound for `Upstream.ResponseHeaderTimeout`,
+  `Route.UpgradeIdleTimeout` and `Route.MaxRequestBody`.
 - Hop-by-hop fields are removed; upgrades such as WebSocket, trailers,
   `Expect: 100-continue` and streaming responses pass through. With "h2" in
   the TLS config's `NextProtos`, clients may use HTTP/2.

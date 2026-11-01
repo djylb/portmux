@@ -46,5 +46,8 @@
 // field's documentation; for timeouts and limits it is a safe bound unless
 // the field says otherwise. A negative timeout means no timeout, as for
 // http.Server.IdleTimeout. Other negative values are an error unless the
-// field gives them a meaning.
+// field gives them a meaning. The zero value is not a safe bound for
+// Upstream.ResponseHeaderTimeout, Route.UpgradeIdleTimeout and
+// Route.MaxRequestBody, whose zero means none: backends may answer slowly
+// or bound uploads themselves, and upgraded connections may stay quiet.
 package httproute
