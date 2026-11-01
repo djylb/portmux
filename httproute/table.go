@@ -201,10 +201,8 @@ func checkUpstream(u Upstream) error {
 		return invalid("upstream %q: PROXY protocol version %d", u.Name, u.ProxyProtocol)
 	case u.ProxyProtocol != 0 && u.HTTP2:
 		return invalid("upstream %q: PROXY protocol with HTTP2, whose connections carry many clients", u.Name)
-	case u.DialTimeout < 0 || u.ResponseHeaderTimeout < 0 || u.IdleConnTimeout < 0:
-		return invalid("upstream %q has a negative timeout", u.Name)
-	case u.MaxIdleConns < 0 || u.MaxResponseHeaderBytes < 0:
-		return invalid("upstream %q has a negative limit", u.Name)
+	case u.MaxResponseHeaderBytes < 0:
+		return invalid("upstream %q has a negative MaxResponseHeaderBytes %d", u.Name, u.MaxResponseHeaderBytes)
 	}
 	if u.Addr != "" {
 		if _, _, err := net.SplitHostPort(u.Addr); err != nil {
@@ -371,8 +369,8 @@ func (t *Table) compile(i int, r Route, upstreams map[string]int) (*route, error
 			return nil, invalid("https redirect status %d", s.Status)
 		}
 	}
-	if r.MaxRequestBody < 0 || r.UpgradeIdleTimeout < 0 {
-		return nil, invalid("negative MaxRequestBody or UpgradeIdleTimeout")
+	if r.MaxRequestBody < 0 {
+		return nil, invalid("negative MaxRequestBody %d", r.MaxRequestBody)
 	}
 	var err error
 	if rt.pages, err = compilePages(r.ErrorPages); err != nil {

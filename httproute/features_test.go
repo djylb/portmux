@@ -280,3 +280,23 @@ func TestProxyProtocolUpstream(t *testing.T) {
 		t.Errorf("PROXY with HTTP2: %v", err)
 	}
 }
+
+// Negative timeouts mean none and a negative MaxIdleConns no limit: the
+// request goes through; a negative MaxResponseHeaderBytes is invalid.
+func TestNegativeUpstreamSettings(t *testing.T) {
+	checkLeaks(t)
+	up := backend(t, "b", echo)
+	up.DialTimeout, up.IdleConnTimeout, up.ResponseHeaderTimeout, up.MaxIdleConns = -1, -1, -1, -1
+	_, base := startRouter(t, Options{ReadHeaderTimeout: -1, IdleTimeout: -1}, Config{
+		Upstreams: []Upstream{up},
+		Routes:    []Route{{Proxy: &Proxy{Upstream: "b"}, UpgradeIdleTimeout: -1}},
+	})
+	if res, _ := get(t, client(t), "GET", base+"/x", "a", nil); res.StatusCode != 200 {
+		t.Fatalf("status %d", res.StatusCode)
+	}
+	bad := backend(t, "c", echo)
+	bad.MaxResponseHeaderBytes = -1
+	if _, err := Build(Config{Upstreams: []Upstream{bad}}); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("negative MaxResponseHeaderBytes: %v", err)
+	}
+}

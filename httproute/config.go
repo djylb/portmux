@@ -106,9 +106,11 @@ type Route struct {
 	ResponseHeaders []httprewrite.Rule
 	// ErrorPages answer the route's errors, before those of the Config.
 	ErrorPages map[int]ErrorPage
-	// MaxRequestBody, if positive, limits request bodies; larger ones
-	// are answered with 413 Content Too Large. It does not limit the
-	// streams of upgraded connections and of WebSockets over HTTP/2.
+	// MaxRequestBody limits request bodies; larger ones are answered with
+	// 413 Content Too Large. 0 means no limit, as backends usually bound
+	// uploads themselves, and a negative limit is an invalid config. It
+	// does not limit the streams of upgraded connections and of WebSockets
+	// over HTTP/2.
 	MaxRequestBody int64
 	// Upgrades are the protocols that the Upgrade field of a request may
 	// name, compared without regard to case; nil means "websocket". A
@@ -118,9 +120,10 @@ type Route struct {
 	// CONNECT requests of HTTP/2 (RFC 8441) are routed by their path and
 	// proxied to the backend as WebSocket upgrades over HTTP/1.1.
 	Upgrades []string
-	// UpgradeIdleTimeout, if positive, closes an upgraded connection,
-	// such as a WebSocket, through which no bytes passed either way for
-	// that long. Zero means none.
+	// UpgradeIdleTimeout closes an upgraded connection, such as a
+	// WebSocket, through which no bytes passed either way for that long; 0
+	// or a negative value means no timeout, as upgraded connections are
+	// often long-lived and quiet.
 	UpgradeIdleTimeout time.Duration
 	// Wrap, if set, wraps the action once, when the table is built, for
 	// authentication, limits or metrics of the caller's. RouteName and
@@ -234,19 +237,25 @@ type Upstream struct {
 	// Connections then carry one request each, as DisableKeepAlives
 	// does; it cannot be used with HTTP2.
 	ProxyProtocol int
-	// DialTimeout bounds Dial and the TLS handshake; 0 means 10 seconds.
+	// DialTimeout bounds Dial and the TLS handshake; 0 means 10 seconds,
+	// and a negative value means no timeout, as for http.Server.IdleTimeout. Unlike net.Dialer.Timeout, 0 is not no timeout.
 	DialTimeout time.Duration
 	// ResponseHeaderTimeout bounds the wait for a response's header after
-	// the request is written; 0 means none. It ends in 504.
+	// the request is written, ending in 504; 0 or a negative value means
+	// no timeout, as for http.Transport.ResponseHeaderTimeout, since
+	// backends may answer slowly by design.
 	ResponseHeaderTimeout time.Duration
-	// IdleConnTimeout closes idle connections; 0 means 90 seconds.
+	// IdleConnTimeout closes idle connections; 0 means 90 seconds, and
+	// a negative value means no timeout, as for http.Server.IdleTimeout. Unlike http.Transport.IdleConnTimeout, 0 is not no limit.
 	IdleConnTimeout time.Duration
-	// MaxIdleConns limits idle connections; 0 means 64, not no limit as
-	// in http.Transport. DisableKeepAlives keeps none.
+	// MaxIdleConns limits idle connections; 0 means 64, and a negative
+	// value means no limit. Unlike http.Transport.MaxIdleConns, 0 is not
+	// no limit. DisableKeepAlives keeps none.
 	MaxIdleConns int
-	// MaxResponseHeaderBytes limits response heads; 0 means 64 KiB.
+	// MaxResponseHeaderBytes limits response heads; 0 means 64 KiB, as
+	// http.Transport.MaxResponseHeaderBytes has a default, and a negative
+	// limit is an invalid config.
 	MaxResponseHeaderBytes int64
-	// The timeouts and limits above must not be negative.
 	// DisableKeepAlives uses each connection for one request only, so
 	// that Dial sees every request, such as to choose a backend per
 	// client.
@@ -310,14 +319,15 @@ type BasicAuth struct {
 	// against a store of the caller's. It must not block for long.
 	Verify func(r *http.Request, user, password string) bool
 	// CacheSize bounds the credentials of Users remembered as verified,
-	// the least recently used dropped first; 0 means 1024, as
-	// DisableCache is how to remember none, and a negative size is an
-	// invalid config.
+	// the least recently used dropped first; 0 means 1024. It has no
+	// unlimited setting: a negative size is an invalid config, and
+	// DisableCache remembers none.
 	CacheSize int
 	// DisableCache remembers no credentials: each request is verified.
 	DisableCache bool
 	// CacheTTL is how long verified credentials are remembered; 0 means
-	// five minutes.
+	// five minutes, and a negative value is an invalid config, as
+	// credentials must not be remembered for ever.
 	CacheTTL time.Duration
 }
 

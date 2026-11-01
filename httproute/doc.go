@@ -41,4 +41,10 @@
 // passthrough are the caller's: a backend is whatever the caller's DialFunc
 // connects to, certificates come from the caller's tls.Config, and portmux
 // routes connections before they reach a Router.
+//
+// Settings: the zero value of a field selects its default, stated in the
+// field's documentation; for timeouts and limits it is a safe bound unless
+// the field says otherwise. A negative timeout means no timeout, as for
+// http.Server.IdleTimeout. Other negative values are an error unless the
+// field gives them a meaning.
 package httproute

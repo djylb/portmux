@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -319,15 +320,25 @@ func (p *pool) CloseIdleConnections() {
 // newPool returns the transports of an upstream. They dial through the
 // upstream of the route of each request, so that a new Dial needs no new
 // transport.
+// perHost is the MaxIdleConnsPerHost of an upstream's transports, whose
+// one host is the upstream: all of MaxIdleConns, or no limit when it is
+// negative.
+func perHost(maxIdle int) int {
+	if maxIdle < 0 {
+		return math.MaxInt
+	}
+	return maxIdle
+}
+
 func newPool(u *upstream) *pool {
 	transport := func(h2 bool) *http.Transport {
 		t := &http.Transport{
 			DialContext:            dialPlain,
 			DialTLSContext:         dialTLS1,
-			ResponseHeaderTimeout:  u.ResponseHeaderTimeout,
-			IdleConnTimeout:        u.IdleConnTimeout,
-			MaxIdleConns:           u.MaxIdleConns,
-			MaxIdleConnsPerHost:    u.MaxIdleConns,
+			ResponseHeaderTimeout:  max(u.ResponseHeaderTimeout, 0),
+			IdleConnTimeout:        max(u.IdleConnTimeout, 0), // 0 is none to http.Transport
+			MaxIdleConns:           max(u.MaxIdleConns, 0),
+			MaxIdleConnsPerHost:    perHost(u.MaxIdleConns),
 			MaxResponseHeaderBytes: u.MaxResponseHeaderBytes,
 			DisableKeepAlives:      u.DisableKeepAlives,
 			// A proxy passes Accept-Encoding and bodies on as they are.
@@ -397,7 +408,10 @@ func connect(ctx context.Context, addr string, alpn []string) (net.Conn, error) 
 		return nil, errNoUpstream
 	}
 	up := rs.route.table.upstreams[rs.route.upstream]
-	ctx, cancel := context.WithTimeout(ctx, up.DialTimeout)
+	cancel := context.CancelFunc(func() {})
+	if up.DialTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, up.DialTimeout)
+	}
 	defer cancel()
 	defer context.AfterFunc(rs.router.ctx, cancel)()
 	c, err := callDial(ctx, up, rs)

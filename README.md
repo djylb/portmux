@@ -701,6 +701,12 @@ routes that one before them hides entirely.
 - `${request_id}` is the `X-Request-Id` of a trusted proxy, else random.
 - `Route.UpgradeIdleTimeout` closes upgraded connections, such as
   WebSockets, that carry nothing for a while.
+- Settings: the zero value of a field selects its default, a safe bound for
+  timeouts and limits unless the field says otherwise; a negative timeout
+  means no timeout, as for `http.Server.IdleTimeout`; other negative values
+  are an invalid config unless the field gives them a meaning.
+  `Upstream.MaxIdleConns` and `IdleConnTimeout` default to 64 and 90 s,
+  unlike `http.Transport`, where 0 means no limit.
 - Hop-by-hop fields are removed; upgrades such as WebSocket, trailers,
   `Expect: 100-continue` and streaming responses pass through. With "h2" in
   the TLS config's `NextProtos`, clients may use HTTP/2.

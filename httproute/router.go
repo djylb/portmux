@@ -30,12 +30,15 @@ const StatusClientClosedRequest = 499
 type Options struct {
 	// ReadHeaderTimeout bounds reading a request's head, and the TLS
 	// handshake of connections handed over as *tls.Conn; 0 means 10
-	// seconds.
+	// seconds, and a negative value means no timeout, as for http.Server.IdleTimeout. Unlike http.Server.ReadHeaderTimeout, 0 is not no
+	// timeout.
 	ReadHeaderTimeout time.Duration
 	// IdleTimeout closes keep-alive connections idle for longer; 0 means
-	// 60 seconds.
+	// 60 seconds, and a negative value means no timeout, as for http.Server.IdleTimeout. Unlike http.Server.IdleTimeout, 0 is not no
+	// timeout.
 	IdleTimeout time.Duration
-	// MaxHeaderBytes limits request heads; 0 means 64 KiB.
+	// MaxHeaderBytes limits request heads; 0 or a negative value means 64
+	// KiB, as for http.Server.MaxHeaderBytes, whose default it replaces.
 	MaxHeaderBytes int
 	// ErrorLog receives the server's and the proxy's errors; nil discards
 	// them.
@@ -159,7 +162,9 @@ func Client(r *http.Request) forwarded.Client {
 func New(o Options) *Router {
 	o.ReadHeaderTimeout = cmp.Or(o.ReadHeaderTimeout, 10*time.Second)
 	o.IdleTimeout = cmp.Or(o.IdleTimeout, 60*time.Second)
-	o.MaxHeaderBytes = cmp.Or(o.MaxHeaderBytes, 64<<10)
+	if o.MaxHeaderBytes <= 0 {
+		o.MaxHeaderBytes = 64 << 10
+	}
 	if o.ErrorLog == nil {
 		o.ErrorLog = log.New(io.Discard, "", 0)
 	}
