@@ -237,20 +237,22 @@ type Upstream struct {
 	// Connections then carry one request each, as DisableKeepAlives
 	// does; it cannot be used with HTTP2.
 	ProxyProtocol int
-	// DialTimeout bounds Dial and the TLS handshake; 0 means 10 seconds,
-	// and a negative value means no timeout, as for http.Server.IdleTimeout. Unlike net.Dialer.Timeout, 0 is not no timeout.
+	// DialTimeout bounds Dial and the TLS handshake; 0 means 10 seconds, and a
+	// negative value means no timeout, as for http.Server.IdleTimeout. This
+	// differs from net.Dialer.Timeout, where 0 means no timeout.
 	DialTimeout time.Duration
 	// ResponseHeaderTimeout bounds the wait for a response's header after
 	// the request is written, ending in 504; 0 or a negative value means
 	// no timeout, as for http.Transport.ResponseHeaderTimeout, since
 	// backends may answer slowly by design.
 	ResponseHeaderTimeout time.Duration
-	// IdleConnTimeout closes idle connections; 0 means 90 seconds, and
-	// a negative value means no timeout, as for http.Server.IdleTimeout. Unlike http.Transport.IdleConnTimeout, 0 is not no limit.
+	// IdleConnTimeout closes idle connections; 0 means 90 seconds, and a
+	// negative value means no timeout, as for http.Server.IdleTimeout. This
+	// differs from http.Transport.IdleConnTimeout, where 0 means no limit.
 	IdleConnTimeout time.Duration
 	// MaxIdleConns limits idle connections; 0 means 64, and a negative
-	// value means no limit. Unlike http.Transport.MaxIdleConns, 0 is not
-	// no limit. DisableKeepAlives keeps none.
+	// value means no limit. This differs from http.Transport.MaxIdleConns,
+	// where 0 means no limit. DisableKeepAlives keeps none.
 	MaxIdleConns int
 	// MaxResponseHeaderBytes limits response heads; 0 means 64 KiB, as
 	// http.Transport.MaxResponseHeaderBytes has a default, and a negative

@@ -28,14 +28,15 @@ const StatusClientClosedRequest = 499
 
 // Options are the settings of a Router's server, fixed when it is created.
 type Options struct {
-	// ReadHeaderTimeout bounds reading a request's head, and the TLS
-	// handshake of connections handed over as *tls.Conn; 0 means 10
-	// seconds, and a negative value means no timeout, as for http.Server.IdleTimeout. Unlike http.Server.ReadHeaderTimeout, 0 is not no
-	// timeout.
+	// ReadHeaderTimeout bounds reading a request's head, and the TLS handshake
+	// of connections handed over as *tls.Conn; 0 means 10 seconds, and a
+	// negative value means no timeout, as for http.Server.IdleTimeout. This
+	// differs from http.Server.ReadHeaderTimeout, where 0 means no timeout.
 	ReadHeaderTimeout time.Duration
-	// IdleTimeout closes keep-alive connections idle for longer; 0 means
-	// 60 seconds, and a negative value means no timeout, as for http.Server.IdleTimeout. Unlike http.Server.IdleTimeout, 0 is not no
-	// timeout.
+	// IdleTimeout closes keep-alive connections idle for longer; 0 means 60
+	// seconds, and a negative value means no timeout, as for
+	// http.Server.IdleTimeout. This differs from http.Server.IdleTimeout, where
+	// 0 means no timeout.
 	IdleTimeout time.Duration
 	// MaxHeaderBytes limits request heads; 0 or a negative value means 64
 	// KiB, as for http.Server.MaxHeaderBytes, whose default it replaces.
