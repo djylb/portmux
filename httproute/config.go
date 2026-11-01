@@ -234,16 +234,21 @@ type Upstream struct {
 	// Connections then carry one request each, as DisableKeepAlives
 	// does; it cannot be used with HTTP2.
 	ProxyProtocol int
-	// DialTimeout bounds Dial and the TLS handshake; 0 means 10 seconds.
+	// DialTimeout bounds Dial and the TLS handshake; 0 means 10 seconds,
+	// as a timeout of zero has no use, and math.MaxInt64 none.
 	DialTimeout time.Duration
 	// ResponseHeaderTimeout bounds the wait for a response's header after
-	// the request is written; 0 means none. It ends in 504.
+	// the request is written; 0, the default, means none, and
+	// math.MaxInt64 does too. It ends in 504.
 	ResponseHeaderTimeout time.Duration
-	// IdleConnTimeout closes idle connections; 0 means 90 seconds.
+	// IdleConnTimeout closes idle connections; 0 means 90 seconds, as a
+	// timeout of zero has no use, and math.MaxInt64 keeps them.
 	IdleConnTimeout time.Duration
-	// MaxIdleConns limits idle connections; 0 means 64.
+	// MaxIdleConns limits idle connections; 0 means 64, as
+	// DisableKeepAlives is how to keep none.
 	MaxIdleConns int
-	// MaxResponseHeaderBytes limits response heads; 0 means 64 KiB.
+	// MaxResponseHeaderBytes limits response heads; 0 means 64 KiB, as no
+	// response fits in 0 bytes.
 	MaxResponseHeaderBytes int64
 	// DisableKeepAlives uses each connection for one request only, so
 	// that Dial sees every request, such as to choose a backend per
