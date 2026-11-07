@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"io"
+	"maps"
 	"math/big"
 	"net"
 	"net/http"
@@ -50,7 +51,7 @@ func goroutines() (int, string) {
 	buf := make([]byte, 1<<20)
 	stacks := string(buf[:runtime.Stack(buf, true)])
 	n := 0
-	for _, g := range strings.Split(stacks, "\n\n") {
+	for g := range strings.SplitSeq(stacks, "\n\n") {
 		if strings.HasPrefix(g, "goroutine ") && !strings.Contains(g, "runtime.handleEvent") {
 			n++
 		}
@@ -117,9 +118,7 @@ func get(t *testing.T, c *http.Client, method, url, host string, header http.Hea
 	if host != "" {
 		req.Host = host
 	}
-	for k, v := range header {
-		req.Header[k] = v
-	}
+	maps.Copy(req.Header, header)
 	res, err := c.Do(req)
 	if err != nil {
 		t.Fatal(err)

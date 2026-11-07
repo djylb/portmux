@@ -208,7 +208,7 @@ func connContext(ctx context.Context, c net.Conn) context.Context {
 	if _, ok := c.(*tls.Conn); ok {
 		return ctx // the server reads it itself
 	}
-	for i := 0; i < 16; i++ {
+	for range 16 {
 		u, ok := c.(interface{ NetConn() net.Conn })
 		if !ok {
 			return ctx

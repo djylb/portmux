@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httputil"
 	"slices"
@@ -66,9 +67,7 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 		return
 	}
 	h := w.Header()
-	for k, v := range res.Header {
-		h[k] = v
-	}
+	maps.Copy(h, res.Header)
 	for _, f := range append(hopFields, "Sec-Websocket-Accept") {
 		h.Del(f)
 	}

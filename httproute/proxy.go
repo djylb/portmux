@@ -173,7 +173,7 @@ func canonicalPath(u *url.URL, in *http.Request, rs *reqState) {
 // escaped path esc.
 func escapedSuffix(esc string, n int) (string, bool) {
 	i := 0
-	for d := 0; d < n; d++ {
+	for range n {
 		if i >= len(esc) {
 			return "", false
 		}
@@ -276,15 +276,13 @@ func proxyError(w http.ResponseWriter, req *http.Request, err error) {
 
 // statusOf maps the error of a round trip to a status.
 func statusOf(err error) int {
-	var se *StatusError
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*StatusError](err); ok {
 		if se.Status >= 400 && se.Status <= 599 {
 			return se.Status
 		}
 		return http.StatusBadGateway
 	}
-	var mb *http.MaxBytesError
-	if errors.As(err, &mb) {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 		return http.StatusRequestEntityTooLarge
 	}
 	var ne net.Error
