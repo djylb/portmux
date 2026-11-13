@@ -73,6 +73,7 @@ type transportKey struct {
 	responseHeaderTimeout time.Duration
 	idleConnTimeout       time.Duration
 	maxIdleConns          int
+	maxKeys               int
 	maxResponseHeader     int64
 	disableKeepAlives     bool
 	http2                 bool
@@ -87,6 +88,7 @@ func (u *upstream) key() transportKey {
 		responseHeaderTimeout: u.ResponseHeaderTimeout,
 		idleConnTimeout:       u.IdleConnTimeout,
 		maxIdleConns:          u.MaxIdleConns,
+		maxKeys:               u.MaxKeys,
 		maxResponseHeader:     u.MaxResponseHeaderBytes,
 		disableKeepAlives:     u.DisableKeepAlives,
 		http2:                 u.HTTP2,
@@ -114,6 +116,7 @@ func Build(c Config) (*Table, error) {
 		u.DialTimeout = cmp.Or(u.DialTimeout, 10*time.Second)
 		u.IdleConnTimeout = cmp.Or(u.IdleConnTimeout, 90*time.Second)
 		u.MaxIdleConns = cmp.Or(u.MaxIdleConns, 64)
+		u.MaxKeys = cmp.Or(u.MaxKeys, 1024)
 		u.MaxResponseHeaderBytes = cmp.Or(u.MaxResponseHeaderBytes, 64<<10)
 		if u.ProxyProtocol != 0 {
 			u.DisableKeepAlives = true // a header names one client

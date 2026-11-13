@@ -100,6 +100,7 @@ type basicAuth struct {
 	users     map[string]*passwordHash
 	dummy     *passwordHash // for unknown users, which cost as much as known ones
 	verify    func(r *http.Request, user, password string) bool
+	allow     func(r *http.Request, user string) bool
 	macKey    [32]byte
 	cache     *authCache // nil when caching is off
 	slots     chan struct{}
@@ -116,7 +117,7 @@ func compileAuth(a *BasicAuth) (*basicAuth, error) {
 		}
 	}
 	realm = strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(realm)
-	b := &basicAuth{challenge: `Basic realm="` + realm + `", charset="UTF-8"`, verify: a.Verify,
+	b := &basicAuth{challenge: `Basic realm="` + realm + `", charset="UTF-8"`, verify: a.Verify, allow: a.Allow,
 		slots: make(chan struct{}, runtime.GOMAXPROCS(0))}
 	if a.Verify != nil {
 		return b, nil
@@ -156,9 +157,14 @@ func compileAuth(a *BasicAuth) (*basicAuth, error) {
 // false also when the request's context ends while it waits for a slot.
 func (b *basicAuth) check(r *http.Request) bool {
 	user, password, ok := r.BasicAuth()
-	if !ok {
+	if !ok || !b.valid(r, user, password) {
 		return false
 	}
+	return b.allow == nil || b.allow(r, user)
+}
+
+// valid reports whether user and password are valid credentials.
+func (b *basicAuth) valid(r *http.Request, user, password string) bool {
 	if b.verify != nil {
 		return b.verify(r, user, password)
 	}
@@ -184,7 +190,7 @@ func (b *basicAuth) check(r *http.Request) bool {
 	if !known {
 		h = b.dummy
 	}
-	ok = h.verify(password) && known
+	ok := h.verify(password) && known
 	// Every check costs the rounds of the slowest hash, so that the time
 	// of a check tells nothing about the user.
 	if extra := b.dummy.iterations - h.iterations; extra > 0 {

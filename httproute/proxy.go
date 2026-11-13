@@ -53,6 +53,19 @@ func (proxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		rs.outPath = p
 	}
+	if pick := rs.route.proxy.Pick; pick != nil {
+		key, err := pick(req)
+		if err != nil {
+			rs.err = err
+			writeError(w, req, rs, statusOf(err))
+			return
+		}
+		rs.key = key
+		if key != "" {
+			rs.keyed = rs.transport.acquire(key)
+			defer rs.transport.release(rs.keyed)
+		}
+	}
 	filterUpgrade(req, rs.route)
 	if req.Method == http.MethodConnect {
 		proxyExtendedConnect(w, req, rs)
@@ -225,6 +238,15 @@ func (roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if rs == nil || rs.transport == nil {
 		return nil, errNoUpstream
 	}
+	return rs.roundTrip(req)
+}
+
+// roundTrip sends req with the transports of the request's Pick key, or
+// with the upstream's own without one.
+func (rs *reqState) roundTrip(req *http.Request) (*http.Response, error) {
+	if rs.keyed != nil {
+		return rs.keyed.RoundTrip(req)
+	}
 	return rs.transport.RoundTrip(req)
 }
 
@@ -292,32 +314,113 @@ func statusOf(err error) int {
 	return http.StatusBadGateway
 }
 
-// pool holds the transports of an upstream, and counts their connections
-// so that a Router knows when a replaced pool has none left.
+// transports are the HTTP transports that share one pool of connections.
+type transports struct {
+	main *http.Transport
+	h1   *http.Transport // for upgrades when main speaks HTTP/2, else nil
+}
+
+func (t *transports) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.h1 != nil && req.Header.Get("Upgrade") != "" {
+		return t.h1.RoundTrip(req)
+	}
+	return t.main.RoundTrip(req)
+}
+
+func (t *transports) CloseIdleConnections() {
+	t.main.CloseIdleConnections()
+	if t.h1 != nil {
+		t.h1.CloseIdleConnections()
+	}
+}
+
+// pool holds the transports of an upstream and those of each Pick key, and
+// counts their connections so that a Router knows when a replaced pool has
+// none left.
 type pool struct {
-	main  *http.Transport
-	h1    *http.Transport // for upgrades when main speaks HTTP/2, else nil
+	transports
 	open  atomic.Int64
 	drain timeshim.Timer // of a replaced pool with connections; under Router.mu
+
+	up      *upstream // what the transports of keys are built from
+	maxKeys int
+	mu      sync.Mutex // guards keys, use and the refs of its keyPools
+	keys    map[string]*keyPool
+	use     uint64 // last keyPool.used
 }
 
-func (p *pool) RoundTrip(req *http.Request) (*http.Response, error) {
-	if p.h1 != nil && req.Header.Get("Upgrade") != "" {
-		return p.h1.RoundTrip(req)
+// keyPool holds the transports of one Pick key. It stays in its pool while
+// requests use it or it has connections, idle ones included, and leaves when
+// the last of them ends, so that a key without connections costs nothing.
+type keyPool struct {
+	transports
+	key  string
+	refs int    // requests in progress and open connections; under pool.mu
+	used uint64 // pool.use when last acquired; under pool.mu
+}
+
+// acquire returns the transports of key, made when the key has none, for
+// a request that calls release when it ends. Above maxKeys keys it closes
+// the idle connections of the least recently used key without requests,
+// which then leaves the pool; keys with requests in progress stay, so the
+// pool exceeds maxKeys by no more than the requests in progress.
+func (p *pool) acquire(key string) *keyPool {
+	p.mu.Lock()
+	p.use++
+	k := p.keys[key]
+	if k == nil {
+		k = &keyPool{transports: newTransports(p.up), key: key}
+		p.keys[key] = k
 	}
-	return p.main.RoundTrip(req)
+	k.refs++
+	k.used = p.use
+	var evict *keyPool
+	if p.maxKeys > 0 && len(p.keys) > p.maxKeys {
+		for _, c := range p.keys {
+			if c != k && (evict == nil || c.used < evict.used) {
+				evict = c
+			}
+		}
+	}
+	p.mu.Unlock()
+	if evict != nil {
+		// Outside the lock: closing the connections releases them.
+		evict.CloseIdleConnections()
+	}
+	return k
 }
 
+// release gives back a reference of acquire or of a connection of k.
+func (p *pool) release(k *keyPool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if k.refs--; k.refs == 0 && p.keys[k.key] == k {
+		delete(p.keys, k.key)
+	}
+}
+
+// hold adds a reference for a new connection of k.
+func (p *pool) hold(k *keyPool) {
+	p.mu.Lock()
+	k.refs++
+	p.mu.Unlock()
+}
+
+// CloseIdleConnections closes the idle connections of the upstream and of
+// every key, whose keys then leave the pool unless requests use them.
 func (p *pool) CloseIdleConnections() {
-	p.main.CloseIdleConnections()
-	if p.h1 != nil {
-		p.h1.CloseIdleConnections()
+	p.transports.CloseIdleConnections()
+	p.mu.Lock()
+	keys := make([]*keyPool, 0, len(p.keys))
+	for _, k := range p.keys {
+		keys = append(keys, k)
+	}
+	p.mu.Unlock()
+	for _, k := range keys {
+		k.CloseIdleConnections()
 	}
 }
 
-// newPool returns the transports of an upstream. They dial through the
-// upstream of the route of each request, so that a new Dial needs no new
-// transport.
 // perHost is the MaxIdleConnsPerHost of an upstream's transports, whose
 // one host is the upstream: all of MaxIdleConns, or no limit when it is
 // negative.
@@ -328,7 +431,15 @@ func perHost(maxIdle int) int {
 	return maxIdle
 }
 
+// newPool returns the pool of an upstream.
 func newPool(u *upstream) *pool {
+	return &pool{transports: newTransports(u), up: u, maxKeys: u.MaxKeys, keys: map[string]*keyPool{}}
+}
+
+// newTransports returns the transports of an upstream. They dial through
+// the upstream of the route of each request, so that a new Dial needs no
+// new transport.
+func newTransports(u *upstream) transports {
 	transport := func(h2 bool) *http.Transport {
 		t := &http.Transport{
 			DialContext:            dialPlain,
@@ -357,22 +468,29 @@ func newPool(u *upstream) *pool {
 		}
 		return t
 	}
-	p := &pool{main: transport(u.HTTP2)}
+	t := transports{main: transport(u.HTTP2)}
 	if u.HTTP2 {
-		p.h1 = transport(false)
+		t.h1 = transport(false)
 	}
-	return p
+	return t
 }
 
-// countedConn is a backend connection of a pool.
+// countedConn is a backend connection of a pool, and of a key if keyed is
+// set.
 type countedConn struct {
 	net.Conn
-	pool *pool
-	once sync.Once
+	pool  *pool
+	keyed *keyPool
+	once  sync.Once
 }
 
 func (c *countedConn) Close() error {
-	c.once.Do(func() { c.pool.open.Add(-1) })
+	c.once.Do(func() {
+		c.pool.open.Add(-1)
+		if c.keyed != nil {
+			c.pool.release(c.keyed)
+		}
+	})
 	return c.Conn.Close()
 }
 
@@ -417,7 +535,10 @@ func connect(ctx context.Context, addr string, alpn []string) (net.Conn, error) 
 		return nil, err
 	}
 	rs.transport.open.Add(1)
-	c = &countedConn{Conn: c, pool: rs.transport}
+	if rs.keyed != nil {
+		rs.transport.hold(rs.keyed)
+	}
+	c = &countedConn{Conn: c, pool: rs.transport, keyed: rs.keyed}
 	if up.ProxyProtocol != 0 {
 		if err := sendProxyHeader(ctx, c, proxyproto.Version(up.ProxyProtocol), rs); err != nil {
 			_ = c.Close()
@@ -515,6 +636,7 @@ func callDial(ctx context.Context, up *upstream, rs *reqState) (c net.Conn, err 
 	}()
 	c, err = up.Dial(ctx, DialInfo{
 		Upstream: up.Name,
+		Key:      rs.key,
 		Addr:     up.Addr,
 		Route:    rs.route.name,
 		Host:     rs.host.String(),

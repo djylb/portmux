@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"log"
 	"net"
+	"net/http"
 
 	"github.com/djylb/netx/httprewrite"
 	"github.com/djylb/portmux"
@@ -52,4 +53,32 @@ X-Forwarded-Proto: ${scheme}
 	_, _ = m.Add(portmux.RouteConfig{Name: "http", Matchers: []portmux.Matcher{portmux.HTTP1()},
 		Handler: func(c *portmux.Conn) { _ = router.ServeConn(c) }})
 	_ = m // m.Serve(listener)
+}
+
+// Pick chooses one backend of a group per request, keeping a client on the
+// backend it had; the upstream pools connections per backend.
+func ExampleProxy_pick() {
+	backends := map[string]string{"one": "10.0.0.1:8080", "two": "10.0.0.2:8080"}
+	table, err := httproute.Build(httproute.Config{
+		Upstreams: []httproute.Upstream{{
+			Name: "group",
+			Dial: func(ctx context.Context, d httproute.DialInfo) (net.Conn, error) {
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "tcp", backends[d.Key])
+			},
+		}},
+		Routes: []httproute.Route{{Proxy: &httproute.Proxy{
+			Upstream: "group",
+			Pick: func(r *http.Request) (string, error) {
+				if c, err := r.Cookie("backend"); err == nil && backends[c.Value] != "" {
+					return c.Value, nil
+				}
+				return "one", nil
+			},
+		}}},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	_ = table
 }

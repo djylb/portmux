@@ -39,7 +39,8 @@
 //
 // Load balancing, certificates and the choice between TLS termination and
 // passthrough are the caller's: a backend is whatever the caller's DialFunc
-// connects to, certificates come from the caller's tls.Config, and portmux
+// connects to, Proxy.Pick may choose one per request, with connections
+// pooled per choice, certificates come from the caller's tls.Config, and portmux
 // routes connections before they reach a Router.
 //
 // Settings: the zero value of a field selects its default, stated in the

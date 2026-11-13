@@ -125,6 +125,8 @@ type reqState struct {
 	outPath   string // a Proxy's expanded PathTemplate
 	inboundID string // X-Request-Id of a trusted proxy
 	transport *pool
+	key       string   // of the Proxy's Pick
+	keyed     *keyPool // the transports of key, nil without one
 	host      hostmatch.Name
 	path      string
 	client    forwarded.Client

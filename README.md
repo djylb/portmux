@@ -672,6 +672,12 @@ routes that one before them hides entirely.
   returns sets the status, such as 503 for a backend that is offline;
   other errors give 502 and timeouts 504. A connection serves later
   requests of the upstream unless `DisableKeepAlives` is set.
+- `Proxy.Pick` chooses a backend per request, such as a member of a group
+  with sticky sessions, and returns a key for it: the upstream pools
+  connections per key, and `Dial` gets it as `DialInfo.Key`. A key keeps
+  memory only while it has connections; above `Upstream.MaxKeys` (1024)
+  the idle connections of the least recently used key are closed. A
+  `*StatusError` from `Pick` sets the status as from a `DialFunc`.
 - Header rules, redirect targets, `Proxy.PathTemplate` and the `${...}` of
   error pages are `httprewrite` variables, its own and those of `Vars`:
   `route`, `route_path`, `path_rest`, `match_1` to `match_9` (the groups
@@ -689,7 +695,9 @@ routes that one before them hides entirely.
   `Verify` function of yours. Verified credentials are remembered for
   `CacheTTL`, at most `CacheSize` of them (1024; `DisableCache` remembers
   none), the least recently used dropped first, until the table is
-  replaced; at most one hash per CPU runs at a time.
+  replaced; at most one hash per CPU runs at a time. `Allow` is asked for
+  every request with valid credentials, remembered ones too, so that an
+  account that expires or is disabled is refused at once.
 - Upgrades are limited to `Route.Upgrades`, `websocket` by default; other
   Upgrade fields and `HTTP2-Settings` are removed, so that no h2c upgrade
   gets past the routes. Plain CONNECT gets 405; WebSockets over HTTP/2

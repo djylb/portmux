@@ -153,6 +153,15 @@ type HTTPSRedirect struct {
 type Proxy struct {
 	// Upstream names one of Config.Upstreams.
 	Upstream string
+	// Pick, if set, chooses a backend of the upstream for each request,
+	// such as one member of a group with sticky sessions. It returns a
+	// key that names the backend: the upstream keeps connections apart
+	// by key and reuses them for requests of the same key, and its Dial
+	// gets the key in DialInfo.Key; "" is the upstream's connections
+	// without a key. Return a *StatusError to answer with its status,
+	// such as 503 when no backend is up; other errors answer 502. It
+	// runs before the request is sent and must not block for long.
+	Pick func(r *http.Request) (key string, err error)
 	// PathTemplate, if set, is the path to send instead of the
 	// client's, such as "/users/${match_1}" for a PathRegexp route; the
 	// query goes on as it was. It is expanded decoded and escaped as a
@@ -254,6 +263,12 @@ type Upstream struct {
 	// value means no limit. This differs from http.Transport.MaxIdleConns,
 	// where 0 means no limit. DisableKeepAlives keeps none.
 	MaxIdleConns int
+	// MaxKeys bounds the Proxy.Pick keys that keep connections of their
+	// own, each with up to MaxIdleConns idle ones; 0 means 1024, and a
+	// negative value means no limit. Above it, the idle connections of
+	// the least recently used key are closed. A key whose connections are
+	// all closed takes no memory.
+	MaxKeys int
 	// MaxResponseHeaderBytes limits response heads; 0 means 64 KiB, as
 	// http.Transport.MaxResponseHeaderBytes has a default, and a negative
 	// limit is an invalid config.
@@ -278,6 +293,8 @@ type DialFunc func(ctx context.Context, d DialInfo) (net.Conn, error)
 // DialInfo describes the request that needs a new backend connection.
 type DialInfo struct {
 	Upstream string
+	// Key is what Proxy.Pick returned for the request, else "".
+	Key string
 	// Addr is Upstream.Addr.
 	Addr  string
 	Route string
@@ -320,6 +337,13 @@ type BasicAuth struct {
 	// Verify, if set, checks credentials instead of Users, such as
 	// against a store of the caller's. It must not block for long.
 	Verify func(r *http.Request, user, password string) bool
+	// Allow, if set, is asked for every request whose credentials are
+	// valid, also when they were remembered from an earlier request, and
+	// refuses it with 401 when it returns false: a check of the account,
+	// such as whether it has expired or been disabled, that takes effect
+	// at once although the credentials stay remembered for CacheTTL. It
+	// sees no password and must be cheap.
+	Allow func(r *http.Request, user string) bool
 	// CacheSize bounds the credentials of Users remembered as verified,
 	// the least recently used dropped first; 0 means 1024. It has no
 	// unlimited setting: a negative size is an invalid config, and

@@ -49,7 +49,7 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 	out.Header.Set("Connection", "Upgrade")
 	out.Header.Set("Upgrade", "websocket")
 	out.Header.Set("Sec-WebSocket-Key", key)
-	res, err := rs.transport.RoundTrip(out)
+	res, err := rs.roundTrip(out)
 	if err != nil {
 		proxyError(w, out, err)
 		return
