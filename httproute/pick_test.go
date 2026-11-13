@@ -185,10 +185,13 @@ func TestPickKeysRecycled(t *testing.T) {
 		t.Errorf("b reused an evicted connection: %v", dials)
 	}
 	mu.Unlock()
-	r.closeIdle()
-	if n := keyCount(r, 0); n != 0 {
-		t.Errorf("%d keys after closing idle connections", n)
-	}
+	// The proxy releases a key's request reference after the client has
+	// already read the response, and a finished upstream connection may
+	// return to the idle pool just after closeIdle, so allow it to settle.
+	waitFor(t, "keys to be released", func() bool {
+		r.closeIdle()
+		return keyCount(r, 0) == 0
+	})
 }
 
 // Concurrent requests over many keys share each key's pool and leave
@@ -228,8 +231,11 @@ func TestPickConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	r.closeIdle()
-	if n := keyCount(r, 0); n != 0 {
-		t.Errorf("%d keys after closing idle connections", n)
-	}
+	// The proxy releases a key's request reference after the client has
+	// already read the response, and a finished upstream connection may
+	// return to the idle pool just after closeIdle, so allow it to settle.
+	waitFor(t, "keys to be released", func() bool {
+		r.closeIdle()
+		return keyCount(r, 0) == 0
+	})
 }
