@@ -284,7 +284,12 @@ func TestErrors(t *testing.T) {
 		t.Fatalf("expect: %v %v", res, err)
 	}
 	_, _ = io.WriteString(conn, "abc")
+	// More than one 100 Continue may arrive (RFC 9110 15.2): the front end
+	// and the backend may each send one, in a timing-dependent order.
 	res, err = http.ReadResponse(r, nil)
+	for err == nil && res.StatusCode == 100 {
+		res, err = http.ReadResponse(r, nil)
+	}
 	if err != nil || res.StatusCode != 401 || !bodyRead.Load() {
 		t.Fatalf("expect after 100: %v %v", res, err)
 	}
