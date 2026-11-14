@@ -160,6 +160,18 @@ func Client(r *http.Request) forwarded.Client {
 	return forwarded.Client{}
 }
 
+// RequestID returns the request_id of r (see Vars): the X-Request-Id of a
+// trusted proxy, else 16 random hexadecimal digits made on first use; the
+// same value templates and error pages of r show. It is "" outside a
+// Router's handler. Call it from the goroutine serving r, such as in a
+// handler that Route.Wrap installs.
+func RequestID(r *http.Request) string {
+	if rs := stateOf(r.Context()); rs != nil {
+		return rs.requestID()
+	}
+	return ""
+}
+
 // New returns a Router without routes, which answers every request with
 // 404 Not Found until Update gives it a Table.
 func New(o Options) *Router {

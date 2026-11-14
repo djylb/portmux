@@ -113,6 +113,25 @@ func TestRequestIDUntrusted(t *testing.T) {
 	}
 }
 
+func TestRequestIDInWrap(t *testing.T) {
+	checkLeaks(t)
+	var seen string
+	wrap := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen = RequestID(r)
+			next.ServeHTTP(w, r)
+		})
+	}
+	_, base := startRouter(t, Options{}, Config{Routes: []Route{{Respond: okRespond, Wrap: wrap, ResponseHeaders: rules(t, "X-Id: ${request_id}")}}})
+	res, _ := get(t, client(t), "GET", base+"/", "x", nil)
+	if id := res.Header.Get("X-Id"); len(id) != 16 || id != seen {
+		t.Errorf("template id %q, Wrap saw %q", id, seen)
+	}
+	if id := RequestID(httptest.NewRequest("GET", "/", nil)); id != "" {
+		t.Errorf("outside a router: %q", id)
+	}
+}
+
 func TestAuthCache(t *testing.T) {
 	c := &authCache{size: 2, ttl: time.Minute, index: map[[32]byte]*list.Element{}, order: list.New()}
 	now := time.Unix(1000, 0)
