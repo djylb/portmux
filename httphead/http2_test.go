@@ -9,11 +9,11 @@ import (
 	"github.com/djylb/portmux/internal/testutil"
 )
 
-func unhex(t testing.TB, s string) []byte {
-	t.Helper()
+func unhex(tb testing.TB, s string) []byte {
+	tb.Helper()
 	b, err := hex.DecodeString(strings.ReplaceAll(s, " ", ""))
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return b
 }
@@ -104,7 +104,7 @@ func TestParseHTTP2(t *testing.T) {
 	}
 	// Every prefix is incomplete, and a Scanner needs more than it has.
 	var s HTTP2Scanner
-	for i := range len(data) {
+	for i := range data {
 		if _, err := ParseHTTP2(data[:i]); outcome(err) != "incomplete" {
 			t.Fatalf("prefix of %d bytes: %v", i, err)
 		}

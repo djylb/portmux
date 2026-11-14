@@ -27,7 +27,7 @@ func outcome(err error) string {
 func scanInPieces(t *testing.T, data []byte, step uint8, parse, scan func([]byte) (*Request, error)) (want, got *Request, wantErr error) {
 	t.Helper()
 	want, wantErr = parse(data)
-	for i := range len(data) {
+	for i := range data {
 		if _, err := parse(data[:i]); outcome(err) != "incomplete" && outcome(err) != outcome(wantErr) {
 			t.Fatalf("prefix of %d bytes: %v, whole: %v", i, err, wantErr)
 		}

@@ -3,15 +3,23 @@ package httphead
 // The tables of HPACK, RFC 7541: the static table of Appendix A and the
 // Huffman code of Appendix B.
 
+// The pseudo-header fields of a request.
+const (
+	pseudoMethod    = ":method"
+	pseudoPath      = ":path"
+	pseudoScheme    = ":scheme"
+	pseudoAuthority = ":authority"
+)
+
 // hpackStatic holds the static table; index 1 is hpackStatic[0].
 var hpackStatic = [61]hpackField{
-	{":authority", ""},
-	{":method", "GET"},
-	{":method", "POST"},
-	{":path", "/"},
-	{":path", "/index.html"},
-	{":scheme", "http"},
-	{":scheme", "https"},
+	{pseudoAuthority, ""},
+	{pseudoMethod, "GET"},
+	{pseudoMethod, "POST"},
+	{pseudoPath, "/"},
+	{pseudoPath, "/index.html"},
+	{pseudoScheme, "http"},
+	{pseudoScheme, "https"},
 	{":status", "200"},
 	{":status", "204"},
 	{":status", "206"},

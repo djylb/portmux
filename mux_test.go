@@ -50,6 +50,7 @@ func TestPrefixRouteReplaysBytes(t *testing.T) {
 // serveTLSNames completes a TLS handshake on every connection from l, then
 // sends name and the negotiated protocol and closes the connection.
 func serveTLSNames(t *testing.T, l net.Listener, name string) {
+	t.Helper()
 	cfg := &tls.Config{Certificates: []tls.Certificate{certificate(t)}, NextProtos: []string{"h2", "http/1.1"}}
 	go func() {
 		for {
@@ -107,6 +108,7 @@ func TestTLSRoutingBySNIAndALPN(t *testing.T) {
 }
 
 func httpServer(t *testing.T, l net.Listener, name string) {
+	t.Helper()
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, "%s %s %s", name, r.Host, r.URL.Path)
 	})}
@@ -825,7 +827,7 @@ func TestConcurrentConnections(t *testing.T) {
 			}
 			b := make([]byte, 1)
 			if _, err := io.ReadFull(c, b); err != nil || string(b) != name {
-				errs <- fmt.Errorf("route %s: got %q, %v", name, b, err)
+				errs <- fmt.Errorf("route %s: got %q, %w", name, b, err)
 			}
 		})
 	}

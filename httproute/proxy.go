@@ -92,7 +92,7 @@ func filterUpgrade(req *http.Request, rt *route) {
 		return
 	}
 	req.Header = req.Header.Clone()
-	req.Header.Del("Http2-Settings")
+	req.Header.Del("HTTP2-Settings")
 	if !allowed {
 		req.Header.Del("Upgrade")
 	}
@@ -529,7 +529,7 @@ func connect(ctx context.Context, addr string, alpn []string) (net.Conn, error) 
 		ctx, cancel = context.WithTimeout(ctx, up.DialTimeout)
 	}
 	defer cancel()
-	defer context.AfterFunc(rs.router.ctx, cancel)()
+	defer context.AfterFunc(rs.router.ctx, cancel)() //nolint:contextcheck // ends the dial with the Router, by design
 	c, err := callDial(ctx, up, rs)
 	if err != nil {
 		return nil, err
@@ -626,12 +626,17 @@ func (c *idleConn) Close() error {
 	return c.ReadWriteCloser.Close()
 }
 
+var (
+	errDialPanic  = errors.New("httproute: Dial panicked")
+	errDialNoConn = errors.New("httproute: Dial returned no connection")
+)
+
 // callDial calls the upstream's Dial, turning a panic into an error: dials
 // run in goroutines of the transport, where a panic would end the program.
 func callDial(ctx context.Context, up *upstream, rs *reqState) (c net.Conn, err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			c, err = nil, fmt.Errorf("httproute: Dial of upstream %q panicked: %v", up.Name, p)
+			c, err = nil, fmt.Errorf("%w: upstream %q: %v", errDialPanic, up.Name, p)
 		}
 	}()
 	c, err = up.Dial(ctx, DialInfo{
@@ -650,7 +655,7 @@ func callDial(ctx context.Context, up *upstream, rs *reqState) (c net.Conn, err 
 		return nil, err
 	}
 	if c == nil {
-		return nil, fmt.Errorf("httproute: Dial of upstream %q returned no connection", up.Name)
+		return nil, fmt.Errorf("%w: upstream %q", errDialNoConn, up.Name)
 	}
 	return c, nil
 }

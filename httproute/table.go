@@ -330,7 +330,7 @@ func (t *Table) compile(i int, r Route, upstreams map[string]int) (*route, error
 			}
 			rt.path, rt.raw = p, true
 		}
-		if !isCleanPath(rt.path) && !(rt.raw && isCleanPath(rt.path+"x")) {
+		if !isCleanPath(rt.path) && (!rt.raw || !isCleanPath(rt.path+"x")) {
 			return nil, invalid("path %q is not a clean absolute path", r.Path)
 		}
 		t.levels = t.levels || r.Exact
@@ -549,7 +549,7 @@ func asciiFoldPrefix(s, prefix string) bool {
 	if len(s) < len(prefix) {
 		return false
 	}
-	for i := 0; i < len(prefix); i++ {
+	for i := range len(prefix) {
 		a, b := s[i], prefix[i]
 		if a != b && (a|0x20 != b|0x20 || a|0x20 < 'a' || a|0x20 > 'z') {
 			return false

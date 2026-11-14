@@ -21,7 +21,7 @@ func Normalize(host string) Name {
 	host = strings.TrimSuffix(host, ".")
 	valid := true
 	upper := false
-	for i := 0; i < len(host); i++ {
+	for i := range len(host) {
 		c := host[i]
 		if c >= 0x80 || !hostTable[c] {
 			valid = false

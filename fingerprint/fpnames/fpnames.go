@@ -10,6 +10,11 @@ import (
 	"github.com/djylb/portmux/fingerprint"
 )
 
+var (
+	errNoJA4 = errors.New("JA4 needs a fingerprint")
+	errNoJA3 = errors.New("JA3 needs a fingerprint")
+)
+
 // Register adds JA4 and JA3 to the TLS filters that portmux.ParseMatcher
 // finds in names, so that rules kept as text can filter by fingerprint, as
 // in TLS(JA4("t13d1516h2_8daaf6152771_e5627efa2ab1")); the matchers print as
@@ -20,13 +25,13 @@ func Register(names *portmux.Names) {
 	}
 	names.TLSFilterFuncs["JA4"] = func(args ...string) (portmux.TLSFilter, error) {
 		if len(args) == 0 {
-			return nil, errors.New("JA4 needs a fingerprint")
+			return nil, errNoJA4
 		}
 		return fingerprint.MatchJA4(args...), nil
 	}
 	names.TLSFilterFuncs["JA3"] = func(args ...string) (portmux.TLSFilter, error) {
 		if len(args) == 0 {
-			return nil, errors.New("JA3 needs a fingerprint")
+			return nil, errNoJA3
 		}
 		return fingerprint.MatchJA3(args...), nil
 	}

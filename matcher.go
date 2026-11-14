@@ -253,9 +253,12 @@ type alwaysMatcher struct{}
 func (alwaysMatcher) Match(*Input) Result { return Match }
 func (alwaysMatcher) String() string      { return "Always()" }
 
+// prefixName is the name of the Prefix constructor, which String prints.
+const prefixName = "Prefix"
+
 // Prefix matches connections whose first bytes equal one of the prefixes.
 func Prefix(prefixes ...string) Matcher {
-	return prefixMatcher{prefixes: slices.Clone(prefixes), name: "Prefix"}
+	return prefixMatcher{prefixes: slices.Clone(prefixes), name: prefixName}
 }
 
 type prefixMatcher struct {
@@ -266,7 +269,7 @@ type prefixMatcher struct {
 func (p prefixMatcher) Match(in *Input) Result { return matchPrefixes(in.data, p.prefixes) }
 
 func (p prefixMatcher) String() string {
-	if p.name != "Prefix" {
+	if p.name != prefixName {
 		return p.name + "()"
 	}
 	return call(p.name, p.prefixes, quote)

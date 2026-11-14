@@ -7,8 +7,9 @@ import (
 // checkFinal verifies the Matcher contract for a parser: a decision made on a
 // prefix of data never changes for data itself.
 func checkFinal(t *testing.T, data []byte, parse func([]byte) Result) {
+	t.Helper()
 	full := parse(data)
-	for i := range len(data) {
+	for i := range data {
 		if res := parse(data[:i]); res != NeedMore && res != full {
 			t.Fatalf("prefix of %d bytes decided %v, full input %v", i, res, full)
 		}

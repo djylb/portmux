@@ -109,7 +109,7 @@ func CheckPattern(p string) error {
 		if label == "" {
 			return fmt.Errorf("%w: %q has an empty label", ErrPattern, p)
 		}
-		for i := 0; i < len(label); i++ {
+		for i := range len(label) {
 			if c := label[i]; c == '*' {
 				return fmt.Errorf("%w: %q has '*' where only a leading \"*.\" may be", ErrPattern, p)
 			} else if c >= 0x80 || !hostTable[c] || c == '%' {

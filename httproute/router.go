@@ -84,20 +84,19 @@ type Router struct {
 	mu         sync.Mutex // guards transports, retired and closed
 	transports map[transportKey]*pool
 	retired    map[*pool]struct{} // replaced pools with connections in use
-	closed     bool
 
 	srv   *http.Server
 	proxy *httputil.ReverseProxy
-	ctx   context.Context // canceled by Shutdown and Close
+	ctx   context.Context //nolint:containedctx // the Router's lifetime, canceled by Shutdown and Close; requests and dials end with it
 	stop  context.CancelFunc
 
-	ln       *netx.ChanListener // for ServeConn
-	lnOnce   sync.Once
-	lnDone   chan struct{}
-	active   atomic.Int64
-	closing  atomic.Bool
-	drained  chan struct{}
-	shutOnce sync.Once
+	ln      *netx.ChanListener // for ServeConn
+	lnDone  chan struct{}
+	active  atomic.Int64
+	drained chan struct{}
+	lnOnce  sync.Once
+	closing atomic.Bool
+	closed  bool // under mu
 }
 
 // state is what a request is matched against: a table and the transports
@@ -481,7 +480,7 @@ func (r *Router) route(w http.ResponseWriter, req *http.Request, st *state, rs *
 		rs.client = forwarded.Client{Addr: peer}
 	}
 	if t.resolver != nil && t.resolver.Trusted.Contains(peer.Addr()) {
-		rs.inboundID = validRequestID(req.Header.Get("X-Request-Id"))
+		rs.inboundID = validRequestID(req.Header.Get("X-Request-ID"))
 	}
 	rt := t.match(rs.host, rs.path, req, rs)
 	if rt == nil && t.abort {
@@ -514,7 +513,7 @@ func (r *Router) route(w http.ResponseWriter, req *http.Request, st *state, rs *
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)
 		defer cancel()
-		defer context.AfterFunc(r.ctx, cancel)()
+		defer context.AfterFunc(r.ctx, cancel)() //nolint:contextcheck // ends the request with the Router, by design
 	}
 	rt.handler.ServeHTTP(w, req.WithContext(ctx))
 }

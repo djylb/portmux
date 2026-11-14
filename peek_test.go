@@ -153,7 +153,7 @@ func TestNewInputParsesIncrementally(t *testing.T) {
 	in := NewInput(remote, nil)
 	head := []byte("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
 	m := And(RemoteIP(netip.MustParsePrefix("10.0.0.0/8")), HTTP1(Host("example.com")))
-	for n := range len(head) {
+	for n := range head {
 		in.SetBytes(head[:n], false)
 		if got := m.Match(in); got != NeedMore {
 			t.Fatalf("after %d bytes: %v", n, got)

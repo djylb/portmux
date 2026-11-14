@@ -17,7 +17,6 @@ import (
 // every matcher on a connection shares one incremental parse.
 type Input struct {
 	data    []byte
-	final   bool
 	elapsed time.Duration
 	remote  net.Addr
 	local   net.Addr
@@ -27,25 +26,29 @@ type Input struct {
 
 	hello *tlshello.Hello
 	tls   tlshello.Scanner
-	tlsP  parseState
 	req   *httphead.Request
 	http  httphead.Scanner
-	httpP parseState
 	req2  *httphead.Request
 	h2    httphead.HTTP2Scanner
-	h2P   parseState
 
 	// values are the ones of SetValue, in the order set.
 	values valueList
 	// name is the name of SetRequestedName, when named.
-	name  hostmatch.Name
-	named bool
+	name hostmatch.Name
 
 	// memo keeps the decisions of the first Regexp matchers that decided,
 	// which do not change, so that a matcher that waits for more bytes in
 	// the same route does not run their expressions again on every read.
 	memo  [4]memoEntry
 	nmemo int
+
+	// The state of the three scans above, kept together: they are a few
+	// bytes each.
+	tlsP  parseState
+	httpP parseState
+	h2P   parseState
+	named bool // name is set
+	final bool // no more bytes will come
 }
 
 type inputValue struct{ key, value any }

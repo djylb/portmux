@@ -3,7 +3,7 @@ package httproute
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // the WebSocket handshake is defined with SHA-1 (RFC 6455)
 	"encoding/base64"
 	"errors"
 	"io"
@@ -42,7 +42,7 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 	for _, f := range append(hopFields, ":protocol", "Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto") {
 		out.Header.Del(f)
 	}
-	rewrite(&httputil.ProxyRequest{In: req, Out: out})
+	rewrite(&httputil.ProxyRequest{In: req, Out: out}) //nolint:contextcheck // the ReverseProxy hook: the context is the request's
 	var nonce [16]byte
 	_, _ = rand.Read(nonce[:])
 	key := base64.StdEncoding.EncodeToString(nonce[:])
@@ -61,7 +61,7 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 		return
 	}
 	res.Request = out
-	if err := modifyResponse(res); err != nil {
+	if err := modifyResponse(res); err != nil { //nolint:contextcheck // the ReverseProxy hook: the context is the response's request's
 		_ = res.Body.Close()
 		proxyError(w, out, err)
 		return
@@ -110,7 +110,7 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 }
 
 func acceptKey(key string) string {
-	sum := sha1.Sum([]byte(key + wsGUID))
+	sum := sha1.Sum([]byte(key + wsGUID)) //nolint:gosec // see the import
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 

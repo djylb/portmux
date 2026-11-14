@@ -230,11 +230,11 @@ func TestBatchPreviewAndNoDeadlock(t *testing.T) {
 	// A change that no longer applies when the batch commits fails as a
 	// whole.
 	err = m.Batch(func(bt *Batch) error {
-		if err := bt.SetPriority(b, 100); err != nil {
-			return err
+		if berr := bt.SetPriority(b, 100); berr != nil {
+			return berr
 		}
-		if _, err := bt.Add(RouteConfig{Name: "d", Matchers: []Matcher{AnyBytes()}}); err != nil {
-			return err
+		if _, berr := bt.Add(RouteConfig{Name: "d", Matchers: []Matcher{AnyBytes()}}); berr != nil {
+			return berr
 		}
 		return b.Close() // removed by another call before this batch commits
 	})
@@ -319,7 +319,9 @@ func TestNoGoroutineLeaks(t *testing.T) {
 		}
 		clients.Wait()
 		_ = m.Close()
-		<-errc
+		if serr := <-errc; serr != nil {
+			t.Log("Serve:", serr)
+		}
 		accepted.Wait()
 	}()
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
@@ -468,11 +470,11 @@ func TestCloseStopsMatchedHandOver(t *testing.T) {
 		accepted := make(chan error, 1)
 		if !handler {
 			go func() {
-				c, err := r.Accept()
-				if err == nil {
+				c, aerr := r.Accept()
+				if aerr == nil {
 					_ = c.Close()
 				}
-				accepted <- err
+				accepted <- aerr
 			}()
 			for r.Info().Accepting == 0 {
 				time.Sleep(time.Millisecond)
@@ -509,7 +511,7 @@ func TestShutdownKeepsAcceptedConnections(t *testing.T) {
 		r := m.Listen(Always())
 		got := make(chan *Conn, 1)
 		go func() {
-			if c, err := r.AcceptConn(); err == nil {
+			if c, aerr := r.AcceptConn(); aerr == nil {
 				got <- c
 			}
 			close(got)
@@ -532,7 +534,9 @@ func TestShutdownKeepsAcceptedConnections(t *testing.T) {
 		}
 		_ = dc.Close()
 		_ = c.Close()
-		<-served
+		if serr := <-served; serr != nil {
+			t.Log("Serve:", serr)
+		}
 	}
 }
 

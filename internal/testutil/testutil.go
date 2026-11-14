@@ -130,6 +130,7 @@ func H2CBytes(tb testing.TB, req *http.Request) []byte {
 }
 
 func capture(tb testing.TB, c net.Conn, done func([]byte) bool) []byte {
+	tb.Helper()
 	var buf []byte
 	tmp := make([]byte, 4096)
 	for {

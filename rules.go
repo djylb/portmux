@@ -216,7 +216,7 @@ var (
 	builtinTLSFilters  map[string]builtin[TLSFilter]
 )
 
-func init() {
+func init() { //nolint:gochecknoinits // the table is built here: see the comment above
 	builtinMatchers = map[string]builtin[Matcher]{
 		"AnyBytes": noArgs(AnyBytes), "Always": noArgs(Always), "SSH": noArgs(SSH), "HTTP2Preface": noArgs(HTTP2Preface),
 		"SOCKS4": noArgs(SOCKS4), "SOCKS5": noArgs(SOCKS5), "PostgreSQL": noArgs(PostgreSQL), "MQTT": noArgs(MQTT),
@@ -224,7 +224,7 @@ func init() {
 
 		"And":       variadic((*parser).matcher, And),
 		"Or":        variadic((*parser).matcher, Or),
-		"Prefix":    variadic((*parser).str, Prefix),
+		prefixName:  variadic((*parser).str, Prefix),
 		"Domain":    variadic((*parser).hostPattern, Domain),
 		"RemoteIP":  variadic((*parser).prefix, RemoteIP),
 		"LocalIP":   variadic((*parser).prefix, LocalIP),
@@ -351,7 +351,7 @@ func buildBuiltin[T any](p *parser, n *node, builtins map[string]builtin[T]) (v 
 	if !ok {
 		return v, false, nil
 	}
-	if err := p.count(n, b.lo, b.hi); err != nil {
+	if err = p.count(n, b.lo, b.hi); err != nil {
 		return v, true, err
 	}
 	v, err = b.build(p, n.args)
@@ -555,7 +555,7 @@ func (p *parser) int(n *node, maxValue int) (int, error) {
 // port reads a port number.
 func (p *parser) port(n *node) (uint16, error) {
 	v, err := p.int(n, 65535)
-	return uint16(v), err
+	return uint16(v), err //nolint:gosec // p.int bounds v to 65535
 }
 
 // prefix reads an IP prefix, or an address that stands for a single one.

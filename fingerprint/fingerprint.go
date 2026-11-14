@@ -1,8 +1,9 @@
 package fingerprint
 
 import (
-	"crypto/md5"
+	"crypto/md5" //nolint:gosec // JA3 is defined as an MD5 digest; it names a fingerprint and protects nothing
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"slices"
 	"strconv"
@@ -46,7 +47,7 @@ func ja4A(h *tlshello.Hello) [10]byte {
 	a := [10]byte{'t', '0', '0', 'i'}
 	switch v := h.MaxVersion(); v {
 	case 0x0304, 0x0303, 0x0302, 0x0301:
-		a[1], a[2] = '1', byte('0'+v-0x0301)
+		a[1], a[2] = '1', digit(int(v-0x0301))
 	case 0x0300:
 		a[1], a[2] = 's', '3'
 	case 0x0002:
@@ -56,7 +57,7 @@ func ja4A(h *tlshello.Hello) [10]byte {
 		a[3] = 'd'
 	}
 	nc, ne := min(countWithoutGREASE(h.CipherSuites), 99), min(countWithoutGREASE(h.Extensions), 99)
-	a[4], a[5], a[6], a[7] = byte('0'+nc/10), byte('0'+nc%10), byte('0'+ne/10), byte('0'+ne%10)
+	a[4], a[5], a[6], a[7] = digit(nc/10), digit(nc%10), digit(ne/10), digit(ne%10)
 	a[8], a[9] = ja4ALPN(h.ALPN)
 	return a
 }
@@ -100,7 +101,9 @@ func appendHexList(dst []byte, vs []uint16) []byte {
 		if i > 0 {
 			dst = append(dst, ',')
 		}
-		dst = hex.AppendEncode(dst, []byte{byte(v >> 8), byte(v)})
+		var be [2]byte
+		binary.BigEndian.PutUint16(be[:], v)
+		dst = hex.AppendEncode(dst, be[:])
 	}
 	return dst
 }
@@ -131,7 +134,7 @@ func JA3(h *tlshello.Hello) string {
 		}
 		b = strconv.AppendUint(b, uint64(f), 10)
 	}
-	sum := md5.Sum(b)
+	sum := md5.Sum(b) //nolint:gosec // see the import
 	return hex.EncodeToString(sum[:])
 }
 
@@ -204,4 +207,9 @@ func (f Filter) String() string {
 		quoted[i] = strconv.Quote(fp)
 	}
 	return f.name + "(" + strings.Join(quoted, ", ") + ")"
+}
+
+// digit is the ASCII digit of n, from 0 to 9.
+func digit(n int) byte {
+	return byte('0' + n) //nolint:gosec // callers pass 0 to 9
 }

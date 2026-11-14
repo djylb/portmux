@@ -111,7 +111,7 @@ func compileAuth(a *BasicAuth) (*basicAuth, error) {
 	if realm == "" {
 		realm = "restricted"
 	}
-	for i := 0; i < len(realm); i++ {
+	for i := range len(realm) {
 		if c := realm[i]; c < ' ' && c != '\t' || c == 0x7f {
 			return nil, invalid("realm %q has a control character", realm)
 		}
@@ -273,7 +273,7 @@ func (a authHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		a.next.ServeHTTP(w, req)
 		return
 	}
-	w.Header().Set("Www-Authenticate", a.auth.challenge)
+	w.Header().Set("WWW-Authenticate", a.auth.challenge)
 	if rs := stateOf(req.Context()); rs != nil {
 		writeError(w, req, rs, http.StatusUnauthorized)
 	} else {

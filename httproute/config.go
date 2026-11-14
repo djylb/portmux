@@ -358,7 +358,7 @@ type BasicAuth struct {
 }
 
 func invalid(format string, args ...any) error {
-	return fmt.Errorf("%w: "+format, append([]any{ErrInvalidConfig}, args...)...)
+	return fmt.Errorf("%w: %s", ErrInvalidConfig, fmt.Sprintf(format, args...))
 }
 
 func validRedirectStatus(s int) bool {
@@ -375,7 +375,7 @@ func isToken(s string) bool {
 	if s == "" {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		if c >= 0x80 || c <= ' ' || strings.IndexByte("\"(),/:;<=>?@[\\]{}\x7f", c) >= 0 {
 			return false

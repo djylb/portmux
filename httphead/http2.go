@@ -7,6 +7,10 @@ import (
 	"strings"
 )
 
+// pseudoFields are the pseudo-header fields of a request that the parser
+// takes; seen records them by index.
+var pseudoFields = [...]string{pseudoMethod, pseudoPath, pseudoScheme, pseudoAuthority}
+
 // HTTP2Preface is the connection preface that HTTP/2 clients send first.
 const HTTP2Preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
@@ -164,7 +168,7 @@ func (s *HTTP2Scanner) request(data []byte) (*Request, error) {
 			return
 		}
 		if f.name[0] == ':' {
-			i := slices.Index([]string{":method", ":path", ":scheme", ":authority"}, f.name)
+			i := slices.Index(pseudoFields[:], f.name)
 			if regular || i < 0 || seen[i] {
 				ok = false // pseudo-header fields come first, once each
 				return
@@ -202,7 +206,7 @@ func (s *HTTP2Scanner) request(data []byte) (*Request, error) {
 	case authority != "" && hosts == 1 && !strings.EqualFold(authority, host):
 		// A server may take either for the host (RFC 9113, Section 8.3.1).
 		return nil, ErrInvalid
-	case r.Method == "CONNECT":
+	case r.Method == methodConnect:
 		if r.RequestURI != "" || scheme != "" || authority == "" {
 			return nil, ErrInvalid
 		}
@@ -231,12 +235,12 @@ func validHTTP2Field(f hpackField) bool {
 	if name == "" {
 		return false
 	}
-	for i := 0; i < len(name); i++ {
+	for i := range len(name) {
 		if c := name[i]; c <= ' ' || 'A' <= c && c <= 'Z' || c >= 0x7f {
 			return false
 		}
 	}
-	for i := 0; i < len(f.value); i++ {
+	for i := range len(f.value) {
 		if c := f.value[i]; c < ' ' && c != '\t' || c == 0x7f {
 			return false
 		}

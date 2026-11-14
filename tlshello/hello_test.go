@@ -242,7 +242,7 @@ func FuzzParse(f *testing.F) {
 		if outcome(got) != outcome(want) {
 			t.Fatalf("pieces: %v, at once: %v", got, want)
 		}
-		for i := range len(data) {
+		for i := range data {
 			var s Scanner
 			_, err := s.Scan(data[:i])
 			switch o := outcome(err); {

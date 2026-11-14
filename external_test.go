@@ -44,7 +44,7 @@ func TestExternalParsers(t *testing.T) {
 	if err != nil || hello.ServerName != "a.example.com" || hello.ALPN[0] != "h2" {
 		t.Fatalf("tlshello.Parse = %+v, %v", hello, err)
 	}
-	if _, err := tlshello.Parse(raw[:len(raw)/2]); !errors.Is(err, io.ErrUnexpectedEOF) {
+	if _, err = tlshello.Parse(raw[:len(raw)/2]); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("half a hello: %v", err)
 	}
 

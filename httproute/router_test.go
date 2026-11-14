@@ -5,12 +5,12 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -317,7 +317,7 @@ func TestTrailers(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		w.Header().Set("Trailer", "X-Sum, X-Req-Trailer")
 		_, _ = w.Write(body)
-		w.Header().Set("X-Sum", fmt.Sprint(len(body)))
+		w.Header().Set("X-Sum", strconv.Itoa(len(body)))
 		w.Header().Set("X-Req-Trailer", r.Trailer.Get("X-Client"))
 	}))
 	_, base := startRouter(t, Options{}, Config{Upstreams: []Upstream{up}, Routes: []Route{{Proxy: &Proxy{Upstream: "b"}}}})
@@ -356,6 +356,7 @@ func wsBackendHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func wsBackend(t *testing.T) Upstream {
+	t.Helper()
 	return backend(t, "ws", http.HandlerFunc(wsBackendHandler))
 }
 
@@ -614,7 +615,10 @@ func TestExternalServerClose(t *testing.T) {
 	closed := make(chan error, 1)
 	go func() { closed <- r.Close() }()
 	select {
-	case <-closed:
+	case err := <-closed:
+		if err != nil {
+			t.Log("Close:", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close waits for a request of another server")
 	}

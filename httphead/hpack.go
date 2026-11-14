@@ -95,7 +95,7 @@ func (d *hpackDecoder) at(i uint64) (hpackField, error) {
 	if i > uint64(len(d.dynamic)) {
 		return hpackField{}, errHPACK
 	}
-	return d.dynamic[len(d.dynamic)-int(i)], nil
+	return d.dynamic[len(d.dynamic)-int(i)], nil //nolint:gosec // i is at most len(d.dynamic), checked above
 }
 
 // literal reads a literal field whose name index has an n-bit prefix.
@@ -106,8 +106,8 @@ func (d *hpackDecoder) literal(p []byte, n uint8) (hpackField, []byte, error) {
 	}
 	var f hpackField
 	if i > 0 {
-		named, err := d.at(i)
-		if err != nil {
+		var named hpackField
+		if named, err = d.at(i); err != nil {
 			return hpackField{}, nil, err
 		}
 		f.name = named.name
@@ -217,7 +217,7 @@ func huffmanDecode(p []byte) (string, error) {
 		cbits += 8
 		sbits += 8
 		for cbits >= 8 {
-			n = n.children[byte(cur>>(cbits-8))]
+			n = n.children[byte(cur>>(cbits-8))] //nolint:gosec // the low byte is the one wanted
 			if n == nil {
 				return "", errHPACK
 			}
@@ -231,7 +231,7 @@ func huffmanDecode(p []byte) (string, error) {
 		}
 	}
 	for cbits > 0 {
-		next := n.children[byte(cur<<(8-cbits))]
+		next := n.children[byte(cur<<(8-cbits))] //nolint:gosec // the low byte is the one wanted
 		if next == nil || next.children != nil || next.codeLen > cbits {
 			break
 		}

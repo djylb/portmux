@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -191,12 +192,12 @@ func TestInputPeerAddr(t *testing.T) {
 // cost does not grow with the number of targets.
 func BenchmarkResolverHosts(b *testing.B) {
 	for _, n := range []int{10, 1000, 100000} {
-		b.Run(fmt.Sprint(n), func(b *testing.B) {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			// The targets are routes of the table, as in a Mux.
 			var domains domainTable
 			s := routeSet{routes: map[*Route]routeState{{seq: uint64(n)}: {resolve: domains.resolve}}}
 			for i := range n {
-				r := &Route{name: fmt.Sprint(i), seq: uint64(i)}
+				r := &Route{name: strconv.Itoa(i), seq: uint64(i)}
 				domains.set(fmt.Sprintf("h%d.example.com", i), r)
 				s.routes[r] = routeState{}
 			}

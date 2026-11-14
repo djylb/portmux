@@ -394,8 +394,8 @@ func TestUpsertKeepsListener(t *testing.T) {
 	accepted := make(chan *Conn)
 	go func() {
 		for {
-			c, err := web.AcceptConn()
-			if err != nil {
+			c, aerr := web.AcceptConn()
+			if aerr != nil {
 				close(accepted)
 				return
 			}
@@ -404,8 +404,8 @@ func TestUpsertKeepsListener(t *testing.T) {
 	}()
 
 	// New matchers and priority, the same route and listener.
-	if r, err := m.Upsert(RouteConfig{Name: "web", Matchers: []Matcher{Prefix("B")}, Priority: 5}); err != nil || r != web {
-		t.Fatalf("Upsert = %v, %v; want the same route", r, err)
+	if r, uerr := m.Upsert(RouteConfig{Name: "web", Matchers: []Matcher{Prefix("B")}, Priority: 5}); uerr != nil || r != web {
+		t.Fatalf("Upsert = %v, %v; want the same route", r, uerr)
 	}
 	_, _ = dial(t, m).Write([]byte("B"))
 	if c := <-accepted; c == nil || web.Priority() != 5 {
@@ -414,12 +414,12 @@ func TestUpsertKeepsListener(t *testing.T) {
 
 	// A handler and a resolver change in place.
 	served := make(chan struct{}, 1)
-	if err := web.SetHandler(func(c *Conn) { _ = c.Close(); served <- struct{}{} }); err != nil {
+	if err = web.SetHandler(func(c *Conn) { _ = c.Close(); served <- struct{}{} }); err != nil {
 		t.Fatal(err)
 	}
 	_, _ = dial(t, m).Write([]byte("B"))
 	<-served
-	if err := web.SetHandler(nil); err != nil {
+	if err = web.SetHandler(nil); err != nil {
 		t.Fatal(err)
 	}
 

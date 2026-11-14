@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -43,6 +44,7 @@ func (c *memConn) SetWriteDeadline(time.Time) error { return nil }
 // benchServeConn measures matching and delivering one connection against a
 // typical route table, without network I/O.
 func benchServeConn(b *testing.B, data []byte) {
+	b.Helper()
 	m := New()
 	defer func() { _ = m.Close() }()
 	m.Listen(Prefix("TST"))
@@ -87,6 +89,7 @@ func BenchmarkServeConnParallelAcceptors(b *testing.B) {
 }
 
 func benchParallel(b *testing.B, acceptors int) {
+	b.Helper()
 	hello := testutil.ClientHelloBytes(b, &tls.Config{ServerName: "www.example.com", InsecureSkipVerify: true})
 	m := New()
 	defer func() { _ = m.Close() }()
@@ -146,6 +149,7 @@ func BenchmarkLoopback(b *testing.B) {
 // runClients runs b's loop in parallel clients that each dial addr, send
 // hello and wait until the server closes the connection.
 func runClients(b *testing.B, addr string, hello []byte) {
+	b.Helper()
 	b.ReportAllocs()
 	b.SetParallelism(4)
 	b.RunParallel(func(pb *testing.PB) {
@@ -167,7 +171,7 @@ func runClients(b *testing.B, addr string, hello []byte) {
 // filter one host, a path and a header.
 func BenchmarkHostRoutes(b *testing.B) {
 	for _, n := range []int{1, 10, 100, 1000} {
-		b.Run(fmt.Sprint(n), func(b *testing.B) {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			s := routeSet{routes: make(map[*Route]routeState)}
 			for i := range n {
 				s.routes[&Route{seq: uint64(i)}] = routeState{matchers: []Matcher{
@@ -227,7 +231,7 @@ func BenchmarkServeConnAlways(b *testing.B) {
 // entries and a few rules for every entry.
 func BenchmarkChangeRoutes(b *testing.B) {
 	for _, tunnels := range []int{100, 1000} {
-		b.Run(fmt.Sprint(tunnels), func(b *testing.B) {
+		b.Run(strconv.Itoa(tunnels), func(b *testing.B) {
 			m := New()
 			defer func() { _ = m.Close() }()
 			err := m.Batch(func(batch *Batch) error {

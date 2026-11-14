@@ -20,12 +20,12 @@ func waitReadable(c net.Conn) error {
 	}
 	rc, err := sc.SyscallConn()
 	if err != nil {
-		return nil
+		return nil //nolint:nilerr // without the raw connection there is nothing to wait on: the read goes ahead
 	}
 	var peek [1]byte
 	err = rc.Read(func(fd uintptr) bool {
-		_, _, err := syscall.Recvfrom(int(fd), peek[:], syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
-		return !errors.Is(err, syscall.EAGAIN) && !errors.Is(err, syscall.EINTR)
+		_, _, rerr := syscall.Recvfrom(int(fd), peek[:], syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
+		return !errors.Is(rerr, syscall.EAGAIN) && !errors.Is(rerr, syscall.EINTR)
 	})
 	if err != nil && !isTimeout(err) {
 		return nil // leave other errors, such as a closed connection, to Read

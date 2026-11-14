@@ -228,8 +228,8 @@ var (
 )
 
 // certificate returns a self-signed certificate for any name.
-func certificate(t testing.TB) tls.Certificate {
-	t.Helper()
+func certificate(tb testing.TB) tls.Certificate {
+	tb.Helper()
 	certOnce.Do(func() {
 		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {

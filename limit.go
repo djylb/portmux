@@ -30,7 +30,7 @@ var shardSeed = maphash.MakeSeed()
 // keys of IPv6 clients are networks, whose last bytes are all zero.
 func shardOf(client netip.Prefix, n int) int {
 	b := client.Addr().As16()
-	return int(maphash.Bytes(shardSeed, b[:]) % uint64(n))
+	return int(maphash.Bytes(shardSeed, b[:]) % uint64(n)) //nolint:gosec // n is a positive shard count
 }
 
 // slotLimit counts the undelivered connections from Serve for
@@ -45,17 +45,17 @@ func newSlotLimit() *slotLimit {
 	return &slotLimit{free: make(chan struct{}, 1)}
 }
 
-// tryAcquire takes a slot unless max, when positive, are taken.
-func (l *slotLimit) tryAcquire(max int) bool {
-	return addBelow(&l.n, max)
+// tryAcquire takes a slot unless limit, when positive, are taken.
+func (l *slotLimit) tryAcquire(limit int) bool {
+	return addBelow(&l.n, limit)
 }
 
-// addBelow adds one to n unless max, when positive, is reached, and reports
+// addBelow adds one to n unless limit, when positive, is reached, and reports
 // whether it did.
-func addBelow(n *atomic.Int64, max int) bool {
+func addBelow(n *atomic.Int64, limit int) bool {
 	for {
 		v := n.Load()
-		if max > 0 && v >= int64(max) {
+		if limit > 0 && v >= int64(limit) {
 			return false
 		}
 		if n.CompareAndSwap(v, v+1) {
@@ -85,11 +85,11 @@ type pendingLimit struct {
 }
 
 // acquire counts a connection of client. It reports false when the client
-// reached max.
-func (l *pendingLimit) acquire(client netip.Prefix, max int) bool {
+// reached limit.
+func (l *pendingLimit) acquire(client netip.Prefix, limit int) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.count[client] >= max {
+	if l.count[client] >= limit {
 		return false
 	}
 	l.count[client]++

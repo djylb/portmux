@@ -67,7 +67,7 @@ func (rs *reqState) requestID() string {
 	if rs.id == "" {
 		const digits = "0123456789abcdef"
 		var b [16]byte
-		x := rand.Uint64()
+		x := rand.Uint64() //nolint:gosec // request ids tell requests apart; they are not secrets
 		for i := range b {
 			b[i] = digits[x>>(4*i)&0xf]
 		}
@@ -82,7 +82,7 @@ func validRequestID(id string) string {
 	if len(id) == 0 || len(id) > 128 {
 		return ""
 	}
-	for i := 0; i < len(id); i++ {
+	for i := range len(id) {
 		if id[i] <= ' ' || id[i] >= 0x7f {
 			return ""
 		}

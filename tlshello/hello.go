@@ -210,14 +210,14 @@ func parseBody(body []byte) (*Hello, error) {
 	if !ok || !s.skip(32) {
 		return nil, ErrInvalid
 	}
-	if sid, ok := s.u8Prefixed(); !ok || len(sid) > 32 {
+	if sid, sidOK := s.u8Prefixed(); !sidOK || len(sid) > 32 {
 		return nil, ErrInvalid
 	}
 	suites, ok := s.u16Prefixed()
 	if !ok || len(suites) < 2 || len(suites)%2 != 0 {
 		return nil, ErrInvalid
 	}
-	if methods, ok := s.u8Prefixed(); !ok || len(methods) < 1 {
+	if methods, methodsOK := s.u8Prefixed(); !methodsOK || len(methods) < 1 {
 		return nil, ErrInvalid
 	}
 	storage := new(helloStorage)

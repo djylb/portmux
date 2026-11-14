@@ -103,11 +103,11 @@ type Route struct {
 	seq       uint64
 	ch        chan *Conn
 	done      chan struct{}
-	once      sync.Once
 	matched   atomic.Uint64
 	queued    atomic.Int64
 	accepting atomic.Int64
 	open      atomic.Int64
+	once      sync.Once
 	routeKind
 }
 
@@ -270,9 +270,9 @@ func (r *Route) SetMaxQueued(n int) error {
 	return r.mux.Batch(func(b *Batch) error { return b.SetMaxQueued(r, n) })
 }
 
-// tryOpen counts a connection as open unless max, when positive, are open.
-func (r *Route) tryOpen(max int) bool {
-	return addBelow(&r.open, max)
+// tryOpen counts a connection as open unless limit, when positive, are open.
+func (r *Route) tryOpen(limit int) bool {
+	return addBelow(&r.open, limit)
 }
 
 // SetPriority changes the route's priority. It returns net.ErrClosed for a

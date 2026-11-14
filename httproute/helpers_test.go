@@ -80,7 +80,7 @@ func startRouter(t *testing.T, o Options, c Config) (*Router, string) {
 		t.Fatal(err)
 	}
 	r := New(o)
-	if err := r.Update(tab); err != nil {
+	if err = r.Update(tab); err != nil {
 		t.Fatal(err)
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -101,6 +101,7 @@ func startRouter(t *testing.T, o Options, c Config) (*Router, string) {
 
 // client returns an HTTP client whose idle connections close with the test.
 func client(t *testing.T) *http.Client {
+	t.Helper()
 	tr := &http.Transport{DisableCompression: true}
 	t.Cleanup(tr.CloseIdleConnections)
 	return &http.Client{Transport: tr, Timeout: 10 * time.Second,

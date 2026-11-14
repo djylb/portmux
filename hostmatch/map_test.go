@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -152,7 +153,7 @@ func BenchmarkMapLookupLongName(b *testing.B) {
 
 func BenchmarkMapLookup(b *testing.B) {
 	for _, n := range []int{10, 100000} {
-		b.Run(fmt.Sprint(n), func(b *testing.B) {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
 			var m Map[int]
 			for i := range n {
 				m.Set(fmt.Sprintf("h%d.example.com", i), i)

@@ -211,9 +211,7 @@ func TestPickConcurrent(t *testing.T) {
 	c := client(t)
 	var wg sync.WaitGroup
 	for i := range 16 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for j := range 20 {
 				k := strconv.Itoa((i + j) % 8)
 				req, _ := http.NewRequest("GET", base+"/?k="+k, nil)
@@ -228,7 +226,7 @@ func TestPickConcurrent(t *testing.T) {
 					t.Error(res.StatusCode)
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	// The proxy releases a key's request reference after the client has

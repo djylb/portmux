@@ -14,6 +14,9 @@ import (
 	"github.com/djylb/portmux/hostmatch"
 )
 
+// methodConnect is the CONNECT method; net/http is not imported for it.
+const methodConnect = "CONNECT"
+
 // ErrInvalid is returned for data that is not the start of a well-formed
 // request head.
 var ErrInvalid = errors.New("httphead: not an HTTP request head")
@@ -315,7 +318,7 @@ func (r *Request) finish() bool {
 	case target == "":
 		// Only an HTTP/2 CONNECT request has no target; its authority is
 		// the host.
-		if r.Method != "CONNECT" {
+		if r.Method != methodConnect {
 			return false
 		}
 	case strings.IndexByte(target, '#') >= 0:
@@ -335,7 +338,7 @@ func (r *Request) finish() bool {
 		r.Path = p
 	case target == "*":
 		r.Path = "*"
-	case r.Method == "CONNECT":
+	case r.Method == methodConnect:
 		//goland:noinspection HttpUrlsUsage
 		u, err := url.ParseRequestURI("http://" + target)
 		if err != nil || u.Host == "" {
@@ -385,7 +388,7 @@ func CleanPath(escaped string) (string, error) {
 			return "", ErrInvalid
 		}
 	}
-	for i := 0; i < len(p); i++ {
+	for i := range len(p) {
 		if p[i] < ' ' || p[i] == 0x7f {
 			return "", ErrInvalid
 		}
@@ -415,7 +418,9 @@ func ambiguousPath(escaped string) bool {
 	if strings.IndexByte(escaped, '\\') >= 0 || strings.Contains(escaped, "%5C") || strings.Contains(escaped, "%5c") {
 		return true
 	}
-	for seg, rest, more := "", escaped, true; more; {
+	rest, more := escaped, true
+	for more {
+		var seg string
 		seg, rest, more = strings.Cut(rest, "/")
 		if seg == "." || seg == ".." || !strings.ContainsAny(seg, "%;") {
 			continue
@@ -424,7 +429,9 @@ func ambiguousPath(escaped string) bool {
 		if err != nil {
 			return true
 		}
-		for piece, dRest, dMore := "", decoded, true; dMore; {
+		dRest, dMore := decoded, true
+		for dMore {
+			var piece string
 			piece, dRest, dMore = strings.Cut(dRest, "/")
 			name, _, params := strings.Cut(piece, ";")
 			if name == "." || name == ".." || params && name == "" && (dMore || more) {

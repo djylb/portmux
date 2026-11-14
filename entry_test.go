@@ -148,7 +148,7 @@ func TestEntryRulesApplyAcrossEntries(t *testing.T) {
 		asked.Add(1)
 		return NoMatch
 	})
-	if _, err := m.Add(RouteConfig{Entries: []string{"admin"}, Matchers: []Matcher{counting}}); err != nil {
+	if _, err = m.Add(RouteConfig{Entries: []string{"admin"}, Matchers: []Matcher{counting}}); err != nil {
 		t.Fatal(err)
 	}
 	public, err := m.Add(RouteConfig{Name: "public", Entries: []string{"public"}, Matchers: []Matcher{AnyBytes()}})
