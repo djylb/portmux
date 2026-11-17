@@ -270,3 +270,35 @@ func TestPoolEvictsLRU(t *testing.T) {
 		t.Fatalf("keys left: %d", len(p.keys))
 	}
 }
+
+// TestPoolEvictedKeyListedAgain checks that a key evicted while in use
+// can be evicted again once its request ends while it keeps a connection,
+// so that it does not stay in the pool for good.
+func TestPoolEvictedKeyListedAgain(t *testing.T) {
+	u, err := compileUpstream(Upstream{Name: "u", Addr: "x:1", MaxKeys: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newPool(u)
+	ka := p.acquire("a") // a request on a
+	p.acquire("b")
+	p.acquire("c") // evicts a, in use
+	if ka.prev != nil {
+		t.Fatal("a still listed")
+	}
+	p.hold(ka) // a connection of a stays open
+	p.release(ka)
+	if ka.prev == nil {
+		t.Fatal("a not listed again after its request ended")
+	}
+	evicted := false
+	for _, k := range []string{"d", "e", "f", "g"} {
+		kk := p.acquire(k)
+		p.hold(kk)
+		p.release(kk)
+		evicted = evicted || ka.prev == nil
+	}
+	if !evicted {
+		t.Error("a was never evicted again")
+	}
+}

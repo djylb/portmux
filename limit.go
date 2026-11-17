@@ -193,7 +193,7 @@ func (l *rateLimit) allow(client netip.Prefix, rec records) bool {
 }
 
 func (l *rateLimit) allowAt(client netip.Prefix, now time.Duration, rec records) bool {
-	sh := &l.shards[shardOf(client, rateShards)]
+	sh := l.shard(client)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if sh.checks.due() {
@@ -203,7 +203,7 @@ func (l *rateLimit) allowAt(client netip.Prefix, now time.Duration, rec records)
 	if !ok {
 		if rec.isFull(l.size.Load()) && (!sh.swept || now-sh.fullSweep >= time.Second) {
 			sh.fullSweep, sh.swept = now, true
-			l.sweep(sh, now)
+			l.sweepAll(sh, now, rec)
 		}
 		switch {
 		case !rec.isFull(l.size.Load()):
@@ -231,6 +231,28 @@ func (l *rateLimit) sweep(sh *rateShard, now time.Duration) {
 			delete(sh.bucket, client)
 			l.size.Add(-1)
 		}
+	}
+}
+
+func (l *rateLimit) shard(client netip.Prefix) *rateShard {
+	return &l.shards[shardOf(client, rateShards)]
+}
+
+// sweepAll sweeps sh, whose lock is held, and while the table stays full
+// the other shards that are free to lock: a full table may hold its stale
+// records in other shards. TryLock keeps shards from waiting on each other.
+func (l *rateLimit) sweepAll(sh *rateShard, now time.Duration, rec records) {
+	l.sweep(sh, now)
+	for i := range l.shards {
+		o := &l.shards[i]
+		if !rec.isFull(l.size.Load()) {
+			return
+		}
+		if o == sh || !o.mu.TryLock() {
+			continue
+		}
+		l.sweep(o, now)
+		o.mu.Unlock()
 	}
 }
 

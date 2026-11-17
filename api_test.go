@@ -186,7 +186,7 @@ func TestBanPrefix(t *testing.T) {
 	defer func() { _ = m.Close() }()
 	m.BanPrefix(netip.MustParsePrefix("::ffff:192.0.2.0/120"), time.Minute)
 	now := m.bans.now()
-	if !m.bans.banned(netip.MustParseAddr("192.0.2.77"), now, testRecords) || m.bans.banned(netip.MustParseAddr("192.0.3.1"), now, testRecords) {
+	if !m.bans.banned(netip.MustParseAddr("192.0.2.77"), now, testRecords, "", false) || m.bans.banned(netip.MustParseAddr("192.0.3.1"), now, testRecords, "", false) {
 		t.Fatal("192.0.2.0/24 not banned as IPv4")
 	}
 	if bans := m.Bans(); len(bans) != 1 || bans[0].Client != netip.MustParsePrefix("192.0.2.0/24") {

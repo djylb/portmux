@@ -164,14 +164,15 @@ func (l *banList) shard(client netip.Prefix) *banShard {
 }
 
 // banned reports whether a network that holds ip is banned at now, or,
-// with rec failing closed, whether the list is full and ip has no record.
-func (l *banList) banned(ip netip.Addr, now time.Duration, rec records) bool {
+// with rec failing closed, whether the list is full and ip has no record:
+// neither the shared one nor, with own set, the one of entry.
+func (l *banList) banned(ip netip.Addr, now time.Duration, rec records, entry string, own bool) bool {
 	if l.size.Load() == 0 {
 		return false
 	}
 	known := false
 	for key := range l.keys(ip) {
-		ban, ok := l.bannedKey(key, now)
+		ban, ok := l.bannedKey(key, now, entry, own)
 		if ban {
 			return true
 		}
@@ -181,12 +182,15 @@ func (l *banList) banned(ip netip.Addr, now time.Duration, rec records) bool {
 }
 
 // bannedKey reports whether client is banned at now, and whether it has a
-// record.
-func (l *banList) bannedKey(client netip.Prefix, now time.Duration) (banned, ok bool) {
+// record: the shared one, or with own set, the one of entry.
+func (l *banList) bannedKey(client netip.Prefix, now time.Duration, entry string, own bool) (banned, ok bool) {
 	sh := l.shard(client)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	e, ok := sh.clients[banKey{client: client}]
+	if !ok && own {
+		_, ok = sh.clients[banKey{client: client, entry: entry, own: true}]
+	}
 	return ok && e.until > now, ok
 }
 

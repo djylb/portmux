@@ -98,11 +98,11 @@ func TestBanListBounds(t *testing.T) {
 	l.fail(banKey{client: host(a)}, now, 3, time.Second, time.Minute, testRecords)
 	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute, testRecords) // a new window
 	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute, testRecords)
-	if l.banned(a, now+2*time.Second, testRecords) {
+	if l.banned(a, now+2*time.Second, testRecords, "", false) {
 		t.Fatal("banned with failures in two windows")
 	}
 	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute, testRecords)
-	if !l.banned(a, now+2*time.Second, testRecords) || l.banned(a, now+3*time.Minute, testRecords) {
+	if !l.banned(a, now+2*time.Second, testRecords, "", false) || l.banned(a, now+3*time.Minute, testRecords, "", false) {
 		t.Fatal("ban period")
 	}
 	// Expired clients are swept, and the list stops growing when full.
@@ -136,7 +136,7 @@ func TestBanListScopes(t *testing.T) {
 	for i := range 4 {
 		l.fail(own, time.Duration(2+2*i)*time.Second, 3, time.Second, time.Hour, testRecords)
 	}
-	if l.banned(a, 10*time.Second, testRecords) {
+	if l.banned(a, 10*time.Second, testRecords, "", false) {
 		t.Fatal("banned by failures in separate windows")
 	}
 	// Sweeps after failures with a short window keep the Mux's count.
@@ -145,14 +145,14 @@ func TestBanListScopes(t *testing.T) {
 		l.fail(banKey{client: host(ip), entry: "fast", own: true}, time.Minute, 3, time.Second, time.Hour, testRecords)
 	}
 	l.fail(mux, 2*time.Minute, 3, 10*time.Minute, time.Hour, testRecords)
-	if !l.banned(a, 2*time.Minute, testRecords) {
+	if !l.banned(a, 2*time.Minute, testRecords, "", false) {
 		t.Fatal("not banned by the Mux's rule")
 	}
 	// The entry's rule bans the client as well.
 	for range 3 {
 		l.fail(banKey{client: host(b), entry: "fast", own: true}, time.Hour, 3, time.Second, time.Minute, testRecords)
 	}
-	if !l.banned(b, time.Hour, testRecords) || len(l.list(time.Hour)) != 2 {
+	if !l.banned(b, time.Hour, testRecords, "", false) || len(l.list(time.Hour)) != 2 {
 		t.Fatalf("bans %+v", l.list(time.Hour))
 	}
 }
@@ -181,7 +181,7 @@ func TestBanForever(t *testing.T) {
 	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
 	m.Ban(a, math.MaxInt64)
 	m.bans.fail(banKey{client: host(b)}, m.bans.now(), 1, time.Minute, math.MaxInt64, testRecords)
-	if !m.bans.banned(a, m.bans.now(), testRecords) || !m.bans.banned(b, m.bans.now(), testRecords) || len(m.Bans()) != 2 {
+	if !m.bans.banned(a, m.bans.now(), testRecords, "", false) || !m.bans.banned(b, m.bans.now(), testRecords, "", false) || len(m.Bans()) != 2 {
 		t.Fatalf("bans %+v", m.Bans())
 	}
 }
@@ -206,3 +206,23 @@ func TestBanFakeClock(t *testing.T) {
 
 // testRecords are the default bounds of tables of clients.
 var testRecords = records{max: DefaultMaxClientRecords}
+
+// TestFailClosedOwnBan checks that a full fail-closed list knows clients
+// by the records of an entry that counts its failures apart.
+func TestFailClosedOwnBan(t *testing.T) {
+	l := newBanList(timeshim.Real)
+	rec := records{max: 2, full: FullFailClosed}
+	p1, p2 := netip.MustParsePrefix("10.0.0.1/32"), netip.MustParsePrefix("10.0.0.2/32")
+	now := l.now()
+	l.fail(banKey{client: p1, entry: "e", own: true}, now, 5, time.Minute, time.Minute, rec)
+	l.fail(banKey{client: p2, entry: "e", own: true}, now, 5, time.Minute, time.Minute, rec)
+	if l.size.Load() != 2 {
+		t.Fatalf("size %d", l.size.Load())
+	}
+	if l.banned(p1.Addr(), now, rec, "e", true) {
+		t.Error("a client with a record of its entry refused as unknown")
+	}
+	if !l.banned(netip.MustParseAddr("10.0.0.3"), now, rec, "e", true) {
+		t.Error("an unknown client let in while full")
+	}
+}

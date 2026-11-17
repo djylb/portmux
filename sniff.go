@@ -230,7 +230,7 @@ func (m *Mux) admitProxied(s *sniffer, l *listener, a *admission, cs *connSettin
 		// policy would hold up or bring down.
 		if a.proxy = proxyPolicyFor(cs.opts, entry, c); a.proxy != proxyproto.Ignore {
 			a.proxied = true
-		} else if *a, err = m.admitClient(*a, c.RemoteAddr(), cs); err != nil {
+		} else if *a, err = m.admitClient(*a, entry, c.RemoteAddr(), cs); err != nil {
 			return err
 		}
 	}
@@ -240,7 +240,7 @@ func (m *Mux) admitProxied(s *sniffer, l *listener, a *admission, cs *connSettin
 	if a.proxied {
 		// The client is the source of the header, if there was one.
 		a.header = s.conn.proxy != nil
-		*a, err = m.admitClient(*a, s.conn.RemoteAddr(), cs)
+		*a, err = m.admitClient(*a, entry, s.conn.RemoteAddr(), cs)
 	}
 	return err
 }

@@ -295,7 +295,7 @@ func (m *Mux) admit(c net.Conn, l *listener, cs *connSettings) (admission, error
 		return admission{}, ErrRateLimited
 	}
 	if o.proxyPolicy != nil {
-		if ap, ok := addrPort(c.RemoteAddr()); ok && m.bans.banned(ap.Addr(), m.bans.now(), records{max: -1}) {
+		if ap, ok := addrPort(c.RemoteAddr()); ok && m.bans.banned(ap.Addr(), m.bans.now(), records{max: -1}, "", false) {
 			// Records bound only clients: a trusted peer is never refused
 			// for having none.
 			return admission{}, ErrBanned
@@ -306,7 +306,7 @@ func (m *Mux) admit(c net.Conn, l *listener, cs *connSettings) (admission, error
 	if o.maxPendingPerClient <= 0 && cs.rate == nil && o.banFailures <= 0 && m.bans.size.Load() == 0 {
 		return a, nil
 	}
-	return m.admitClient(a, c.RemoteAddr(), cs)
+	return m.admitClient(a, l.entry, c.RemoteAddr(), cs)
 }
 
 // proxyPolicyFor returns the PROXY protocol policy of o for c on entry.
@@ -319,7 +319,7 @@ func proxyPolicyFor(o *options, entry string, c net.Conn) proxyproto.Policy {
 
 // admitClient applies the per-client rules to client, the peer of a
 // connection or the source of its PROXY header, and records the client in a.
-func (m *Mux) admitClient(a admission, client net.Addr, cs *connSettings) (admission, error) {
+func (m *Mux) admitClient(a admission, entry string, client net.Addr, cs *connSettings) (admission, error) {
 	ap, ok := addrPort(client)
 	if !ok {
 		return a, nil
@@ -327,7 +327,7 @@ func (m *Mux) admitClient(a admission, client net.Addr, cs *connSettings) (admis
 	key := cs.opts.clientNet(ap.Addr())
 	a.client = key
 	switch {
-	case m.bans.banned(ap.Addr(), m.bans.now(), cs.opts.records()):
+	case m.bans.banned(ap.Addr(), m.bans.now(), cs.opts.records(), entry, cs.ownBan):
 		return a, ErrBanned
 	case cs.rate != nil && !cs.rate.allow(key, cs.opts.records()):
 		return a, ErrRateLimited

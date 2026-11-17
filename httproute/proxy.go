@@ -411,9 +411,17 @@ func (p *pool) acquire(key string) *keyPool {
 func (p *pool) release(k *keyPool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if k.refs--; k.refs == 0 && p.keys[k.key] == k {
+	k.refs--
+	switch {
+	case p.keys[k.key] != k:
+	case k.refs == 0:
 		delete(p.keys, k.key)
 		k.unlink()
+	case k.prev == nil:
+		// Evicted while in use and still holding connections, which
+		// became idle after the eviction closed the idle ones: listed
+		// again, so that a later eviction can take it.
+		p.pushFront(k)
 	}
 }
 

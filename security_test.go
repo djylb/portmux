@@ -875,15 +875,15 @@ func TestBanRecordPolicies(t *testing.T) {
 	if n := open.size.Load(); n != 4 {
 		t.Errorf("fail open: size %d", n)
 	}
-	if open.banned(client(100), time.Second, records{max: 4, full: FullFailOpen}) {
+	if open.banned(client(100), time.Second, records{max: 4, full: FullFailOpen}, "", false) {
 		t.Error("fail open refused a new client")
 	}
 	closed := fill(records{max: 4, full: FullFailClosed})
 	rec := records{max: 4, full: FullFailClosed}
-	if !closed.banned(client(100), time.Second, rec) {
+	if !closed.banned(client(100), time.Second, rec, "", false) {
 		t.Error("fail closed let a new client in while full")
 	}
-	if closed.banned(client(0), time.Second, rec) {
+	if closed.banned(client(0), time.Second, rec, "", false) {
 		t.Error("fail closed refused a client with a record")
 	}
 	evict := fill(records{max: 4, full: FullEvictOldest})
@@ -891,7 +891,7 @@ func TestBanRecordPolicies(t *testing.T) {
 		t.Errorf("evict: size %d", n)
 	}
 	// The newest client has a record; the oldest lost theirs.
-	if _, ok := evict.bannedKey(host(client(63)), time.Second); !ok {
+	if _, ok := evict.bannedKey(host(client(63)), time.Second, "", false); !ok {
 		t.Error("evict: newest client has no record")
 	}
 	// Bans are not evicted.
@@ -905,7 +905,7 @@ func TestBanRecordPolicies(t *testing.T) {
 	for i := 2; i < 10; i++ {
 		l.fail(banKey{client: host(client(i))}, 0, 2, time.Hour, time.Hour, er)
 	}
-	if !l.banned(client(0), time.Second, er) || !l.banned(client(1), time.Second, er) {
+	if !l.banned(client(0), time.Second, er, "", false) || !l.banned(client(1), time.Second, er, "", false) {
 		t.Error("evict: a ban was evicted")
 	}
 	unl := fill(records{max: -1})
@@ -928,4 +928,27 @@ func TestWithClientRecords(t *testing.T) {
 	if r := m.options().records(); r.max != DefaultMaxClientRecords || r.full != FullFailOpen {
 		t.Fatalf("records %+v", r)
 	}
+}
+
+// TestRateSweepOtherShards checks that a full table frees the stale
+// records of other shards for a new client.
+func TestRateSweepOtherShards(t *testing.T) {
+	rec := records{max: 8, full: FullFailClosed}
+	l := newRateLimit(1000, 1, timeshim.Real)
+	for i := range 8 {
+		l.allowAt(host(netip.AddrFrom4([4]byte{10, 2, 0, byte(i)})), 0, rec)
+	}
+	// Every bucket is full again a second later; find a client whose shard
+	// holds none of them.
+	for i := range 256 {
+		c := host(netip.AddrFrom4([4]byte{10, 3, 0, byte(i)}))
+		sh := l.shard(c)
+		if len(sh.bucket) == 0 {
+			if !l.allowAt(c, time.Second, rec) {
+				t.Fatal("a new client refused while other shards held only stale records")
+			}
+			return
+		}
+	}
+	t.Skip("no empty shard")
 }

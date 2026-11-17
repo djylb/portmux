@@ -360,7 +360,10 @@ const (
 	// FullFailClosed refuses clients that no record holds: a new client
 	// of a full rate table is refused with ErrRateLimited, and while the
 	// table of bans and failures is full, Serve refuses clients without a
-	// record of failures with ErrBanned.
+	// record of failures with ErrBanned. An attacker who fills a table,
+	// with many addresses or failures, then denies service to every new
+	// client until records expire: choose it only where refusing unknown
+	// clients is safer than serving them unchecked.
 	FullFailClosed
 	// FullEvictOldest makes room by forgetting the client seen longest
 	// ago, of a sample of a few records, which then starts over as a new
