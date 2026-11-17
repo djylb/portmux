@@ -163,3 +163,18 @@ func equal(a, b []string) bool {
 	}
 	return true
 }
+
+func TestBuilderUpdate(t *testing.T) {
+	var b MapBuilder[int]
+	add := func(n int, _ bool) int { return n + 1 }
+	for _, p := range []string{"A.example", "a.example.", "*.example", "*.example"} {
+		b.Update(p, add)
+	}
+	s := b.Snapshot()
+	if v, p, _ := s.Lookup("a.example"); v != 2 || p != "a.example" {
+		t.Errorf("a.example = %d %q", v, p)
+	}
+	if v, _ := s.Get("*.example"); v != 2 {
+		t.Errorf("*.example = %d", v)
+	}
+}

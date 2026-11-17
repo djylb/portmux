@@ -150,6 +150,7 @@ func (t *Table) apply(c Changes, build bool) (*Table, error) {
 	hosts := t.hosts.Builder()
 	if build {
 		named.Grow(len(c.Routes))
+		hosts.Grow(len(c.Routes)) // most routes name a host of their own
 		ups.Grow(len(c.Upstreams))
 	}
 	// Routes that proxy to upstreams that the changes remove, by name.
@@ -159,9 +160,10 @@ func (t *Table) apply(c Changes, build bool) (*Table, error) {
 			gone[name] += d
 			return
 		}
-		e, _ := ups.Get(name)
-		e.refs += d
-		ups.Set(name, e)
+		ups.Update(name, func(e upstreamEntry, _ bool) upstreamEntry {
+			e.refs += d
+			return e
+		})
 	}
 	// Routes that leave, and the host patterns whose lists With copied:
 	// both stay empty in Build, whose lists are all new.
@@ -273,8 +275,7 @@ func (t *Table) apply(c Changes, build bool) (*Table, error) {
 		}
 		for _, h := range rt.hosts {
 			touch(h)
-			list, _ := hosts.Get(h)
-			hosts.Set(h, append(list, rt))
+			hosts.Update(h, func(list []*route, _ bool) []*route { return append(list, rt) })
 		}
 	}
 	for name, n := range gone {

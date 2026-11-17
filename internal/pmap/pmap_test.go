@@ -125,3 +125,22 @@ func TestDiffFull(t *testing.T) {
 		t.Fatalf("add %d del %d upd %d", add, del, upd)
 	}
 }
+
+// TestUpdate counts with Update in bulk and in a trie.
+func TestUpdate(t *testing.T) {
+	inc := func(n int, _ bool) int { return n + 1 }
+	for _, base := range []Map[int]{{}, Map[int]{}.With("x", 0)} {
+		b := base.Builder()
+		for range 3 {
+			b.Update("a", inc)
+		}
+		b.Update("x", inc)
+		m := b.Map()
+		if a, _ := m.Get("a"); a != 3 {
+			t.Errorf("a = %d", a)
+		}
+		if x, _ := m.Get("x"); x != 1 {
+			t.Errorf("x = %d", x)
+		}
+	}
+}

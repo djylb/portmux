@@ -384,14 +384,16 @@ func diffEntries[V any](a, b []*slot[V], fn func(string, V, bool, V, bool)) {
 }
 
 // Builder changes a Map in place. Its zero value starts from an empty map.
-// Starting from an empty map, it gathers entries in a hash map and builds
-// the trie once, with nodes of their exact size, when Map is called; from a
-// map with entries, it changes the trie, copying each shared node it
-// touches once. A Builder is not safe for concurrent use.
+// Starting from an empty map, it gathers entries in a list and builds the
+// trie once, with nodes of their exact size, when Map is called; from a map
+// with entries, it changes the trie, copying each shared node it touches
+// once. A Builder is not safe for concurrent use.
 type Builder[V any] struct {
 	owner *owner
-	bulk  map[string]V // entries gathered from empty, or nil
+	index map[string]int // of entries gathered in bulk in list, or nil
+	list  []slot[V]
 	m     Map[V]
+	dead  int // entries of list deleted
 }
 
 // Builder returns a Builder that starts from m, which it does not change.
@@ -404,43 +406,49 @@ func (b *Builder[V]) own() *owner {
 	return b.owner
 }
 
-// gathering reports whether b gathers entries in bulk.
-func (b *Builder[V]) gathering() bool {
-	if b.bulk == nil && b.m.root == nil && b.owner == nil {
-		b.bulk = map[string]V{}
+// gathering reports whether b gathers entries in bulk, as it does from an
+// empty map.
+func (b *Builder[V]) gathering(hint int) bool {
+	if b.index == nil && b.m.root == nil && b.owner == nil {
+		b.index = make(map[string]int, hint)
+		b.list = make([]slot[V], 0, hint)
 	}
-	return b.bulk != nil
+	return b.index != nil
 }
 
 // Grow hints that about n entries are to be set, so that a Builder that
 // gathers in bulk makes room for them at once.
-func (b *Builder[V]) Grow(n int) {
-	if b.bulk == nil && b.m.root == nil && b.owner == nil && n > 0 {
-		b.bulk = make(map[string]V, n)
-	}
-}
+func (b *Builder[V]) Grow(n int) { b.gathering(max(n, 0)) }
 
 // Len returns the number of entries.
 func (b *Builder[V]) Len() int {
-	if b.bulk != nil {
-		return len(b.bulk)
+	if b.index != nil {
+		return len(b.index)
 	}
 	return b.m.n
 }
 
 // Get returns the value of key.
 func (b *Builder[V]) Get(key string) (V, bool) {
-	if b.bulk != nil {
-		v, ok := b.bulk[key]
-		return v, ok
+	if b.index != nil {
+		if i, ok := b.index[key]; ok {
+			return b.list[i].val, true
+		}
+		var zero V
+		return zero, false
 	}
 	return b.m.Get(key)
 }
 
 // Set maps key to v.
 func (b *Builder[V]) Set(key string, v V) {
-	if b.gathering() {
-		b.bulk[key] = v
+	if b.gathering(0) {
+		if i, ok := b.index[key]; ok {
+			b.list[i].val = v
+			return
+		}
+		b.index[key] = len(b.list)
+		b.list = append(b.list, slot[V]{key: key, val: v}) // hashed by Map
 		return
 	}
 	root, added := b.m.root.set(b.own(), slot[V]{key: key, val: v, hash: hash(key)}, 0)
@@ -450,10 +458,31 @@ func (b *Builder[V]) Set(key string, v V) {
 	}
 }
 
+// Update sets key to what fn returns for its value, and whether it had one,
+// looking key up once.
+func (b *Builder[V]) Update(key string, fn func(old V, ok bool) V) {
+	if b.gathering(0) {
+		if i, ok := b.index[key]; ok {
+			b.list[i].val = fn(b.list[i].val, true)
+			return
+		}
+		var zero V
+		b.index[key] = len(b.list)
+		b.list = append(b.list, slot[V]{key: key, val: fn(zero, false)})
+		return
+	}
+	old, ok := b.m.Get(key)
+	b.Set(key, fn(old, ok))
+}
+
 // Delete removes key.
 func (b *Builder[V]) Delete(key string) {
-	if b.bulk != nil {
-		delete(b.bulk, key)
+	if b.index != nil {
+		if i, ok := b.index[key]; ok {
+			delete(b.index, key)
+			b.list[i].key = "" // dropped by Map, as index no longer names it
+			b.dead++
+		}
 		return
 	}
 	root, removed := b.m.root.del(b.own(), hash(key), key, 0)
@@ -464,13 +493,22 @@ func (b *Builder[V]) Delete(key string) {
 
 // Map returns the map built so far. Later changes of b do not change it.
 func (b *Builder[V]) Map() Map[V] {
-	if b.bulk != nil {
-		es := make([]slot[V], 0, len(b.bulk))
-		for k, v := range b.bulk {
-			es = append(es, slot[V]{key: k, val: v, hash: hash(k)})
+	if b.index != nil {
+		es := b.list
+		if b.dead > 0 {
+			kept := es[:0]
+			for i := range es {
+				if j, ok := b.index[es[i].key]; ok && j == i {
+					kept = append(kept, es[i])
+				}
+			}
+			es = kept
 		}
-		b.bulk = nil
-		b.m = Map[V]{root: build(es, make([]slot[V], len(es)), 0), n: len(es)}
+		for i := range es {
+			es[i].hash = hash(es[i].key)
+		}
+		b.m = Map[V]{root: build(es, 0), n: len(es)}
+		b.index, b.list, b.dead = nil, nil, 0
 		return b.m
 	}
 	if b.owner != nil {
@@ -480,18 +518,19 @@ func (b *Builder[V]) Map() Map[V] {
 	return b.m
 }
 
-// build returns the trie of es at shift, with nodes of their exact size;
-// tmp, as long as es, is room to sort es by the bits of their hashes.
-func build[V any](es, tmp []slot[V], shift uint) *node[V] {
+// build returns the trie of es at shift, with nodes of their exact size.
+// It sorts es in place by the bits of their hashes.
+func build[V any](es []slot[V], shift uint) *node[V] {
 	if len(es) == 0 {
 		return nil
 	}
 	if shift >= maxShift {
 		return &node[V]{slots: slices.Clone(es)}
 	}
-	var start [fanMask + 2]int
+	chunk := func(e *slot[V]) uint64 { return e.hash >> shift & fanMask }
+	var start, next [fanMask + 2]int
 	for i := range es {
-		start[es[i].hash>>shift&fanMask+1]++
+		start[chunk(&es[i])+1]++
 	}
 	n := &node[V]{}
 	used := 0
@@ -502,21 +541,28 @@ func build[V any](es, tmp []slot[V], shift uint) *node[V] {
 		}
 		start[i+1] += start[i]
 	}
-	next := start
-	for i := range es {
-		c := es[i].hash >> shift & fanMask
-		tmp[next[c]] = es[i]
-		next[c]++
+	// Put each entry in its bucket by swaps, as American flag sort does.
+	next = start
+	for c := range fanMask + 1 {
+		for next[c] < start[c+1] {
+			e := &es[next[c]]
+			if d := chunk(e); d != uint64(c) {
+				es[next[c]], es[next[d]] = es[next[d]], es[next[c]]
+				next[d]++
+			} else {
+				next[c]++
+			}
+		}
 	}
 	n.slots = make([]slot[V], 0, used)
 	for i := range fanMask + 1 {
-		part := tmp[start[i]:start[i+1]]
+		part := es[start[i]:start[i+1]]
 		switch len(part) {
 		case 0:
 		case 1:
 			n.slots = append(n.slots, part[0])
 		default:
-			n.slots = append(n.slots, slot[V]{sub: build(part, es[start[i]:start[i+1]], shift+bitsPerLevel)})
+			n.slots = append(n.slots, slot[V]{sub: build(part, shift+bitsPerLevel)})
 		}
 	}
 	return n

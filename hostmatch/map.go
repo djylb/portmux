@@ -287,6 +287,14 @@ func edit[V any](bp **pmap.Builder[hostEntry[V]], m pmap.Map[hostEntry[V]]) *pma
 	return *bp
 }
 
+// Grow hints that about n exact names are to be set, so that a MapBuilder
+// that starts from an empty Snapshot makes room for them at once.
+func (b *MapBuilder[V]) Grow(n int) {
+	if b.exact == nil && b.base.exact.Len() == 0 {
+		edit(&b.exact, b.base.exact).Grow(n)
+	}
+}
+
 // Set maps pattern to v, replacing the value it had. It panics on a
 // pattern that CheckPattern refuses.
 func (b *MapBuilder[V]) Set(pattern string, v V) {
@@ -306,6 +314,22 @@ func (b *MapBuilder[V]) Set(pattern string, v V) {
 	case patternAny:
 		b.any = &e
 	}
+}
+
+// Update sets pattern to what fn returns for its value, and whether it had
+// one, looking an exact name up once. It panics on a pattern that
+// CheckPattern refuses.
+func (b *MapBuilder[V]) Update(pattern string, fn func(old V, ok bool) V) {
+	mustPattern(pattern)
+	p := parseHostPattern(pattern)
+	if p.kind != patternExact {
+		old, ok := b.Get(pattern)
+		b.Set(pattern, fn(old, ok))
+		return
+	}
+	edit(&b.exact, b.base.exact).Update(p.key, func(e hostEntry[V], ok bool) hostEntry[V] {
+		return hostEntry[V]{pattern: p.key, value: fn(e.value, ok)}
+	})
 }
 
 // Delete removes pattern and reports whether it was set.
