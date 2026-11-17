@@ -15,6 +15,11 @@
 // served, keeping the transports of the upstreams it leaves alone; requests
 // read it without a lock and keep the table they were matched with.
 //
+// A request's host is found in time independent of the number of host
+// patterns; the routes of each matching pattern are then tried in order,
+// so lookup costs O(k) in the k routes of one pattern. Spread many routes
+// over host patterns rather than give one pattern very many paths.
+//
 // Of the routes whose host patterns match a request, a route is chosen in
 // this order:
 //

@@ -30,18 +30,25 @@ func TestRandom(t *testing.T) {
 		keys := 1 + rng.IntN(2000)
 		var m Map[int]
 		want := map[string]int{}
-		b := Map[int]{}.Builder()
+		b := Map[int]{}.Builder() // gathers in bulk
+		seed := Map[int]{}.With("seed", 0)
+		tb := seed.Builder() // changes the trie in place
+		tbWant := map[string]int{"seed": 0}
 		for i := range 3000 {
 			k := strconv.Itoa(rng.IntN(keys))
 			prev, prevWant := m, maps.Clone(want)
 			if rng.IntN(3) == 0 {
 				m = m.Without(k)
 				b.Delete(k)
+				tb.Delete(k)
 				delete(want, k)
+				delete(tbWant, k)
 			} else {
 				m = m.With(k, i)
 				b.Set(k, i)
+				tb.Set(k, i)
 				want[k] = i
+				tbWant[k] = i
 			}
 			if i%500 == 0 || round == 0 && i < 50 {
 				check(t, m, want)
@@ -59,6 +66,8 @@ func TestRandom(t *testing.T) {
 			}
 		}
 		check(t, m, want)
+		check(t, tb.Map(), tbWant)
+		check(t, seed, map[string]int{"seed": 0})
 		built := b.Map()
 		check(t, built, want)
 		b.Set("after", -1) // must not change built

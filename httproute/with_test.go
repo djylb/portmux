@@ -228,7 +228,7 @@ func TestUpdateDiffsUpstreams(t *testing.T) {
 	}
 	r := New(Options{})
 	defer func() { _ = r.Close() }()
-	if err := r.Update(t0); err != nil {
+	if err = r.Update(t0); err != nil {
 		t.Fatal(err)
 	}
 	a, b := poolOf(r, "a"), poolOf(r, "b")
@@ -236,7 +236,7 @@ func TestUpdateDiffsUpstreams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Update(t1); err != nil {
+	if err = r.Update(t1); err != nil {
 		t.Fatal(err)
 	}
 	if poolOf(r, "a") != a || poolOf(r, "b") == b || poolOf(r, "c") == nil {

@@ -148,6 +148,10 @@ func (t *Table) apply(c Changes, build bool) (*Table, error) {
 	ups := t.upstreams.Builder()
 	named := t.named.Builder()
 	hosts := t.hosts.Builder()
+	if build {
+		named.Grow(len(c.Routes))
+		ups.Grow(len(c.Upstreams))
+	}
 	// Routes that proxy to upstreams that the changes remove, by name.
 	var gone map[string]int
 	ref := func(name string, d int) {
@@ -232,7 +236,8 @@ func (t *Table) apply(c Changes, build bool) (*Table, error) {
 		ups.Set(u.Name, upstreamEntry{up: cu, refs: e.refs})
 	}
 	clear(seen)
-	for i, r := range c.Routes {
+	for i := range c.Routes {
+		r := &c.Routes[i] // Routes are large: no copy
 		if r.Name == "" && !build {
 			return nil, invalid("route #%d of the changes has no name", i)
 		}
@@ -520,7 +525,7 @@ func (rt *route) label() string {
 	return "#" + strconv.Itoa(rt.order)
 }
 
-func (cm *common) compile(r Route, upstreams *pmap.Builder[upstreamEntry]) (*route, error) {
+func (cm *common) compile(r *Route, upstreams *pmap.Builder[upstreamEntry]) (*route, error) {
 	rt := &route{name: r.Name, path: r.Path, exact: r.Exact, ci: r.CaseInsensitivePath,
 		methods: r.Methods, https: r.RedirectHTTPS, maxBody: r.MaxRequestBody,
 		idle: r.UpgradeIdleTimeout, response: r.ResponseHeaders}

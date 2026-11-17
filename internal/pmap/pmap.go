@@ -384,9 +384,13 @@ func diffEntries[V any](a, b []*slot[V], fn func(string, V, bool, V, bool)) {
 }
 
 // Builder changes a Map in place. Its zero value starts from an empty map.
-// A Builder is not safe for concurrent use.
+// Starting from an empty map, it gathers entries in a hash map and builds
+// the trie once, with nodes of their exact size, when Map is called; from a
+// map with entries, it changes the trie, copying each shared node it
+// touches once. A Builder is not safe for concurrent use.
 type Builder[V any] struct {
 	owner *owner
+	bulk  map[string]V // entries gathered from empty, or nil
 	m     Map[V]
 }
 
@@ -400,14 +404,45 @@ func (b *Builder[V]) own() *owner {
 	return b.owner
 }
 
+// gathering reports whether b gathers entries in bulk.
+func (b *Builder[V]) gathering() bool {
+	if b.bulk == nil && b.m.root == nil && b.owner == nil {
+		b.bulk = map[string]V{}
+	}
+	return b.bulk != nil
+}
+
+// Grow hints that about n entries are to be set, so that a Builder that
+// gathers in bulk makes room for them at once.
+func (b *Builder[V]) Grow(n int) {
+	if b.bulk == nil && b.m.root == nil && b.owner == nil && n > 0 {
+		b.bulk = make(map[string]V, n)
+	}
+}
+
 // Len returns the number of entries.
-func (b *Builder[V]) Len() int { return b.m.n }
+func (b *Builder[V]) Len() int {
+	if b.bulk != nil {
+		return len(b.bulk)
+	}
+	return b.m.n
+}
 
 // Get returns the value of key.
-func (b *Builder[V]) Get(key string) (V, bool) { return b.m.Get(key) }
+func (b *Builder[V]) Get(key string) (V, bool) {
+	if b.bulk != nil {
+		v, ok := b.bulk[key]
+		return v, ok
+	}
+	return b.m.Get(key)
+}
 
 // Set maps key to v.
 func (b *Builder[V]) Set(key string, v V) {
+	if b.gathering() {
+		b.bulk[key] = v
+		return
+	}
 	root, added := b.m.root.set(b.own(), slot[V]{key: key, val: v, hash: hash(key)}, 0)
 	b.m.root = root
 	if added {
@@ -417,6 +452,10 @@ func (b *Builder[V]) Set(key string, v V) {
 
 // Delete removes key.
 func (b *Builder[V]) Delete(key string) {
+	if b.bulk != nil {
+		delete(b.bulk, key)
+		return
+	}
 	root, removed := b.m.root.del(b.own(), hash(key), key, 0)
 	if removed {
 		b.m.root, b.m.n = root, b.m.n-1
@@ -425,9 +464,60 @@ func (b *Builder[V]) Delete(key string) {
 
 // Map returns the map built so far. Later changes of b do not change it.
 func (b *Builder[V]) Map() Map[V] {
+	if b.bulk != nil {
+		es := make([]slot[V], 0, len(b.bulk))
+		for k, v := range b.bulk {
+			es = append(es, slot[V]{key: k, val: v, hash: hash(k)})
+		}
+		b.bulk = nil
+		b.m = Map[V]{root: build(es, make([]slot[V], len(es)), 0), n: len(es)}
+		return b.m
+	}
 	if b.owner != nil {
 		b.m.root.trim(b.owner)
 	}
 	b.owner = nil // nodes made so far are now shared
 	return b.m
+}
+
+// build returns the trie of es at shift, with nodes of their exact size;
+// tmp, as long as es, is room to sort es by the bits of their hashes.
+func build[V any](es, tmp []slot[V], shift uint) *node[V] {
+	if len(es) == 0 {
+		return nil
+	}
+	if shift >= maxShift {
+		return &node[V]{slots: slices.Clone(es)}
+	}
+	var start [fanMask + 2]int
+	for i := range es {
+		start[es[i].hash>>shift&fanMask+1]++
+	}
+	n := &node[V]{}
+	used := 0
+	for i := range fanMask + 1 {
+		if start[i+1] > 0 {
+			n.bitmap |= 1 << i
+			used++
+		}
+		start[i+1] += start[i]
+	}
+	next := start
+	for i := range es {
+		c := es[i].hash >> shift & fanMask
+		tmp[next[c]] = es[i]
+		next[c]++
+	}
+	n.slots = make([]slot[V], 0, used)
+	for i := range fanMask + 1 {
+		part := tmp[start[i]:start[i+1]]
+		switch len(part) {
+		case 0:
+		case 1:
+			n.slots = append(n.slots, part[0])
+		default:
+			n.slots = append(n.slots, slot[V]{sub: build(part, es[start[i]:start[i+1]], shift+bitsPerLevel)})
+		}
+	}
+	return n
 }
