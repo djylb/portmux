@@ -120,27 +120,27 @@ func Diff[V any](a, b Map[V], fn func(key string, old V, hadOld bool, cur V, has
 }
 
 func (n *node[V]) find(h uint64, key string, shift uint) *slot[V] {
-	for n != nil {
+	for cur := n; cur != nil; {
 		if shift >= maxShift {
-			for i := range n.slots {
-				if n.slots[i].key == key {
-					return &n.slots[i]
+			for i := range cur.slots {
+				if cur.slots[i].key == key {
+					return &cur.slots[i]
 				}
 			}
 			return nil
 		}
 		bit := uint32(1) << (h >> shift & fanMask)
-		if n.bitmap&bit == 0 {
+		if cur.bitmap&bit == 0 {
 			return nil
 		}
-		s := &n.slots[bits.OnesCount32(n.bitmap&(bit-1))]
+		s := &cur.slots[bits.OnesCount32(cur.bitmap&(bit-1))]
 		if s.sub == nil {
 			if s.hash == h && s.key == key {
 				return s
 			}
 			return nil
 		}
-		n, shift = s.sub, shift+bitsPerLevel
+		cur, shift = s.sub, shift+bitsPerLevel
 	}
 	return nil
 }

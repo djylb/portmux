@@ -458,14 +458,14 @@ type Config struct {
 	// ClientPrefix4 and ClientPrefix6 are the arguments of WithClientPrefix.
 	ClientPrefix4 int
 	ClientPrefix6 int
-	// Observer and ProxyProtocol report whether WithObserver and
-	// WithProxyProtocol set a function.
-	Observer      bool
-	ProxyProtocol bool
 	// MaxClientRecords and ClientRecordsFull are the arguments of
 	// WithClientRecords.
 	MaxClientRecords  int
 	ClientRecordsFull FullPolicy
+	// Observer and ProxyProtocol report whether WithObserver and
+	// WithProxyProtocol set a function.
+	Observer      bool
+	ProxyProtocol bool
 	// CloseEvents is the argument of WithCloseEvents.
 	CloseEvents bool
 }

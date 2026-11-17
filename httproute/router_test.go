@@ -190,7 +190,7 @@ func TestErrors(t *testing.T) {
 	checkLeaks(t)
 	slow := make(chan struct{})
 	t.Cleanup(func() { close(slow) })
-	reject := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	reject := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = io.WriteString(w, "backend page")
 	})
@@ -202,7 +202,7 @@ func TestErrors(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusUnauthorized)
 	})
-	slowUp := backend(t, "slow", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	slowUp := backend(t, "slow", http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		select {
 		case <-slow:
 		case <-r.Context().Done():
@@ -417,8 +417,8 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 
 func TestUpdate(t *testing.T) {
 	checkLeaks(t)
-	b1 := backend(t, "b", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "one") }))
-	b2 := backend(t, "b", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "two") }))
+	b1 := backend(t, "b", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "one") }))
+	b2 := backend(t, "b", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "two") }))
 	t1, err := Build(Config{Upstreams: []Upstream{b1}, Routes: []Route{{Proxy: &Proxy{Upstream: "b"}}}})
 	if err != nil {
 		t.Fatal(err)
@@ -634,7 +634,7 @@ func TestExternalServerClose(t *testing.T) {
 func TestShutdown(t *testing.T) {
 	checkLeaks(t)
 	release := make(chan struct{})
-	up := backend(t, "b", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := backend(t, "b", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		<-release
 		_, _ = io.WriteString(w, "done")
 	}))
