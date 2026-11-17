@@ -5,11 +5,13 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/djylb/portmux/internal/pmap"
 )
 
-// Map maps host name patterns to values and looks names up by specificity,
-// as virtual hosts are chosen. Patterns are those of Set. The patterns that
-// match a name rank, most specific first:
+// Snapshot maps host name patterns to values and looks names up by
+// specificity, as virtual hosts are chosen. Patterns are those of Set. The
+// patterns that match a name rank, most specific first:
 //
 //   - the exact name;
 //   - ".name", which takes the name itself as well as the names below it;
@@ -23,23 +25,33 @@ import (
 // function accepts, and Matches all of them in this order, so that a policy
 // of your own can skip patterns whose values do not apply. The empty pattern
 // matches a ClientHello or request without a name. Names with bytes that no
-// DNS name has match no pattern. Set panics on patterns that CheckPattern
-// refuses, such as "api-*.example.com", which older versions matched.
+// DNS name has match no pattern. With panics on patterns that CheckPattern
+// refuses, such as "api-*.example.com".
 //
-// A Map is safe for concurrent use, and its zero value is an empty map ready
-// to use. Lookups take no lock and cost a few map lookups whatever the
-// number of patterns. Patterns can be set and deleted while lookups run.
-type Map[V any] struct {
-	exact    sync.Map // name -> *hostEntry[V]
-	self     sync.Map // "example.com" -> *hostEntry[V], for ".example.com"
-	suffixes sync.Map // ".example.com" -> *hostEntry[V], for "*.example.com"
-	dots     sync.Map // ".example.com" -> *hostEntry[V], for ".example.com"
+// A Snapshot is immutable and safe for concurrent use; a nil or zero
+// Snapshot is empty. With and Without return a new Snapshot that shares all
+// but the changed paths with the old one, so a change costs a few small
+// copies whatever the number of patterns, and a Snapshot of a few patterns
+// is a few small nodes. Lookups cost a few hash lookups whatever the number
+// of patterns. Load many patterns at once with a MapBuilder.
+type Snapshot[V any] struct {
+	exact    pmap.Map[hostEntry[V]] // name
+	self     pmap.Map[hostEntry[V]] // "example.com", for ".example.com"
+	suffixes pmap.Map[hostEntry[V]] // ".example.com", for "*.example.com"
+	dots     pmap.Map[hostEntry[V]] // ".example.com", for ".example.com"
+	any      *hostEntry[V]
 	// longest is the length of the longest suffix ever set, so that a lookup
 	// tries only the dots at which a suffix can start, however long the name.
-	longest atomic.Int64
-	any     atomic.Pointer[hostEntry[V]]
-	mu      sync.Mutex // serialises changes of "*" and ".name" patterns
-	n       atomic.Int64
+	longest int
+}
+
+// Map is a Snapshot that changes in place: Set and Delete publish a new
+// Snapshot, which lookups then see. Lookups take no lock; changes are
+// serialised. Its zero value is an empty map ready to use. Use Edit to
+// apply many changes as one.
+type Map[V any] struct {
+	cur atomic.Pointer[Snapshot[V]]
+	mu  sync.Mutex // serialises changes
 }
 
 // hostEntry is a pattern, as it compares, and its value.
@@ -90,91 +102,67 @@ func (p hostPattern) String() string {
 	}
 }
 
-// Set maps pattern to v, replacing the value it had. It panics on a
-// pattern that CheckPattern refuses.
-func (m *Map[V]) Set(pattern string, v V) {
-	mustPattern(pattern)
-	p := parseHostPattern(pattern)
-	e := &hostEntry[V]{pattern: p.String(), value: v}
-	var loaded bool
-	switch p.kind {
-	case patternExact:
-		_, loaded = m.exact.Swap(p.key, e)
-	case patternSuffix:
-		m.raiseLongest(len(p.key))
-		_, loaded = m.suffixes.Swap(p.key, e)
-	case patternDot:
-		m.mu.Lock()
-		m.raiseLongest(len(p.key))
-		_, loaded = m.dots.Swap(p.key, e)
-		m.self.Store(p.key[1:], e)
-		m.mu.Unlock()
-	case patternAny:
-		loaded = m.any.Swap(e) != nil
-	}
-	if !loaded {
-		m.n.Add(1)
-	}
-}
-
-// raiseLongest raises longest before a suffix is stored, so that lookups
-// that find the suffix also try its dot.
-func (m *Map[V]) raiseLongest(n int) {
-	for {
-		if cur := m.longest.Load(); cur >= int64(n) || m.longest.CompareAndSwap(cur, int64(n)) {
-			return
-		}
-	}
-}
-
-// Delete removes pattern and reports whether it was set.
-func (m *Map[V]) Delete(pattern string) bool {
-	p := parseHostPattern(pattern)
-	deleted := false
-	switch p.kind {
-	case patternExact:
-		_, deleted = m.exact.LoadAndDelete(p.key)
-	case patternSuffix:
-		_, deleted = m.suffixes.LoadAndDelete(p.key)
-	case patternDot:
-		m.mu.Lock()
-		_, deleted = m.dots.LoadAndDelete(p.key)
-		m.self.Delete(p.key[1:])
-		m.mu.Unlock()
-	case patternAny:
-		deleted = m.any.Swap(nil) != nil
-	}
-	if deleted {
-		m.n.Add(-1)
-	}
-	return deleted
-}
-
 // Get returns the value of pattern itself, without matching.
-func (m *Map[V]) Get(pattern string) (V, bool) {
-	var e *hostEntry[V]
-	switch p := parseHostPattern(pattern); p.kind {
-	case patternExact:
-		e = loadEntry[V](&m.exact, p.key)
-	case patternSuffix:
-		e = loadEntry[V](&m.suffixes, p.key)
-	case patternDot:
-		e = loadEntry[V](&m.dots, p.key)
-	case patternAny:
-		e = m.any.Load()
-	}
-	if e == nil {
+func (s *Snapshot[V]) Get(pattern string) (V, bool) {
+	if s == nil {
 		var zero V
 		return zero, false
 	}
-	return e.value, true
+	return get(pattern, s.exact.Get, s.suffixes.Get, s.dots.Get, s.any)
+}
+
+type getter[V any] func(string) (hostEntry[V], bool)
+
+func get[V any](pattern string, exact, suffixes, dots getter[V], anyEntry *hostEntry[V]) (V, bool) {
+	var e hostEntry[V]
+	ok := false
+	switch p := parseHostPattern(pattern); p.kind {
+	case patternExact:
+		e, ok = exact(p.key)
+	case patternSuffix:
+		e, ok = suffixes(p.key)
+	case patternDot:
+		e, ok = dots(p.key)
+	case patternAny:
+		if anyEntry != nil {
+			e, ok = *anyEntry, true
+		}
+	}
+	return e.value, ok
+}
+
+// With returns s with pattern mapped to v. It panics on a pattern that
+// CheckPattern refuses.
+func (s *Snapshot[V]) With(pattern string, v V) *Snapshot[V] {
+	b := s.Builder()
+	b.Set(pattern, v)
+	return b.Snapshot()
+}
+
+// Without returns s without pattern.
+func (s *Snapshot[V]) Without(pattern string) *Snapshot[V] {
+	b := s.Builder()
+	b.Delete(pattern)
+	return b.Snapshot()
+}
+
+// Len returns the number of patterns.
+func (s *Snapshot[V]) Len() int {
+	if s == nil {
+		return 0
+	}
+	n := s.exact.Len() + s.suffixes.Len() + s.dots.Len()
+	if s.any != nil {
+		n++
+	}
+	return n
 }
 
 // Lookup returns the value of the most specific pattern that matches host, a
 // bare name or IP address without a port, and that pattern as it compares:
 // lowercased and without a trailing dot.
-func (m *Map[V]) Lookup(host string) (v V, pattern string, ok bool) {
-	m.walk(Normalize(host), func(p string, x V) bool {
+func (s *Snapshot[V]) Lookup(host string) (v V, pattern string, ok bool) {
+	s.walk(Normalize(host), func(p string, x V) bool {
 		v, pattern, ok = x, p, true
 		return false
 	})
@@ -184,16 +172,15 @@ func (m *Map[V]) Lookup(host string) (v V, pattern string, ok bool) {
 // LookupFunc returns the value and pattern of the most specific pattern
 // that matches host and whose value accept accepts, so that a name falls back
 // to wider patterns when the value of a narrower one does not apply. It is
-// Matches without allocating; accept must not call methods of m that change
-// it.
-func (m *Map[V]) LookupFunc(host string, accept func(pattern string, v V) bool) (v V, pattern string, ok bool) {
-	return m.LookupNameFunc(Normalize(host), accept)
+// Matches without allocating.
+func (s *Snapshot[V]) LookupFunc(host string, accept func(pattern string, v V) bool) (v V, pattern string, ok bool) {
+	return s.LookupNameFunc(Normalize(host), accept)
 }
 
 // LookupNameFunc is LookupFunc for a prepared name, which it does not prepare
 // again.
-func (m *Map[V]) LookupNameFunc(n Name, accept func(pattern string, v V) bool) (v V, pattern string, ok bool) {
-	m.walk(n, func(p string, x V) bool {
+func (s *Snapshot[V]) LookupNameFunc(n Name, accept func(pattern string, v V) bool) (v V, pattern string, ok bool) {
+	s.walk(n, func(p string, x V) bool {
 		if accept(p, x) {
 			v, pattern, ok = x, p, true
 			return false
@@ -212,74 +199,227 @@ func (m *Map[V]) LookupNameFunc(n Name, accept func(pattern string, v V) bool) (
 //			return rule
 //		}
 //	}
-func (m *Map[V]) Matches(host string) iter.Seq2[string, V] {
+func (s *Snapshot[V]) Matches(host string) iter.Seq2[string, V] {
 	n := Normalize(host)
-	return func(yield func(string, V) bool) { m.walk(n, yield) }
+	return func(yield func(string, V) bool) { s.walk(n, yield) }
 }
 
 // walk yields the patterns that match n, most specific first.
-func (m *Map[V]) walk(n Name, yield func(string, V) bool) {
-	if !n.valid {
+func (s *Snapshot[V]) walk(n Name, yield func(string, V) bool) {
+	if s == nil || !n.valid {
 		return
 	}
-	if e := loadEntry[V](&m.exact, n.name); e != nil && !yield(e.pattern, e.value) {
+	h := pmap.Hash(n.name)
+	if e, ok := s.exact.GetHashed(h, n.name); ok && !yield(e.pattern, e.value) {
 		return
 	}
 	if n.name == "" {
 		return
 	}
-	if e := loadEntry[V](&m.self, n.name); e != nil && !yield(e.pattern, e.value) {
+	if e, ok := s.self.GetHashed(h, n.name); ok && !yield(e.pattern, e.value) {
 		return
 	}
 	// Suffixes come longest first, from the first dot on. Dots further from
 	// the end than the longest suffix start none.
-	for i := max(1, len(n.name)-int(m.longest.Load())); i < len(n.name); i++ {
-		if n.name[i] != '.' {
-			continue
-		}
-		if e := loadEntry[V](&m.suffixes, n.name[i:]); e != nil && !yield(e.pattern, e.value) {
-			return
-		}
-		if e := loadEntry[V](&m.dots, n.name[i:]); e != nil && !yield(e.pattern, e.value) {
-			return
-		}
-	}
-	if e := m.any.Load(); e != nil {
-		yield(e.pattern, e.value)
-	}
-}
-
-func loadEntry[V any](m *sync.Map, key string) *hostEntry[V] {
-	x, ok := m.Load(key)
-	if !ok {
-		return nil
-	}
-	e, _ := x.(*hostEntry[V])
-	return e
-}
-
-// Len returns the number of patterns.
-func (m *Map[V]) Len() int {
-	return int(m.n.Load())
-}
-
-// All yields every pattern, as it compares, with its value, in no particular
-// order. Patterns set or deleted while it runs may or may not be yielded.
-func (m *Map[V]) All() iter.Seq2[string, V] {
-	return func(yield func(string, V) bool) {
-		more := true
-		each := func(_, x any) bool {
-			e := x.(*hostEntry[V])
-			more = yield(e.pattern, e.value)
-			return more
-		}
-		for _, sm := range []*sync.Map{&m.exact, &m.suffixes, &m.dots} {
-			if sm.Range(each); !more {
+	if s.suffixes.Len()+s.dots.Len() > 0 {
+		for i := max(1, len(n.name)-s.longest); i < len(n.name); i++ {
+			if n.name[i] != '.' {
+				continue
+			}
+			if e, ok := s.suffixes.Get(n.name[i:]); ok && !yield(e.pattern, e.value) {
+				return
+			}
+			if e, ok := s.dots.Get(n.name[i:]); ok && !yield(e.pattern, e.value) {
 				return
 			}
 		}
-		if e := m.any.Load(); e != nil {
-			yield(e.pattern, e.value)
+	}
+	if s.any != nil {
+		yield(s.any.pattern, s.any.value)
+	}
+}
+
+// All yields every pattern, as it compares, with its value, in no particular
+// order.
+func (s *Snapshot[V]) All() iter.Seq2[string, V] {
+	return func(yield func(string, V) bool) {
+		if s == nil {
+			return
+		}
+		for _, m := range []*pmap.Map[hostEntry[V]]{&s.exact, &s.suffixes, &s.dots} {
+			for _, e := range m.All() {
+				if !yield(e.pattern, e.value) {
+					return
+				}
+			}
+		}
+		if s.any != nil {
+			yield(s.any.pattern, s.any.value)
 		}
 	}
 }
+
+// MapBuilder changes a Snapshot in place, without the copies that With
+// makes, to set many patterns at once. Its zero value starts from an empty
+// Snapshot. A MapBuilder is not safe for concurrent use.
+type MapBuilder[V any] struct {
+	// The builders of the maps of base that changed, or nil.
+	exact, self, suffixes, dots *pmap.Builder[hostEntry[V]]
+	any                         *hostEntry[V]
+	base                        Snapshot[V]
+}
+
+// Builder returns a MapBuilder that starts from s, which it does not change.
+func (s *Snapshot[V]) Builder() *MapBuilder[V] {
+	b := &MapBuilder[V]{}
+	if s != nil {
+		b.base = *s
+		b.any = s.any
+	}
+	return b
+}
+
+// edit returns the builder *bp of m, made on first use.
+func edit[V any](bp **pmap.Builder[hostEntry[V]], m pmap.Map[hostEntry[V]]) *pmap.Builder[hostEntry[V]] {
+	if *bp == nil {
+		*bp = m.Builder()
+	}
+	return *bp
+}
+
+// Set maps pattern to v, replacing the value it had. It panics on a
+// pattern that CheckPattern refuses.
+func (b *MapBuilder[V]) Set(pattern string, v V) {
+	mustPattern(pattern)
+	p := parseHostPattern(pattern)
+	e := hostEntry[V]{pattern: p.String(), value: v}
+	switch p.kind {
+	case patternExact:
+		edit(&b.exact, b.base.exact).Set(p.key, e)
+	case patternSuffix:
+		b.base.longest = max(b.base.longest, len(p.key))
+		edit(&b.suffixes, b.base.suffixes).Set(p.key, e)
+	case patternDot:
+		b.base.longest = max(b.base.longest, len(p.key))
+		edit(&b.dots, b.base.dots).Set(p.key, e)
+		edit(&b.self, b.base.self).Set(p.key[1:], e)
+	case patternAny:
+		b.any = &e
+	}
+}
+
+// Delete removes pattern and reports whether it was set.
+func (b *MapBuilder[V]) Delete(pattern string) bool {
+	p := parseHostPattern(pattern)
+	switch p.kind {
+	case patternExact:
+		return del(edit(&b.exact, b.base.exact), p.key)
+	case patternSuffix:
+		return del(edit(&b.suffixes, b.base.suffixes), p.key)
+	case patternDot:
+		edit(&b.self, b.base.self).Delete(p.key[1:])
+		return del(edit(&b.dots, b.base.dots), p.key)
+	case patternAny:
+		had := b.any != nil
+		b.any = nil
+		return had
+	}
+	return false
+}
+
+func del[V any](b *pmap.Builder[V], key string) bool {
+	n := b.Len()
+	b.Delete(key)
+	return b.Len() < n
+}
+
+// view returns the map of base, or of its builder when it changed.
+func view[V any](bp *pmap.Builder[hostEntry[V]], m pmap.Map[hostEntry[V]]) getter[V] {
+	if bp != nil {
+		return bp.Get
+	}
+	return m.Get
+}
+
+// Get returns the value of pattern itself, without matching.
+func (b *MapBuilder[V]) Get(pattern string) (V, bool) {
+	return get(pattern, view(b.exact, b.base.exact), view(b.suffixes, b.base.suffixes), view(b.dots, b.base.dots), b.any)
+}
+
+// Snapshot returns the patterns set so far. Later changes of b do not
+// change it.
+func (b *MapBuilder[V]) Snapshot() *Snapshot[V] {
+	s := b.base // b.base.longest follows Set
+	s.any = b.any
+	for _, x := range []struct {
+		b *pmap.Builder[hostEntry[V]]
+		m *pmap.Map[hostEntry[V]]
+	}{{b.exact, &s.exact}, {b.self, &s.self}, {b.suffixes, &s.suffixes}, {b.dots, &s.dots}} {
+		if x.b != nil {
+			*x.m = x.b.Map()
+		}
+	}
+	if s.suffixes.Len()+s.dots.Len() == 0 {
+		s.longest = 0
+	}
+	b.base = s
+	return &s
+}
+
+// Load returns the current Snapshot, which later changes of m leave as it
+// is.
+func (m *Map[V]) Load() *Snapshot[V] { return m.cur.Load() }
+
+// Edit applies the changes that fn makes to b as one: lookups see all of
+// them or none. fn must not call methods of m.
+func (m *Map[V]) Edit(fn func(b *MapBuilder[V])) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b := m.cur.Load().Builder()
+	fn(b)
+	m.cur.Store(b.Snapshot())
+}
+
+// Set maps pattern to v, replacing the value it had. It panics on a
+// pattern that CheckPattern refuses.
+func (m *Map[V]) Set(pattern string, v V) {
+	mustPattern(pattern)
+	m.Edit(func(b *MapBuilder[V]) { b.Set(pattern, v) })
+}
+
+// Delete removes pattern and reports whether it was set.
+func (m *Map[V]) Delete(pattern string) (deleted bool) {
+	m.Edit(func(b *MapBuilder[V]) { deleted = b.Delete(pattern) })
+	return deleted
+}
+
+// Get returns the value of pattern itself, without matching.
+func (m *Map[V]) Get(pattern string) (V, bool) { return m.Load().Get(pattern) }
+
+// Lookup is Snapshot.Lookup on the current patterns.
+func (m *Map[V]) Lookup(host string) (v V, pattern string, ok bool) { return m.Load().Lookup(host) }
+
+// LookupFunc is Snapshot.LookupFunc on the current patterns; accept must
+// not change m.
+func (m *Map[V]) LookupFunc(host string, accept func(pattern string, v V) bool) (v V, pattern string, ok bool) {
+	return m.Load().LookupFunc(host, accept)
+}
+
+// LookupNameFunc is Snapshot.LookupNameFunc on the current patterns.
+func (m *Map[V]) LookupNameFunc(n Name, accept func(pattern string, v V) bool) (v V, pattern string, ok bool) {
+	return m.Load().LookupNameFunc(n, accept)
+}
+
+// Matches is Snapshot.Matches on the patterns current when it is called.
+func (m *Map[V]) Matches(host string) iter.Seq2[string, V] { return m.Load().Matches(host) }
+
+// Len returns the number of patterns.
+func (m *Map[V]) Len() int { return m.Load().Len() }
+
+// All is Snapshot.All on the patterns current when it is called.
+func (m *Map[V]) All() iter.Seq2[string, V] { return m.Load().All() }
+
+// Canonical returns pattern as Snapshot and Map compare it: lowercased and
+// without a trailing dot, so that two spellings of one pattern give the
+// same string.
+func Canonical(pattern string) string { return parseHostPattern(pattern).String() }
