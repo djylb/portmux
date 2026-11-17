@@ -132,9 +132,16 @@ func TestPickServerName(t *testing.T) {
 	}
 }
 
-// keyCount returns the number of keys of the router's pool of upstream i.
-func keyCount(r *Router, i int) int {
-	p := r.state.Load().transports[i]
+// poolOf returns the router's pool of the named upstream.
+func poolOf(r *Router, name string) *pool {
+	b, _ := r.state.Load().upstreams.Get(name)
+	return b.pool
+}
+
+// keyCount returns the number of keys of the router's pool of the named
+// upstream.
+func keyCount(r *Router, name string) int {
+	p := poolOf(r, name)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.keys)
@@ -169,7 +176,7 @@ func TestPickKeysRecycled(t *testing.T) {
 		}
 	}
 	// "b" was the least recently used when "c" came.
-	if n := keyCount(r, 0); n != 2 {
+	if n := keyCount(r, "u"); n != 2 {
 		t.Errorf("%d keys, want 2", n)
 	}
 	mu.Lock()
@@ -190,7 +197,7 @@ func TestPickKeysRecycled(t *testing.T) {
 	// return to the idle pool just after closeIdle, so allow it to settle.
 	waitFor(t, "keys to be released", func() bool {
 		r.closeIdle()
-		return keyCount(r, 0) == 0
+		return keyCount(r, "u") == 0
 	})
 }
 
@@ -234,6 +241,32 @@ func TestPickConcurrent(t *testing.T) {
 	// return to the idle pool just after closeIdle, so allow it to settle.
 	waitFor(t, "keys to be released", func() bool {
 		r.closeIdle()
-		return keyCount(r, 0) == 0
+		return keyCount(r, "u") == 0
 	})
+}
+
+// TestPoolEvictsLRU checks that a pool over MaxKeys evicts its least
+// recently used key, and that an evicted key in use is not chosen again.
+func TestPoolEvictsLRU(t *testing.T) {
+	u, err := compileUpstream(Upstream{Name: "u", Dial: noDial, MaxKeys: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newPool(u)
+	a, b := p.acquire("a"), p.acquire("b")
+	p.acquire("a") // a is now more recent than b
+	c := p.acquire("c")
+	if b.prev != nil || a.prev == nil || c.prev == nil {
+		t.Fatalf("evicted the wrong key: a %v b %v c %v", a.prev != nil, b.prev != nil, c.prev != nil)
+	}
+	p.acquire("d") // b is out of the list: a goes now
+	if a.prev != nil {
+		t.Fatal("a still listed")
+	}
+	for _, k := range []*keyPool{a, a, b, c} {
+		p.release(k)
+	}
+	if _, ok := p.keys["a"]; ok || len(p.keys) != 1 {
+		t.Fatalf("keys left: %d", len(p.keys))
+	}
 }

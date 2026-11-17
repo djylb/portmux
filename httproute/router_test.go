@@ -431,15 +431,15 @@ func TestUpdate(t *testing.T) {
 	if err := r.Update(t1); err != nil {
 		t.Fatal(err)
 	}
-	tr := r.state.Load().transports[0]
+	tr := poolOf(r, "b")
 	if err := r.Update(t2); err != nil {
 		t.Fatal(err)
 	}
-	if r.state.Load().transports[0] != tr {
+	if poolOf(r, "b") != tr {
 		t.Error("an upstream with the same settings got a new transport")
 	}
 	t3, _ := Build(Config{Upstreams: []Upstream{{Name: "b", Dial: b2.Dial, DisableKeepAlives: true}}, Routes: []Route{{Proxy: &Proxy{Upstream: "b"}}}})
-	if err := r.Update(t3); err != nil || r.state.Load().transports[0] == tr {
+	if err := r.Update(t3); err != nil || poolOf(r, "b") == tr {
 		t.Error("an upstream with other settings kept its transport")
 	}
 
@@ -661,5 +661,31 @@ func TestShutdown(t *testing.T) {
 	}
 	if err := <-shut; err != nil {
 		t.Error(err)
+	}
+}
+
+// TestConnTLSShared checks that the requests of a wrapped TLS connection
+// share its state rather than copy it each.
+func TestConnTLSShared(t *testing.T) {
+	cc, sc := net.Pipe()
+	defer func() { _ = cc.Close(); _ = sc.Close() }()
+	srv := tls.Server(sc, &tls.Config{Certificates: []tls.Certificate{certificate()}})
+	cli := tls.Client(cc, &tls.Config{InsecureSkipVerify: true})
+	done := make(chan error, 1)
+	go func() { done <- cli.Handshake() }()
+	if err := srv.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	ctx := connContext(context.Background(), wrapped{srv})
+	ct, ok := ctx.Value(tlsKey).(*connTLS)
+	if !ok {
+		t.Fatal("no TLS connection found")
+	}
+	a, b := ct.state(), ct.state()
+	if a != b || !a.HandshakeComplete {
+		t.Errorf("states %p and %p, complete %v", a, b, a.HandshakeComplete)
 	}
 }

@@ -143,7 +143,7 @@ func writeBody(w http.ResponseWriter, req *http.Request, status int, contentType
 
 // errorPage returns the page for status: the route's, then the table's.
 func (rs *reqState) errorPage(status int) *page {
-	if rs.table == nil {
+	if rs.table == nil || rs.table.common == nil {
 		return nil
 	}
 	if rs.route != nil {
@@ -151,7 +151,7 @@ func (rs *reqState) errorPage(status int) *page {
 			return p
 		}
 	}
-	return rs.table.errorPages[status]
+	return rs.table.common.errorPages[status]
 }
 
 // context returns what variables read for a response with status.

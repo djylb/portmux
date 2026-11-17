@@ -8,9 +8,12 @@
 // A Router serves requests from its own http.Server, on listeners such as a
 // portmux route (Serve) or on single connections handed over after TLS
 // termination (ServeConn), and is itself an http.Handler for servers of the
-// caller. Its routes are a Table, built once from a Config and replaced as a
-// whole with Router.Update while requests are served; requests read it
-// without a lock and keep the table they were matched with.
+// caller. Its routes are a Table, built from a Config and changed with
+// Table.With, which compiles again only the host patterns that a change
+// touches and shares the rest, so that a change costs little however many
+// routes there are. Router.Update installs a Table while requests are
+// served, keeping the transports of the upstreams it leaves alone; requests
+// read it without a lock and keep the table they were matched with.
 //
 // Of the routes whose host patterns match a request, a route is chosen in
 // this order:

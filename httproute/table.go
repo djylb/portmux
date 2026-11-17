@@ -17,42 +17,51 @@ import (
 	"github.com/djylb/netx/httprewrite"
 	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/httphead"
+	"github.com/djylb/portmux/internal/pmap"
 )
 
 // Table is a built set of routes. It is immutable and safe for concurrent
-// use, also by several Routers.
+// use, also by several Routers. Build makes one from a Config and With
+// changes one, sharing all that the change leaves alone.
 type Table struct {
-	routes     []*route
-	hosts      *hostmatch.Map[[]*route] // filled by Build, never changed after
-	upstreams  []*upstream
+	hosts     *hostmatch.Snapshot[[]*route] // sorted as match takes them
+	common    *common
+	named     pmap.Map[*route]
+	upstreams pmap.Map[upstreamEntry]
+	routes    int
+	levels    int // routes with an exact path or a regexp
+	next      int // order of the next route added
+}
+
+// common is what all routes of a Table and those it is changed into share.
+type common struct {
 	errorPages map[int]*page
 	resolver   *forwarded.Resolver
-	levels     bool // some route has an exact path or a regexp
 	abort      bool // AbortNoRoute
 }
 
 // route is a Route as a Table holds it.
 type route struct {
 	name     string
-	index    int
 	path     string
+	upstream string   // name of the Proxy's upstream, or ""
+	hosts    []string // canonical patterns, each once
 	upgrades []string
 	tls      *bool          // the TLS filter
 	re       *regexp.Regexp // PathRegexp
 	methods  []string
 	headers  []HeaderMatch // canonical names
 	https    *HTTPSRedirect
-	upstream int // index in Table.upstreams, or -1
 	proxy    *Proxy
 	redirect *Redirect
 	respond  *Respond
-	maxBody  int64
-	idle     time.Duration // of upgraded connections
 	pages    map[int]*page
 	response []httprewrite.Rule
 	rewriter *httprewrite.Rewriter
 	handler  http.Handler // the action, wrapped
-	table    *Table
+	order    int          // in the Config, or as With added it; breaks ties
+	maxBody  int64
+	idle     time.Duration // of upgraded connections
 	exact    bool
 	ci       bool // CaseInsensitivePath
 	raw      bool // Path ended with '*': a prefix of bytes, not segments
@@ -63,6 +72,13 @@ type upstream struct {
 	Upstream
 	// serverName is the TLS server name unless the outgoing Host's.
 	serverName string
+}
+
+// upstreamEntry is an upstream of a Table and the number of its routes
+// that proxy to it.
+type upstreamEntry struct {
+	up   *upstream
+	refs int
 }
 
 // transportKey holds the settings of an upstream that its transport is
@@ -80,6 +96,327 @@ type transportKey struct {
 	tls                   bool
 }
 
+// defaultUpgrades are the upgrades of a Route without Upgrades; it is
+// never changed.
+var defaultUpgrades = []string{"websocket"}
+
+// Changes are what With changes in a Table. They apply in this order:
+// RemoveRoutes, RemoveUpstreams, Upstreams, Routes.
+type Changes struct {
+	// Routes are added, or replace the route of the same Name, which keeps
+	// its place in the order that breaks ties; added ones come after all
+	// others. Each must have a Name.
+	Routes []Route
+	// RemoveRoutes names routes to remove; each must exist.
+	RemoveRoutes []string
+	// Upstreams are added, or replace the upstream of the same Name.
+	Upstreams []Upstream
+	// RemoveUpstreams names upstreams to remove; each must exist and no
+	// route may proxy to it after the change.
+	RemoveUpstreams []string
+}
+
+// Build checks and compiles a Config. Errors wrap ErrInvalidConfig. The
+// Table keeps the Config's slices, maps and templates, which must not change
+// afterwards.
+func Build(c Config) (*Table, error) {
+	cm := &common{resolver: c.Resolver, abort: c.AbortNoRoute}
+	var err error
+	if cm.errorPages, err = compilePages(c.ErrorPages); err != nil {
+		return nil, err
+	}
+	return (&Table{common: cm}).apply(Changes{Routes: c.Routes, Upstreams: c.Upstreams}, true)
+}
+
+// With returns t with the changes applied; t stays as it is. Only the host
+// patterns of the routes it adds, replaces or removes are compiled again,
+// and the result shares everything else with t, so that its cost follows
+// the size of the change and of the hosts it touches, not of the Table. A
+// Router that is updated with the result keeps the transports of the
+// upstreams it leaves alone. Errors wrap ErrInvalidConfig; the result is
+// the Table that Build makes of t's Config changed in the same way.
+func (t *Table) With(c Changes) (*Table, error) {
+	return t.apply(c, false)
+}
+
+func (t *Table) apply(c Changes, build bool) (*Table, error) {
+	cm := t.common
+	if cm == nil {
+		cm = &common{}
+	}
+	nt := &Table{common: cm, routes: t.routes, levels: t.levels, next: t.next}
+	ups := t.upstreams.Builder()
+	named := t.named.Builder()
+	hosts := t.hosts.Builder()
+	// Routes that proxy to upstreams that the changes remove, by name.
+	var gone map[string]int
+	ref := func(name string, d int) {
+		if _, ok := gone[name]; ok {
+			gone[name] += d
+			return
+		}
+		e, _ := ups.Get(name)
+		e.refs += d
+		ups.Set(name, e)
+	}
+	// Routes that leave, and the host patterns whose lists With copied:
+	// both stay empty in Build, whose lists are all new.
+	var removed map[*route]bool
+	var touched map[string]bool
+	touch := func(h string) {
+		if build || touched[h] {
+			return
+		}
+		if touched == nil {
+			touched = map[string]bool{}
+		}
+		touched[h] = true
+		old, _ := hosts.Get(h)
+		hosts.Set(h, slices.Clone(old))
+	}
+	drop := func(rt *route) {
+		if removed == nil {
+			removed = map[*route]bool{}
+		}
+		removed[rt] = true
+		nt.routes--
+		nt.levels -= b2i(rt.level() < 2)
+		for _, h := range rt.hosts {
+			touch(h)
+		}
+		if rt.upstream != "" {
+			ref(rt.upstream, -1)
+		}
+	}
+	for _, name := range c.RemoveRoutes {
+		rt, ok := named.Get(name)
+		if !ok {
+			return nil, invalid("removing unknown route %q", name)
+		}
+		named.Delete(name)
+		drop(rt)
+	}
+	for _, name := range c.RemoveUpstreams {
+		e, ok := ups.Get(name)
+		if !ok {
+			return nil, invalid("removing unknown upstream %q", name)
+		}
+		if gone == nil {
+			gone = map[string]int{}
+		}
+		gone[name] = e.refs
+		ups.Delete(name)
+	}
+	// Names that the changes set, to refuse them twice; Build, which starts
+	// empty, finds them in what it built so far.
+	var seen map[string]bool
+	if !build {
+		seen = map[string]bool{}
+	}
+	for _, u := range c.Upstreams {
+		cu, err := compileUpstream(u)
+		if err != nil {
+			return nil, err
+		}
+		e, had := ups.Get(u.Name)
+		if build && had || seen[u.Name] {
+			return nil, invalid("upstream %q appears twice", u.Name)
+		}
+		if n, ok := gone[u.Name]; ok {
+			e.refs = n // added again
+			delete(gone, u.Name)
+		}
+		if seen != nil {
+			seen[u.Name] = true
+		}
+		ups.Set(u.Name, upstreamEntry{up: cu, refs: e.refs})
+	}
+	clear(seen)
+	for i, r := range c.Routes {
+		if r.Name == "" && !build {
+			return nil, invalid("route #%d of the changes has no name", i)
+		}
+		old, had := named.Get(r.Name)
+		if r.Name != "" && (build && had || seen[r.Name]) {
+			return nil, invalid("route %q appears twice", r.Name)
+		}
+		order := nt.next
+		if had && r.Name != "" {
+			order = old.order
+			drop(old)
+		} else {
+			nt.next++
+		}
+		rt, err := cm.compile(r, ups)
+		if err != nil {
+			if r.Name != "" {
+				return nil, invalidRoute(strconv.Quote(r.Name), err)
+			}
+			return nil, invalidRoute("#"+strconv.Itoa(i), err)
+		}
+		rt.order = order
+		if r.Name != "" {
+			if seen != nil {
+				seen[r.Name] = true
+			}
+			named.Set(r.Name, rt)
+		}
+		nt.routes++
+		nt.levels += b2i(rt.level() < 2)
+		if rt.upstream != "" {
+			ref(rt.upstream, 1)
+		}
+		for _, h := range rt.hosts {
+			touch(h)
+			list, _ := hosts.Get(h)
+			hosts.Set(h, append(list, rt))
+		}
+	}
+	for name, n := range gone {
+		if n != 0 {
+			return nil, invalid("removing upstream %q, to which %d routes proxy", name, n)
+		}
+	}
+	sort := func(h string, list []*route) error {
+		if removed != nil {
+			list = slices.DeleteFunc(list, func(rt *route) bool { return removed[rt] })
+		}
+		if len(list) == 0 {
+			hosts.Delete(h)
+			return nil
+		}
+		if err := sortHost(h, list); err != nil {
+			return err
+		}
+		if !build {
+			hosts.Set(h, list)
+		}
+		return nil
+	}
+	if build {
+		// The lists are new: sort them where they are.
+		for h, list := range hosts.Snapshot().All() {
+			if err := sort(h, list); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		for h := range touched {
+			list, _ := hosts.Get(h)
+			if err := sort(h, list); err != nil {
+				return nil, err
+			}
+		}
+	}
+	nt.hosts, nt.named, nt.upstreams = hosts.Snapshot(), named.Map(), ups.Map()
+	return nt, nil
+}
+
+// sortHost sorts the routes of a host pattern as match takes them: exact
+// paths first, then regexps, then prefixes from the longest, each in their
+// order; and refuses routes that never match.
+func sortHost(pattern string, list []*route) error {
+	slices.SortFunc(list, func(a, b *route) int {
+		if c := cmp.Compare(a.level(), b.level()); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(len(b.path), len(a.path)); c != 0 {
+			return c
+		}
+		// Of equal prefixes, the one of whole segments first.
+		if c := cmp.Compare(b2i(a.raw), b2i(b.raw)); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.order, b.order)
+	})
+	// Routes of one path key have one level, length and rawness, so they
+	// are in one run of the sorted list.
+	for i := 0; i < len(list); {
+		j := i + 1
+		for j < len(list) && list[j].level() == list[i].level() && len(list[j].path) == len(list[i].path) && list[j].raw == list[i].raw {
+			j++
+		}
+		if err := checkOverlap(pattern, list[i:j]); err != nil {
+			return err
+		}
+		i = j
+	}
+	return nil
+}
+
+// overlapIndexMin is the length of a run from which checkOverlap groups
+// routes by path instead of comparing every pair.
+const overlapIndexMin = 16
+
+// checkOverlap refuses routes of one host pattern that never match because
+// a route before them matches all they do: the same path at the same level,
+// and conditions that the earlier route's include. run is in order.
+func checkOverlap(pattern string, run []*route) error {
+	if len(run) < overlapIndexMin {
+		return checkPairs(pattern, run)
+	}
+	groups := map[string][]*route{}
+	for _, rt := range run {
+		k := rt.pathKey()
+		groups[k] = append(groups[k], rt)
+	}
+	for _, g := range groups {
+		if err := checkPairs(pattern, g); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkPairs(pattern string, list []*route) error {
+	for j, b := range list {
+		for _, a := range list[:j] {
+			if a.level() != b.level() || a.pathKey() != b.pathKey() || a.ci != b.ci {
+				continue
+			}
+			if !covers(a, b) {
+				continue
+			}
+			if covers(b, a) {
+				return invalid("routes %s and %s match the same requests for host %q", a.label(), b.label(), pattern)
+			}
+			return invalid("route %s never matches for host %q: route %s before it matches all it does", b.label(), pattern, a.label())
+		}
+	}
+	return nil
+}
+
+func compileUpstream(u Upstream) (*upstream, error) {
+	if err := checkUpstream(u); err != nil {
+		return nil, err
+	}
+	u.DialTimeout = cmp.Or(u.DialTimeout, 10*time.Second)
+	u.IdleConnTimeout = cmp.Or(u.IdleConnTimeout, 90*time.Second)
+	u.MaxIdleConns = cmp.Or(u.MaxIdleConns, 64)
+	u.MaxKeys = cmp.Or(u.MaxKeys, 1024)
+	u.MaxResponseHeaderBytes = cmp.Or(u.MaxResponseHeaderBytes, 64<<10)
+	if u.ProxyProtocol != 0 {
+		u.DisableKeepAlives = true // a header names one client
+	}
+	if u.Dial == nil {
+		addr := u.Addr
+		u.Dial = func(ctx context.Context, _ DialInfo) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", addr)
+		}
+	}
+	cu := &upstream{Upstream: u, serverName: u.ServerName}
+	if u.TLS != nil && cu.serverName == "" {
+		cu.serverName = u.TLS.ServerName
+	}
+	if h, _, err := net.SplitHostPort(u.Addr); err == nil && cu.serverName == "" && h != "" {
+		if _, err := netip.ParseAddr(h); err != nil {
+			cu.serverName = h // a name, not an address
+		}
+	}
+	return cu, nil
+}
+
 func (u *upstream) key() transportKey {
 	return transportKey{
 		name:                  u.Name,
@@ -93,101 +430,6 @@ func (u *upstream) key() transportKey {
 		disableKeepAlives:     u.DisableKeepAlives,
 		http2:                 u.HTTP2,
 	}
-}
-
-// Build checks and compiles a Config. Errors wrap ErrInvalidConfig. The
-// Table keeps the Config's slices, maps and templates, which must not change
-// afterwards.
-func Build(c Config) (*Table, error) {
-	t := &Table{hosts: &hostmatch.Map[[]*route]{}, resolver: c.Resolver, abort: c.AbortNoRoute}
-	var err error
-	if t.errorPages, err = compilePages(c.ErrorPages); err != nil {
-		return nil, err
-	}
-	upstreams := make(map[string]int, len(c.Upstreams))
-	for _, u := range c.Upstreams {
-		if err := checkUpstream(u); err != nil {
-			return nil, err
-		}
-		if _, dup := upstreams[u.Name]; dup {
-			return nil, invalid("upstream %q appears twice", u.Name)
-		}
-		upstreams[u.Name] = len(t.upstreams)
-		u.DialTimeout = cmp.Or(u.DialTimeout, 10*time.Second)
-		u.IdleConnTimeout = cmp.Or(u.IdleConnTimeout, 90*time.Second)
-		u.MaxIdleConns = cmp.Or(u.MaxIdleConns, 64)
-		u.MaxKeys = cmp.Or(u.MaxKeys, 1024)
-		u.MaxResponseHeaderBytes = cmp.Or(u.MaxResponseHeaderBytes, 64<<10)
-		if u.ProxyProtocol != 0 {
-			u.DisableKeepAlives = true // a header names one client
-		}
-		if u.Dial == nil {
-			addr := u.Addr
-			u.Dial = func(ctx context.Context, _ DialInfo) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "tcp", addr)
-			}
-		}
-		cu := &upstream{Upstream: u, serverName: u.ServerName}
-		if u.TLS != nil && cu.serverName == "" {
-			cu.serverName = u.TLS.ServerName
-		}
-		if h, _, err := net.SplitHostPort(u.Addr); err == nil && cu.serverName == "" && h != "" {
-			if _, err := netip.ParseAddr(h); err != nil {
-				cu.serverName = h // a name, not an address
-			}
-		}
-		t.upstreams = append(t.upstreams, cu)
-	}
-	names := make(map[string]bool, len(c.Routes))
-	for i, r := range c.Routes {
-		rt, err := t.compile(i, r, upstreams)
-		if err != nil {
-			if r.Name != "" {
-				return nil, invalidRoute(r.Name, err)
-			}
-			return nil, invalidRoute("#"+strconv.Itoa(i), err)
-		}
-		if r.Name != "" {
-			if names[r.Name] {
-				return nil, invalid("route %q appears twice", r.Name)
-			}
-			names[r.Name] = true
-		}
-		t.routes = append(t.routes, rt)
-		hosts := r.Hosts
-		if len(hosts) == 0 || slices.Contains(hosts, "*") {
-			// "*" also takes requests without a host, as no Hosts do.
-			hosts = append(slices.Clone(hosts), "*", "")
-		}
-		for _, h := range hosts {
-			list, _ := t.hosts.Get(h) // the same pattern in another spelling is one
-			if slices.Contains(list, rt) {
-				continue
-			}
-			t.hosts.Set(h, append(list, rt))
-		}
-	}
-	for pattern, list := range t.hosts.All() {
-		if err := checkOverlap(pattern, list); err != nil {
-			return nil, err
-		}
-	}
-	// Exact paths first, then regexps, then prefixes from the longest,
-	// each in the order of the Config.
-	for _, list := range t.hosts.All() {
-		slices.SortStableFunc(list, func(a, b *route) int {
-			if c := cmp.Compare(a.level(), b.level()); c != 0 {
-				return c
-			}
-			if c := cmp.Compare(len(b.path), len(a.path)); c != 0 {
-				return c
-			}
-			// Of equal prefixes, the one of whole segments first.
-			return cmp.Compare(b2i(a.raw), b2i(b.raw))
-		})
-	}
-	return t, nil
 }
 
 func invalidRoute(name string, err error) error {
@@ -218,27 +460,6 @@ func checkUpstream(u Upstream) error {
 func checkHost(p string) error {
 	if err := hostmatch.CheckPattern(p); err != nil {
 		return invalid("%v", err)
-	}
-	return nil
-}
-
-// checkOverlap refuses routes of one host pattern that never match because
-// a route before them matches all they do: the same path at the same level,
-// and conditions that the earlier route's include.
-func checkOverlap(pattern string, list []*route) error {
-	for j, b := range list {
-		for _, a := range list[:j] {
-			if a.level() != b.level() || a.pathKey() != b.pathKey() || a.ci != b.ci {
-				continue
-			}
-			if !covers(a, b) {
-				continue
-			}
-			if covers(b, a) {
-				return invalid("routes %s and %s match the same requests for host %q", a.label(), b.label(), pattern)
-			}
-			return invalid("route %s never matches for host %q: route %s before it matches all it does", b.label(), pattern, a.label())
-		}
 	}
 	return nil
 }
@@ -296,11 +517,11 @@ func (rt *route) label() string {
 	if rt.name != "" {
 		return strconv.Quote(rt.name)
 	}
-	return "#" + strconv.Itoa(rt.index)
+	return "#" + strconv.Itoa(rt.order)
 }
 
-func (t *Table) compile(i int, r Route, upstreams map[string]int) (*route, error) {
-	rt := &route{name: r.Name, index: i, path: r.Path, exact: r.Exact, ci: r.CaseInsensitivePath, upstream: -1, table: t,
+func (cm *common) compile(r Route, upstreams *pmap.Builder[upstreamEntry]) (*route, error) {
+	rt := &route{name: r.Name, path: r.Path, exact: r.Exact, ci: r.CaseInsensitivePath,
 		methods: r.Methods, https: r.RedirectHTTPS, maxBody: r.MaxRequestBody,
 		idle: r.UpgradeIdleTimeout, response: r.ResponseHeaders}
 	if r.PathRegexp != "" {
@@ -319,7 +540,6 @@ func (t *Table) compile(i int, r Route, upstreams map[string]int) (*route, error
 			return nil, invalid("PathRegexp: %v", err)
 		}
 		rt.re = re
-		t.levels = true
 	} else {
 		if rt.path == "" {
 			rt.path = "/"
@@ -333,16 +553,26 @@ func (t *Table) compile(i int, r Route, upstreams map[string]int) (*route, error
 		if !isCleanPath(rt.path) && (!rt.raw || !isCleanPath(rt.path+"x")) {
 			return nil, invalid("path %q is not a clean absolute path", r.Path)
 		}
-		t.levels = t.levels || r.Exact
 	}
 	for _, h := range r.Hosts {
 		if err := checkHost(h); err != nil {
 			return nil, err
 		}
+		if c := hostmatch.Canonical(h); !slices.Contains(rt.hosts, c) {
+			rt.hosts = append(rt.hosts, c)
+		}
+	}
+	if len(r.Hosts) == 0 || slices.Contains(rt.hosts, "*") {
+		// "*" also takes requests without a host, as no Hosts do.
+		for _, h := range []string{"*", ""} {
+			if !slices.Contains(rt.hosts, h) {
+				rt.hosts = append(rt.hosts, h)
+			}
+		}
 	}
 	rt.upgrades = r.Upgrades
 	if rt.upgrades == nil {
-		rt.upgrades = []string{"websocket"}
+		rt.upgrades = defaultUpgrades
 	}
 	for _, u := range rt.upgrades {
 		if !isToken(u) {
@@ -388,8 +618,7 @@ func (t *Table) compile(i int, r Route, upstreams map[string]int) (*route, error
 	var action http.Handler
 	if p := r.Proxy; p != nil {
 		actions++
-		idx, ok := upstreams[p.Upstream]
-		if !ok {
+		if _, ok := upstreams.Get(p.Upstream); !ok {
 			return nil, invalid("unknown upstream %q", p.Upstream)
 		}
 		if p.ReplacePath != "" && !isCleanPath(p.ReplacePath) {
@@ -398,12 +627,12 @@ func (t *Table) compile(i int, r Route, upstreams map[string]int) (*route, error
 		if p.ReplacePath != "" && (p.PathTemplate != nil || rt.re != nil) {
 			return nil, invalid("ReplacePath with PathTemplate or PathRegexp")
 		}
-		rt.upstream, rt.proxy = idx, p
+		rt.upstream, rt.proxy = p.Upstream, p
 		rt.rewriter = &httprewrite.Rewriter{
 			Request:   r.RequestHeaders,
 			Response:  r.ResponseHeaders,
 			Redirects: p.Redirects,
-			Resolver:  t.resolver,
+			Resolver:  cm.resolver,
 			Data:      requestData,
 		}
 		action = proxyHandler{}
@@ -456,7 +685,7 @@ func (t *Table) compile(i int, r Route, upstreams map[string]int) (*route, error
 // of a regexp's match are stored in rs.
 func (t *Table) match(n hostmatch.Name, p string, req *http.Request, rs *reqState) *route {
 	var prefix *route
-	if !t.levels {
+	if t.levels == 0 {
 		t.hosts.LookupNameFunc(n, func(_ string, list []*route) bool {
 			if rt := firstPrefix(list, p, req, rs, prefix); rt != nil {
 				prefix = rt

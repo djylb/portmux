@@ -19,6 +19,7 @@ import (
 	"github.com/djylb/netx/forwarded"
 	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/httphead"
+	"github.com/djylb/portmux/internal/pmap"
 	"github.com/djylb/timeshim"
 )
 
@@ -81,9 +82,8 @@ type Router struct {
 	clock timeshim.Clock
 	state atomic.Pointer[state]
 
-	mu         sync.Mutex // guards transports, retired and closed
-	transports map[transportKey]*pool
-	retired    map[*pool]struct{} // replaced pools with connections in use
+	mu      sync.Mutex         // serialises Update; guards retired and closed
+	retired map[*pool]struct{} // replaced pools with connections in use
 
 	srv   *http.Server
 	proxy *httputil.ReverseProxy
@@ -99,18 +99,28 @@ type Router struct {
 	closed  bool // under mu
 }
 
-// state is what a request is matched against: a table and the transports
-// of its upstreams, by index.
+// state is what a request is matched against: a table and its upstreams
+// with their transports, by name.
 type state struct {
-	table      *Table
-	transports []*pool
+	table     *Table
+	upstreams pmap.Map[*binding]
 }
+
+// binding is an upstream of a table and the transports a Router holds for
+// it. Upstreams of equal transport keys share them across updates.
+type binding struct {
+	up   *upstream
+	pool *pool
+}
+
+// emptyTable is the Table of a Router without one.
+var emptyTable = &Table{common: &common{}}
 
 type ctxKey int
 
 const (
 	stateKey  ctxKey = iota // *reqState
-	tlsKey                  // *tls.Conn found under a connection
+	tlsKey                  // *connTLS of a TLS connection found under a connection
 	serverKey               // *Router whose server serves the request
 )
 
@@ -124,8 +134,9 @@ type reqState struct {
 	outPath   string // a Proxy's expanded PathTemplate
 	inboundID string // X-Request-Id of a trusted proxy
 	transport *pool
-	key       string   // of the Proxy's Pick
-	keyed     *keyPool // the transports of key, nil without one
+	up        *upstream // the route's upstream, or nil
+	key       string    // of the Proxy's Pick
+	keyed     *keyPool  // the transports of key, nil without one
 	host      hostmatch.Name
 	path      string
 	client    forwarded.Client
@@ -183,17 +194,16 @@ func New(o Options) *Router {
 		o.ErrorLog = log.New(io.Discard, "", 0)
 	}
 	r := &Router{
-		opts:       o,
-		clock:      timeshim.Or(o.Clock),
-		transports: map[transportKey]*pool{},
-		retired:    map[*pool]struct{}{},
-		ln:         netx.NewChanListener(nil, 64),
-		lnDone:     make(chan struct{}),
-		drained:    make(chan struct{}, 1),
+		opts:    o,
+		clock:   timeshim.Or(o.Clock),
+		retired: map[*pool]struct{}{},
+		ln:      netx.NewChanListener(nil, 64),
+		lnDone:  make(chan struct{}),
+		drained: make(chan struct{}, 1),
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	r.ctx, r.stop = context.WithValue(ctx, serverKey, r), stop
-	r.state.Store(&state{table: &Table{hosts: &hostmatch.Map[[]*route]{}}})
+	r.state.Store(&state{table: emptyTable})
 	r.srv = &http.Server{
 		Handler:           r,
 		ReadHeaderTimeout: o.ReadHeaderTimeout,
@@ -230,10 +240,29 @@ func connContext(ctx context.Context, c net.Conn) context.Context {
 			return ctx
 		}
 		if tc, ok := c.(*tls.Conn); ok {
-			return context.WithValue(ctx, tlsKey, tc)
+			return context.WithValue(ctx, tlsKey, &connTLS{conn: tc})
 		}
 	}
 	return ctx
+}
+
+// connTLS is a TLS connection under the connection that a server serves.
+// Its requests share its state once the handshake is complete, as those
+// of a *tls.Conn that the server reads itself do.
+type connTLS struct {
+	conn *tls.Conn
+	done atomic.Pointer[tls.ConnectionState]
+}
+
+func (c *connTLS) state() *tls.ConnectionState {
+	if cs := c.done.Load(); cs != nil {
+		return cs
+	}
+	cs := c.conn.ConnectionState()
+	if cs.HandshakeComplete {
+		c.done.Store(&cs)
+	}
+	return &cs
 }
 
 // Update replaces the routes with those of t; requests already routed keep
@@ -244,35 +273,44 @@ func connContext(ctx context.Context, c net.Conn) context.Context {
 // Shutdown or Close.
 func (r *Router) Update(t *Table) error {
 	if t == nil {
-		t = &Table{hosts: &hostmatch.Map[[]*route]{}}
+		t = emptyTable
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return net.ErrClosed
 	}
-	st := &state{table: t, transports: make([]*pool, len(t.upstreams))}
-	next := make(map[transportKey]*pool, len(t.upstreams))
-	for i, u := range t.upstreams {
-		k := u.key()
-		p := next[k]
-		if p == nil {
-			if p = r.transports[k]; p == nil {
-				p = newPool(u)
-			}
-			next[k] = p
+	old := r.state.Load()
+	// Only the upstreams that differ: none that t shares with the current
+	// table, as one made of it by With does.
+	bs := old.upstreams.Builder()
+	var drop []*pool
+	pmap.Diff(old.table.upstreams, t.upstreams, func(name string, _ upstreamEntry, _ bool, e upstreamEntry, has bool) {
+		b, _ := bs.Get(name)
+		u := e.up
+		if has && b != nil && b.up == u {
+			return
 		}
-		st.transports[i] = p
-	}
-	r.state.Store(st)
-	for k, p := range r.transports {
-		if next[k] != p {
-			r.retired[p] = struct{}{}
+		if has && b != nil && b.up.key() == u.key() {
+			bs.Set(name, &binding{up: u, pool: b.pool})
+			return
 		}
+		if b != nil {
+			drop = append(drop, b.pool)
+		}
+		if has {
+			bs.Set(name, &binding{up: u, pool: newPool(u)})
+		} else {
+			bs.Delete(name)
+		}
+	})
+	r.state.Store(&state{table: t, upstreams: bs.Map()})
+	for _, p := range drop {
+		r.retired[p] = struct{}{}
 	}
 	// Connections of replaced pools that were in use become idle later:
 	// close them as they do, until none is left.
-	for p := range r.retired {
+	for _, p := range drop {
 		p.CloseIdleConnections()
 		if p.open.Load() == 0 {
 			delete(r.retired, p)
@@ -280,7 +318,6 @@ func (r *Router) Update(t *Table) error {
 			p.drain = r.clock.AfterFunc(retireTick, func() { r.drainRetired(p) })
 		}
 	}
-	r.transports = next
 	return nil
 }
 
@@ -390,8 +427,8 @@ func (r *Router) drainRetired(p *pool) {
 func (r *Router) closeIdle() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, p := range r.transports {
-		p.CloseIdleConnections()
+	for _, b := range r.state.Load().upstreams.All() {
+		b.pool.CloseIdleConnections()
 	}
 	for p := range r.retired {
 		p.CloseIdleConnections()
@@ -468,22 +505,21 @@ func (r *Router) route(w http.ResponseWriter, req *http.Request, st *state, rs *
 	}
 	ctx := req.Context()
 	if req.TLS == nil {
-		if tc, ok := ctx.Value(tlsKey).(*tls.Conn); ok {
-			cs := tc.ConnectionState()
-			req.TLS, rs.tls = &cs, true
+		if ct, ok := ctx.Value(tlsKey).(*connTLS); ok {
+			req.TLS, rs.tls = ct.state(), true
 		}
 	}
 	peer, _ := forwarded.ParseNode(req.RemoteAddr)
-	if t.resolver != nil {
-		rs.client = t.resolver.Resolve(peer, req.Header)
+	if t.common.resolver != nil {
+		rs.client = t.common.resolver.Resolve(peer, req.Header)
 	} else {
 		rs.client = forwarded.Client{Addr: peer}
 	}
-	if t.resolver != nil && t.resolver.Trusted.Contains(peer.Addr()) {
+	if t.common.resolver != nil && t.common.resolver.Trusted.Contains(peer.Addr()) {
 		rs.inboundID = validRequestID(req.Header.Get("X-Request-ID"))
 	}
 	rt := t.match(rs.host, rs.path, req, rs)
-	if rt == nil && t.abort {
+	if rt == nil && t.common.abort {
 		panic(http.ErrAbortHandler)
 	}
 	if rt == nil {
@@ -491,8 +527,9 @@ func (r *Router) route(w http.ResponseWriter, req *http.Request, st *state, rs *
 		return
 	}
 	rs.route = rt
-	if rt.upstream >= 0 {
-		rs.transport = st.transports[rt.upstream]
+	if rt.upstream != "" {
+		b, _ := st.upstreams.Get(rt.upstream)
+		rs.up, rs.transport = b.up, b.pool
 	}
 	if rt.https != nil && !rs.secure() {
 		redirectHTTPS(w, req, rs)

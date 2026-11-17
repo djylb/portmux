@@ -103,7 +103,7 @@ func filterUpgrade(req *http.Request, rt *route) {
 func rewrite(pr *httputil.ProxyRequest) {
 	rs := stateOf(pr.In.Context())
 	rt := rs.route
-	up := rt.table.upstreams[rt.upstream]
+	up := rs.up
 	u := pr.Out.URL
 	u.Scheme, u.Host, u.User, u.Fragment, u.RawFragment = "http", upstreamHost, nil, "", ""
 	if up.Addr != "" {
@@ -343,10 +343,10 @@ type pool struct {
 	drain timeshim.Timer // of a replaced pool with connections; under Router.mu
 
 	up      *upstream // what the transports of keys are built from
-	maxKeys int
-	mu      sync.Mutex // guards keys, use and the refs of its keyPools
 	keys    map[string]*keyPool
-	use     uint64 // last keyPool.used
+	lru     keyPool // sentinel of the list of keys, most recently used first
+	maxKeys int
+	mu      sync.Mutex // guards keys, lru and the refs and links of its keyPools
 }
 
 // keyPool holds the transports of one Pick key. It stays in its pool while
@@ -354,33 +354,50 @@ type pool struct {
 // the last of them ends, so that a key without connections costs nothing.
 type keyPool struct {
 	transports
-	key  string
-	refs int    // requests in progress and open connections; under pool.mu
-	used uint64 // pool.use when last acquired; under pool.mu
+	prev, next *keyPool // in pool.lru, nil when not in it; under pool.mu
+	key        string
+	refs       int // requests in progress and open connections; under pool.mu
+}
+
+// unlink takes k out of the list it is in, if any.
+func (k *keyPool) unlink() {
+	if k.prev != nil {
+		k.prev.next, k.next.prev = k.next, k.prev
+		k.prev, k.next = nil, nil
+	}
+}
+
+// pushFront puts k first in the list of its pool.
+func (p *pool) pushFront(k *keyPool) {
+	k.unlink()
+	if p.lru.next == nil {
+		p.lru.next, p.lru.prev = &p.lru, &p.lru
+	}
+	k.prev, k.next = &p.lru, p.lru.next
+	k.next.prev, p.lru.next = k, k
 }
 
 // acquire returns the transports of key, made when the key has none, for
 // a request that calls release when it ends. Above maxKeys keys it closes
-// the idle connections of the least recently used key without requests,
-// which then leaves the pool; keys with requests in progress stay, so the
-// pool exceeds maxKeys by no more than the requests in progress.
+// the idle connections of the least recently used key, which then leaves
+// the pool unless requests use it; keys with requests in progress stay, so
+// the pool exceeds maxKeys by no more than the requests in progress.
+// Choosing the key takes constant time, however many keys there are.
 func (p *pool) acquire(key string) *keyPool {
 	p.mu.Lock()
-	p.use++
 	k := p.keys[key]
 	if k == nil {
 		k = &keyPool{transports: newTransports(p.up), key: key}
 		p.keys[key] = k
 	}
 	k.refs++
-	k.used = p.use
+	p.pushFront(k)
 	var evict *keyPool
-	if p.maxKeys > 0 && len(p.keys) > p.maxKeys {
-		for _, c := range p.keys {
-			if c != k && (evict == nil || c.used < evict.used) {
-				evict = c
-			}
-		}
+	if p.maxKeys > 0 && len(p.keys) > p.maxKeys && p.lru.prev != k {
+		// Out of the list, so that the next eviction takes the next key
+		// while this one waits for its requests to end.
+		evict = p.lru.prev
+		evict.unlink()
 	}
 	p.mu.Unlock()
 	if evict != nil {
@@ -396,6 +413,7 @@ func (p *pool) release(k *keyPool) {
 	defer p.mu.Unlock()
 	if k.refs--; k.refs == 0 && p.keys[k.key] == k {
 		delete(p.keys, k.key)
+		k.unlink()
 	}
 }
 
@@ -520,10 +538,10 @@ func dialTLS2(ctx context.Context, _, addr string) (net.Conn, error) {
 // addr is the outbound URL's host and port.
 func connect(ctx context.Context, addr string, alpn []string) (net.Conn, error) {
 	rs := stateOf(ctx)
-	if rs == nil || rs.route == nil || rs.route.upstream < 0 || rs.transport == nil {
+	if rs == nil || rs.up == nil || rs.transport == nil {
 		return nil, errNoUpstream
 	}
-	up := rs.route.table.upstreams[rs.route.upstream]
+	up := rs.up
 	cancel := context.CancelFunc(func() {})
 	if up.DialTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, up.DialTimeout)
