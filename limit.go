@@ -106,12 +106,21 @@ func (l *pendingLimit) release(client netip.Prefix) {
 	l.mu.Unlock()
 }
 
-const (
-	rateShards = 16
-	// maxRateClients bounds the clients a rateLimit tracks. When they do not
-	// fit, new clients pass untracked rather than being refused.
-	maxRateClients = 1 << 16
-)
+const rateShards = 16
+
+// evictSample is how many records of a shard eviction compares to find the
+// oldest, so that it takes constant time.
+const evictSample = 8
+
+// records bounds the records of a table of clients, as
+// WithClientRecords sets it.
+type records struct {
+	max  int // positive; or negative for no limit
+	full FullPolicy
+}
+
+// isFull reports whether a table of n records has no room for another.
+func (r records) isFull(n int64) bool { return r.max >= 0 && n >= int64(r.max) }
 
 // sweepEvery is how many checks a shard of a rateLimit or a banList makes
 // between sweeps of the records it no longer needs.
@@ -154,9 +163,10 @@ func (b *tokenBucket) take(rate, burst float64, now time.Duration) bool {
 // rateLimit is a token bucket per client for new connections.
 type rateLimit struct {
 	clock  timeshim.Clock
+	epoch  time.Time
 	rate   float64 // tokens per second
 	burst  float64
-	epoch  time.Time
+	size   atomic.Int64 // tracked clients
 	shards [rateShards]rateShard
 }
 
@@ -172,20 +182,17 @@ type rateShard struct {
 }
 
 func newRateLimit(rate float64, burst int, clk timeshim.Clock) *rateLimit {
-	l := &rateLimit{rate: rate, burst: float64(max(burst, 1)), clock: clk, epoch: clk.Now()}
-	for i := range l.shards {
-		l.shards[i].bucket = make(map[netip.Prefix]tokenBucket)
-	}
-	return l
+	// The maps of the shards are made on first use.
+	return &rateLimit{rate: rate, burst: float64(max(burst, 1)), clock: clk, epoch: clk.Now()}
 }
 
 // allow takes a token for a new connection of client and reports whether
 // there was one.
-func (l *rateLimit) allow(client netip.Prefix) bool {
-	return l.allowAt(client, l.clock.Now().Sub(l.epoch))
+func (l *rateLimit) allow(client netip.Prefix, rec records) bool {
+	return l.allowAt(client, l.clock.Now().Sub(l.epoch), rec)
 }
 
-func (l *rateLimit) allowAt(client netip.Prefix, now time.Duration) bool {
+func (l *rateLimit) allowAt(client netip.Prefix, now time.Duration, rec records) bool {
 	sh := &l.shards[shardOf(client, rateShards)]
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -194,15 +201,20 @@ func (l *rateLimit) allowAt(client netip.Prefix, now time.Duration) bool {
 	}
 	tb, ok := sh.bucket[client]
 	if !ok {
-		if len(sh.bucket) >= maxRateClients/rateShards {
-			if sh.swept && now-sh.fullSweep < time.Second {
-				return true
-			}
+		if rec.isFull(l.size.Load()) && (!sh.swept || now-sh.fullSweep >= time.Second) {
 			sh.fullSweep, sh.swept = now, true
 			l.sweep(sh, now)
-			if len(sh.bucket) >= maxRateClients/rateShards {
-				return true
-			}
+		}
+		switch {
+		case !rec.isFull(l.size.Load()):
+			l.size.Add(1)
+		case rec.full == FullFailClosed:
+			return false
+		case rec.full != FullEvictOldest || !l.evict(sh):
+			return true // untracked
+		}
+		if sh.bucket == nil {
+			sh.bucket = make(map[netip.Prefix]tokenBucket)
 		}
 		tb = tokenBucket{tokens: l.burst, last: now}
 	}
@@ -217,6 +229,54 @@ func (l *rateLimit) sweep(sh *rateShard, now time.Duration) {
 	for client, tb := range sh.bucket {
 		if tb.refilled(l.rate, l.burst, now) >= l.burst {
 			delete(sh.bucket, client)
+			l.size.Add(-1)
 		}
 	}
+}
+
+// evict forgets the client seen longest ago, of a sample from sh or else
+// from the first other shard that is free to lock and has one, to give its
+// room to a new client of sh, and reports whether there was one. TryLock
+// keeps shards from waiting on each other.
+func (l *rateLimit) evict(sh *rateShard) bool {
+	start := 0
+	for i := range l.shards {
+		if &l.shards[i] == sh {
+			start = i
+		}
+	}
+	for i := range rateShards {
+		o := &l.shards[(start+i)%rateShards]
+		if o != sh && !o.mu.TryLock() {
+			continue
+		}
+		found := o.evictOldest()
+		if o != sh {
+			o.mu.Unlock()
+		}
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// evictOldest forgets the client of sh seen longest ago, of a sample.
+func (sh *rateShard) evictOldest() bool {
+	var victim netip.Prefix
+	var oldest time.Duration
+	found := false
+	n := 0
+	for client, tb := range sh.bucket {
+		if !found || tb.last < oldest {
+			victim, oldest, found = client, tb.last, true
+		}
+		if n++; n >= evictSample {
+			break
+		}
+	}
+	if found {
+		delete(sh.bucket, victim)
+	}
+	return found
 }

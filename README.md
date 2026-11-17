@@ -342,7 +342,9 @@ func resolveSites(sites *hostmatch.Map[[2]*portmux.Route]) portmux.ResolveFunc {
   their suffix (`*.` before `.` on a tie), then `*`. `LookupFunc`
   and `Matches` fall back to wider patterns for policies of your own. Lookups
   take no lock, and allocate nothing for lowercase names and those that
-  `Input` prepared.
+  `Input` prepared. `Set`, `Delete` and `Edit`, which applies many changes
+  at once, publish an immutable `hostmatch.Snapshot`; `Load` returns the
+  current one.
 - `ResolveHosts` and `ResolveDomain` route TLS, HTTP/1.x and h2c by the name
   the client asks for, and protocols of your own by the name a matcher sets
   with `Input.SetRequestedName`. Paths are for the HTTP server behind the
@@ -513,6 +515,7 @@ func tighten(m *portmux.Mux) portmux.Config {
 | `WithObserver(fn)`               | none    | Called with an `Event` for every connection delivered or closed           |           |
 | `WithProxyProtocol(policy)`      | none    | PROXY protocol v1/v2 per entry and peer                                   |           |
 | `WithClientPrefix(v4, v6)`       | 32, 64  | Networks counted as one client by the per-client limits and bans          |           |
+| `WithClientRecords(n, full)`     | 65536, fail open | Clients each rate and ban table holds (negative: no limit), and what a full one does: `FullFailOpen`, `FullFailClosed` or `FullEvictOldest` | |
 | `WithClock(c)`                   | system  | Time of bans, rate limits and close events; `timeshim.Fake` in tests      |           |
 | `WithCloseEvents(on)`            | off     | An `Event` when a delivered connection closes, with duration and bytes    |           |
 
@@ -663,10 +666,12 @@ over TLS, by the connection or a trusted proxy alone. `Build` refuses
 routes that match the same requests as one before them for a host, and
 routes that one before them hides entirely.
 
-- `Build` checks a `Config` and returns an immutable `Table`; `Update`
-  replaces the table while serving, and requests keep the table they were
-  matched with. Upstreams whose settings stay the same keep their idle
-  connections.
+- `Build` checks a `Config` and returns an immutable `Table`; `Table.With`
+  adds, replaces and removes routes and upstreams by name and returns a new
+  `Table`, compiling only the host patterns it touches, so one change is
+  cheap in a table of any size. `Update` replaces the table while serving,
+  and requests keep the table they were matched with. Upstreams whose
+  settings stay the same keep their idle connections.
 - A `DialFunc` gets the request's context and a `DialInfo` with the route,
   host and client; it is where load balancing goes. A `*StatusError` it
   returns sets the status, such as 503 for a backend that is offline;
@@ -734,6 +739,7 @@ routes that one before them hides entirely.
 | Function                                                        | Use                                                       |
 |-----------------------------------------------------------------|-----------------------------------------------------------|
 | `Peek(c, m, sniffOpts...)`, `PeekAny(c, ms, sniffOpts...)`      | Sniff one connection, and tell which matcher took it      |
+| `NewPeeker(ms, sniffOpts...)`, `Peeker.Peek(c)`                 | `PeekAny` with its matchers prepared once                 |
 | `tlshello.Parse`, `httphead.Parse`, `httphead.ParseHTTP2`       | Parse the first bytes of a connection                     |
 | `httphead.CleanPath`, `httphead.HasPathPrefix`                  | Resolve request paths and compare them as routes do       |
 | `tlshello.Scanner`, `httphead.Scanner`, `httphead.HTTP2Scanner` | Parse as bytes arrive                                     |

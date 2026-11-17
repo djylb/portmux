@@ -357,3 +357,27 @@ func closeNow(c *Conn) {
 	}
 	_ = c.Close()
 }
+
+// BenchmarkPeek compares PeekAny, which prepares its matchers on every call,
+// with a Peeker prepared once.
+func BenchmarkPeek(b *testing.B) {
+	data := []byte("GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+	matchers := []Matcher{TLS(), HTTP1(), SSH()}
+	b.Run("PeekAny", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, i, _ := PeekAny(&memConn{data: data}, matchers); i != 1 {
+				b.Fatal(i)
+			}
+		}
+	})
+	b.Run("Peeker", func(b *testing.B) {
+		p := NewPeeker(matchers)
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, i, _ := p.Peek(&memConn{data: data}); i != 1 {
+				b.Fatal(i)
+			}
+		}
+	})
+}

@@ -16,6 +16,9 @@ const (
 	DefaultMaxSniffBytes   = 16 << 10
 	DefaultMaxPending      = 4096
 	DefaultMaxQueued       = 1024
+	// DefaultMaxClientRecords is the number of clients that each table of
+	// WithClientRecords holds unless set.
+	DefaultMaxClientRecords = 1 << 16
 
 	// MaxSniffBytesLimit is the largest value WithMaxSniffBytes accepts.
 	MaxSniffBytesLimit = 16 << 20
@@ -39,7 +42,9 @@ type options struct {
 	proxyPolicy         func(entry string, peer, local net.Addr) proxyproto.Policy
 	clientBits4         int
 	clientBits6         int
+	clientRecords       int
 	clock               timeshim.Clock
+	recordsFull         FullPolicy
 	closeEvents         bool
 }
 
@@ -201,9 +206,9 @@ func WithMaxPendingPerClient(n int) EntryOption {
 // up to burst, and every connection takes one. Connections without a token
 // are closed at once, before any byte is read past a PROXY header, and
 // reported with ErrRateLimited. Clients are counted as in
-// WithMaxPendingPerClient. Up to 65536 clients are tracked; beyond that, new
-// clients pass unchecked. A non-positive rate, the default, disables the
-// limit.
+// WithMaxPendingPerClient. WithClientRecords bounds the clients tracked
+// and decides what happens to new ones beyond them. A non-positive rate,
+// the default, disables the limit.
 func WithRateLimitPerClient(perSecond float64, burst int) EntryOption {
 	return entryOption{settingRateLimitPerClient, func(o *options) {
 		o.rate, o.rateBurst = perSecond, burst
@@ -343,6 +348,52 @@ func TrustPeers(prefixes ...netip.Prefix) func(entry string, peer, local net.Add
 	return func(_ string, peer, _ net.Addr) proxyproto.Policy { return trust(peer) }
 }
 
+// FullPolicy is what a table of clients does when it is full; see
+// WithClientRecords.
+type FullPolicy uint8
+
+const (
+	// FullFailOpen lets clients that no record holds pass unchecked: new
+	// clients are not rate limited, and their failures do not count
+	// toward bans.
+	FullFailOpen FullPolicy = iota
+	// FullFailClosed refuses clients that no record holds: a new client
+	// of a full rate table is refused with ErrRateLimited, and while the
+	// table of bans and failures is full, Serve refuses clients without a
+	// record of failures with ErrBanned.
+	FullFailClosed
+	// FullEvictOldest makes room by forgetting the client seen longest
+	// ago, of a sample of a few records, which then starts over as a new
+	// client. Bans are never evicted: while only bans are left, failures
+	// of new clients are not counted.
+	FullEvictOldest
+)
+
+// WithClientRecords bounds to n the clients that the Mux keeps records of
+// in each of its tables: the token buckets of WithRateLimitPerClient, of the
+// Mux and of each entry with its own, and the failures and bans of
+// WithBanPerClient. Records are forgotten once they no longer matter, when
+// a bucket is full again or a failure window has passed; under a flood of
+// new clients, n bounds the memory they take, and full decides what
+// happens to clients the table has no room for. Zero selects
+// DefaultMaxClientRecords and a negative n removes the limit. Bans set
+// with Mux.Ban and BanPrefix are kept whatever the limit. Tables grow with
+// the clients they hold, not with n.
+func WithClientRecords(n int, full FullPolicy) Option {
+	return optionFunc(func(o *options) {
+		o.clientRecords, o.recordsFull = n, full
+	})
+}
+
+// records returns the bounds of the tables of clients.
+func (o *options) records() records {
+	n := o.clientRecords
+	if n == 0 {
+		n = DefaultMaxClientRecords
+	}
+	return records{max: n, full: o.recordsFull}
+}
+
 func newOptions(opts []Option) options {
 	cfg := options{
 		sniffTimeout:    DefaultSniffTimeout,
@@ -408,6 +459,10 @@ type Config struct {
 	// WithProxyProtocol set a function.
 	Observer      bool
 	ProxyProtocol bool
+	// MaxClientRecords and ClientRecordsFull are the arguments of
+	// WithClientRecords.
+	MaxClientRecords  int
+	ClientRecordsFull FullPolicy
 	// CloseEvents is the argument of WithCloseEvents.
 	CloseEvents bool
 }
@@ -432,15 +487,16 @@ func (c Config) EntryOptions() []EntryOption {
 }
 
 // Options returns the options that set the settings of c, for New and
-// Mux.SetOptions: those of EntryOptions, WithMaxPending, WithClientPrefix
-// and WithCloseEvents. The functions of WithObserver and WithProxyProtocol,
+// Mux.SetOptions: those of EntryOptions, WithMaxPending, WithClientPrefix,
+// WithClientRecords and WithCloseEvents. The functions of WithObserver and WithProxyProtocol,
 // which Config does not hold, are not among them, so SetOptions keeps them.
 func (c Config) Options() []Option {
 	var opts []Option
 	for _, o := range c.EntryOptions() {
 		opts = append(opts, o)
 	}
-	return append(opts, WithMaxPending(c.MaxPending), WithClientPrefix(c.ClientPrefix4, c.ClientPrefix6), WithCloseEvents(c.CloseEvents))
+	return append(opts, WithMaxPending(c.MaxPending), WithClientPrefix(c.ClientPrefix4, c.ClientPrefix6),
+		WithClientRecords(c.MaxClientRecords, c.ClientRecordsFull), WithCloseEvents(c.CloseEvents))
 }
 
 func (o *options) config() Config {
@@ -462,6 +518,8 @@ func (o *options) config() Config {
 		ProxyProtocol:        o.proxyPolicy != nil,
 		ClientPrefix4:        o.clientBits4,
 		ClientPrefix6:        o.clientBits6,
+		MaxClientRecords:     o.clientRecords,
+		ClientRecordsFull:    o.recordsFull,
 		CloseEvents:          o.closeEvents,
 	}
 }

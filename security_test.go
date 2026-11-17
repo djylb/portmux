@@ -185,7 +185,7 @@ func TestRateLimitBuckets(t *testing.T) {
 		{a, 10_000, true}, {a, 10_000, true}, {a, 10_000, false}, // refilled to burst only
 	}
 	for i, st := range steps {
-		if got := l.allowAt(host(st.client), at(st.ms)); got != st.want {
+		if got := l.allowAt(host(st.client), at(st.ms), testRecords); got != st.want {
 			t.Fatalf("step %d: allow = %v, want %v", i, got, st.want)
 		}
 	}
@@ -206,15 +206,15 @@ func TestRateLimitTracksBoundedClients(t *testing.T) {
 	l := newRateLimit(1, 1, timeshim.Real)
 	// Fill the tracked clients with exhausted buckets, then check that new
 	// clients pass untracked instead of growing the maps.
-	for i := range maxRateClients * 2 {
+	for i := range DefaultMaxClientRecords * 2 {
 		ip := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
-		l.allowAt(host(ip), 0)
+		l.allowAt(host(ip), 0, testRecords)
 	}
 	total := 0
 	for i := range l.shards {
 		total += len(l.shards[i].bucket)
 	}
-	if total > maxRateClients {
+	if total > DefaultMaxClientRecords {
 		t.Fatalf("tracking %d clients", total)
 	}
 }
@@ -818,4 +818,114 @@ func (c *counterPanicConn) RemoteAddr() net.Addr {
 		panic("RemoteAddr failed")
 	}
 	return c.Conn.RemoteAddr()
+}
+
+// TestClientRecordPolicies checks the size and the full policies of the
+// tables of clients.
+func TestClientRecordPolicies(t *testing.T) {
+	client := func(i int) netip.Addr { return netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}) }
+	for _, tc := range []struct {
+		rec      records
+		newOK    bool // a new client of a full rate table passes
+		oldKept  bool // the first client keeps its bucket
+		maxSize  int64
+		unlimitd bool
+	}{
+		{records{max: 4, full: FullFailOpen}, true, true, 4, false},
+		{records{max: 4, full: FullFailClosed}, false, true, 4, false},
+		{records{max: 4, full: FullEvictOldest}, true, false, 4, false},
+		{records{max: -1}, true, true, 0, true},
+	} {
+		l := newRateLimit(0.001, 1, timeshim.Real)
+		l.allowAt(host(client(0)), 0, tc.rec) // takes its one token
+		for i := 1; i < 64; i++ {
+			l.allowAt(host(client(i)), time.Duration(i), tc.rec)
+		}
+		if tc.unlimitd {
+			if n := l.size.Load(); n != 64 {
+				t.Errorf("unlimited: size %d", n)
+			}
+			continue
+		}
+		if n := l.size.Load(); n > tc.maxSize {
+			t.Errorf("%v: size %d", tc.rec, n)
+		}
+		if got := l.allowAt(host(client(1000)), time.Second, tc.rec); got != tc.newOK {
+			t.Errorf("%v: new client allowed %v", tc.rec, got)
+		}
+		// A client still holding a record has no token left.
+		kept := !l.allowAt(host(client(0)), 2*time.Second, tc.rec)
+		if tc.rec.full != FullEvictOldest && kept != tc.oldKept {
+			t.Errorf("%v: first client kept %v", tc.rec, kept)
+		}
+	}
+}
+
+// TestBanRecordPolicies checks the full policies of the table of bans.
+func TestBanRecordPolicies(t *testing.T) {
+	client := func(i int) netip.Addr { return netip.AddrFrom4([4]byte{10, 1, byte(i >> 8), byte(i)}) }
+	fill := func(rec records) *banList {
+		l := newBanList(timeshim.Real)
+		for i := range 64 {
+			l.fail(banKey{client: host(client(i))}, time.Duration(i), 5, time.Hour, time.Hour, rec)
+		}
+		return l
+	}
+	open := fill(records{max: 4, full: FullFailOpen})
+	if n := open.size.Load(); n != 4 {
+		t.Errorf("fail open: size %d", n)
+	}
+	if open.banned(client(100), time.Second, records{max: 4, full: FullFailOpen}) {
+		t.Error("fail open refused a new client")
+	}
+	closed := fill(records{max: 4, full: FullFailClosed})
+	rec := records{max: 4, full: FullFailClosed}
+	if !closed.banned(client(100), time.Second, rec) {
+		t.Error("fail closed let a new client in while full")
+	}
+	if closed.banned(client(0), time.Second, rec) {
+		t.Error("fail closed refused a client with a record")
+	}
+	evict := fill(records{max: 4, full: FullEvictOldest})
+	if n := evict.size.Load(); n != 4 {
+		t.Errorf("evict: size %d", n)
+	}
+	// The newest client has a record; the oldest lost theirs.
+	if _, ok := evict.bannedKey(host(client(63)), time.Second); !ok {
+		t.Error("evict: newest client has no record")
+	}
+	// Bans are not evicted.
+	l := newBanList(timeshim.Real)
+	er := records{max: 2, full: FullEvictOldest}
+	for i := range 2 {
+		for range 2 {
+			l.fail(banKey{client: host(client(i))}, 0, 2, time.Hour, time.Hour, er)
+		}
+	}
+	for i := 2; i < 10; i++ {
+		l.fail(banKey{client: host(client(i))}, 0, 2, time.Hour, time.Hour, er)
+	}
+	if !l.banned(client(0), time.Second, er) || !l.banned(client(1), time.Second, er) {
+		t.Error("evict: a ban was evicted")
+	}
+	unl := fill(records{max: -1})
+	if n := unl.size.Load(); n != 64 {
+		t.Errorf("unlimited: size %d", n)
+	}
+}
+
+func TestWithClientRecords(t *testing.T) {
+	m := New(WithClientRecords(-1, FullEvictOldest))
+	defer func() { _ = m.Close() }()
+	c := m.Config()
+	if c.MaxClientRecords != -1 || c.ClientRecordsFull != FullEvictOldest {
+		t.Fatalf("config %+v", c)
+	}
+	if r := m.options().records(); r.max != -1 {
+		t.Fatalf("records %+v", r)
+	}
+	m.SetOptions(WithClientRecords(0, FullFailOpen))
+	if r := m.options().records(); r.max != DefaultMaxClientRecords || r.full != FullFailOpen {
+		t.Fatalf("records %+v", r)
+	}
 }

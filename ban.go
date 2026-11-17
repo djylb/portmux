@@ -80,12 +80,7 @@ func (m *Mux) Bans() []Ban {
 	return m.bans.list(m.bans.now())
 }
 
-const (
-	banShards = 16
-	// maxBanClients bounds the records a banList keeps. When they do not fit,
-	// failures of new clients are not counted.
-	maxBanClients = 1 << 16
-)
+const banShards = 16
 
 // banList counts the failed connections of each client and bans clients for
 // a while, automatically or on request.
@@ -159,11 +154,7 @@ type banEntry struct {
 }
 
 func newBanList(clk timeshim.Clock) *banList {
-	l := &banList{clock: clk, epoch: clk.Now()}
-	for i := range l.shards {
-		l.shards[i].clients = make(map[banKey]banEntry)
-	}
-	return l
+	return &banList{clock: clk, epoch: clk.Now()} // maps are made on first use
 }
 
 func (l *banList) now() time.Duration { return l.clock.Now().Sub(l.epoch) }
@@ -172,31 +163,37 @@ func (l *banList) shard(client netip.Prefix) *banShard {
 	return &l.shards[shardOf(client, banShards)]
 }
 
-// banned reports whether a network that holds ip is banned at now.
-func (l *banList) banned(ip netip.Addr, now time.Duration) bool {
+// banned reports whether a network that holds ip is banned at now, or,
+// with rec failing closed, whether the list is full and ip has no record.
+func (l *banList) banned(ip netip.Addr, now time.Duration, rec records) bool {
 	if l.size.Load() == 0 {
 		return false
 	}
+	known := false
 	for key := range l.keys(ip) {
-		if l.bannedKey(key, now) {
+		ban, ok := l.bannedKey(key, now)
+		if ban {
 			return true
 		}
+		known = known || ok
 	}
-	return false
+	return !known && rec.full == FullFailClosed && rec.isFull(l.size.Load())
 }
 
-func (l *banList) bannedKey(client netip.Prefix, now time.Duration) bool {
+// bannedKey reports whether client is banned at now, and whether it has a
+// record.
+func (l *banList) bannedKey(client netip.Prefix, now time.Duration) (banned, ok bool) {
 	sh := l.shard(client)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	e, ok := sh.clients[banKey{client: client}]
-	return ok && e.until > now
+	return ok && e.until > now, ok
 }
 
 // fail counts a failed connection in the record key and bans its client for
 // d once failures connections failed within window. It reports whether it
 // banned the client.
-func (l *banList) fail(key banKey, now time.Duration, failures int, window, d time.Duration) bool {
+func (l *banList) fail(key banKey, now time.Duration, failures int, window, d time.Duration, rec records) bool {
 	l.noteLength(key.client)
 	sh := l.shard(key.client)
 	sh.mu.Lock()
@@ -210,7 +207,7 @@ func (l *banList) fail(key banKey, now time.Duration, failures int, window, d ti
 		return false // already banned
 	}
 	e, ok := sh.clients[key]
-	if !ok && !l.track(sh) {
+	if !ok && !l.track(sh, now, rec, ban) {
 		return false
 	}
 	if now-e.start > window {
@@ -224,7 +221,7 @@ func (l *banList) fail(key banKey, now time.Duration, failures int, window, d ti
 	e.failures = 0
 	sh.clients[key] = e
 	if key != ban {
-		if !banned && !l.track(sh) {
+		if !banned && !l.track(sh, now, rec, key) {
 			return false
 		}
 		e = b
@@ -242,14 +239,72 @@ func banEnd(now, d time.Duration) time.Duration {
 	return now + d
 }
 
-// track makes room for a new record in sh and reports whether there was
-// some.
-func (l *banList) track(sh *banShard) bool {
-	if len(sh.clients) >= maxBanClients/banShards {
+// track makes room for a new record in sh, by rec, and reports whether
+// there was some. Evicting, it keeps keep and the records of bans.
+func (l *banList) track(sh *banShard, now time.Duration, rec records, keep banKey) bool {
+	if !rec.isFull(l.size.Load()) {
+		l.size.Add(1)
+		if sh.clients == nil {
+			sh.clients = make(map[banKey]banEntry)
+		}
+		return true
+	}
+	if rec.full != FullEvictOldest {
 		return false
 	}
-	l.size.Add(1)
-	return true
+	// The oldest of a sample from this shard, else from the first other
+	// shard that is free to lock and has one: a full list may hold its
+	// records in other shards. TryLock keeps shards from waiting on each
+	// other.
+	start := l.index(sh)
+	for i := range banShards {
+		o := &l.shards[(start+i)%banShards]
+		if o != sh && !o.mu.TryLock() {
+			continue
+		}
+		found := o.evictOldest(now, keep)
+		if o != sh {
+			o.mu.Unlock()
+		}
+		if found {
+			if sh.clients == nil { // the room moves to sh
+				sh.clients = make(map[banKey]banEntry)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// index returns the index of sh in l.shards.
+func (l *banList) index(sh *banShard) int {
+	for i := range l.shards {
+		if &l.shards[i] == sh {
+			return i
+		}
+	}
+	return 0
+}
+
+// evictOldest forgets the oldest record of a sample that is not a ban nor
+// keep, and reports whether there was one.
+func (sh *banShard) evictOldest(now time.Duration, keep banKey) bool {
+	var victim banKey
+	var oldest time.Duration
+	found := false
+	n := 0
+	for key, e := range sh.clients {
+		if e.until <= now && key != keep && (!found || e.start < oldest) {
+			victim, oldest, found = key, e.start, true
+		}
+		if n++; n >= evictSample {
+			break
+		}
+	}
+	if found {
+		delete(sh.clients, victim) // its room goes to the new record
+	}
+	return found
 }
 
 // set bans the client of key until now+d, or lifts its ban for d <= 0. It
@@ -270,8 +325,12 @@ func (l *banList) set(key banKey, now, d time.Duration) bool {
 	was := ok && e.until > now
 	switch {
 	case d > 0:
+		// Bans set by hand are kept whatever the limit of records.
 		if !ok {
 			l.size.Add(1)
+		}
+		if sh.clients == nil {
+			sh.clients = make(map[banKey]banEntry)
 		}
 		sh.clients[key] = banEntry{start: now, until: banEnd(now, d)}
 	case ok:

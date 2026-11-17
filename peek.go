@@ -38,26 +38,54 @@ func Peek(c net.Conn, m Matcher, opts ...PeekOption) (*Conn, error) {
 // works as in a Mux. PeekAny panics without a connection, without matchers
 // or on a nil one, as Peek does.
 func PeekAny(c net.Conn, matchers []Matcher, opts ...PeekOption) (*Conn, int, error) {
-	if c == nil || len(matchers) == 0 || slices.Contains(matchers, nil) {
+	if c == nil {
+		panic("portmux: PeekAny needs a connection and matchers")
+	}
+	return NewPeeker(matchers, opts...).Peek(c)
+}
+
+// Peeker is PeekAny with its matchers and options prepared once, for a
+// server that peeks at every connection it takes the same way. A Peeker is
+// safe for concurrent use.
+type Peeker struct {
+	tables atomic.Pointer[table] // set once; as a Mux holds its table
+	routes []*Route
+	opts   options
+}
+
+// NewPeeker prepares matchers and opts for Peeker.Peek. It panics without
+// matchers or on a nil one.
+func NewPeeker(matchers []Matcher, opts ...PeekOption) *Peeker {
+	if len(matchers) == 0 || slices.Contains(matchers, nil) {
 		panic("portmux: PeekAny needs a connection and matchers")
 	}
 	all := make([]Option, len(opts))
 	for i, opt := range opts {
 		all[i] = opt
 	}
-	o := newOptions(all)
-	conn := &Conn{conn: c}
-	s := newSniffer(conn, &o, time.Now())
-	defer s.release()
-	var tables atomic.Pointer[table]
+	p := &Peeker{opts: newOptions(all)}
 	t, routes := peekTable(matchers)
-	tables.Store(t)
-	err := s.readProxyHeader(proxyPolicyFor(&o, "", c), &tables)
+	p.tables.Store(t)
+	p.routes = routes
+	return p
+}
+
+// Peek is PeekAny with the matchers and options of p. It panics without a
+// connection.
+func (p *Peeker) Peek(c net.Conn) (*Conn, int, error) {
+	if c == nil {
+		panic("portmux: Peek needs a connection")
+	}
+	o := &p.opts
+	conn := &Conn{conn: c}
+	s := newSniffer(conn, o, time.Now())
+	defer s.release()
+	err := s.readProxyHeader(proxyPolicyFor(o, "", c), &p.tables)
 	index := -1
 	if err == nil {
 		var r *Route
-		if r, err = s.match(&tables, o.maxSniffBytes); err == nil {
-			index = slices.Index(routes, r)
+		if r, err = s.match(&p.tables, o.maxSniffBytes); err == nil {
+			index = slices.Index(p.routes, r)
 		}
 	}
 	s.handOver(nil)

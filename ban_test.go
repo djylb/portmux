@@ -95,29 +95,29 @@ func TestBanListBounds(t *testing.T) {
 	l := newBanList(timeshim.Real)
 	now := time.Duration(0)
 	a := netip.MustParseAddr("192.0.2.1")
-	l.fail(banKey{client: host(a)}, now, 3, time.Second, time.Minute)
-	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute) // a new window
-	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute)
-	if l.banned(a, now+2*time.Second) {
+	l.fail(banKey{client: host(a)}, now, 3, time.Second, time.Minute, testRecords)
+	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute, testRecords) // a new window
+	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute, testRecords)
+	if l.banned(a, now+2*time.Second, testRecords) {
 		t.Fatal("banned with failures in two windows")
 	}
-	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute)
-	if !l.banned(a, now+2*time.Second) || l.banned(a, now+3*time.Minute) {
+	l.fail(banKey{client: host(a)}, now+2*time.Second, 3, time.Second, time.Minute, testRecords)
+	if !l.banned(a, now+2*time.Second, testRecords) || l.banned(a, now+3*time.Minute, testRecords) {
 		t.Fatal("ban period")
 	}
 	// Expired clients are swept, and the list stops growing when full.
-	for i := range maxBanClients + 100 {
+	for i := range DefaultMaxClientRecords + 100 {
 		ip := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
-		l.fail(banKey{client: host(ip)}, 10*time.Minute, 5, time.Second, time.Minute)
+		l.fail(banKey{client: host(ip)}, 10*time.Minute, 5, time.Second, time.Minute, testRecords)
 	}
-	if n := l.size.Load(); n > maxBanClients {
+	if n := l.size.Load(); n > DefaultMaxClientRecords {
 		t.Fatalf("size %d", n)
 	}
 	for i := range sweepEvery * banShards {
 		ip := netip.AddrFrom4([4]byte{172, 16, byte(i >> 8), byte(i)})
-		l.fail(banKey{client: host(ip)}, time.Hour, 5, time.Second, time.Minute)
+		l.fail(banKey{client: host(ip)}, time.Hour, 5, time.Second, time.Minute, testRecords)
 	}
-	if n := l.size.Load(); n > maxBanClients/2 {
+	if n := l.size.Load(); n > DefaultMaxClientRecords/2 {
 		t.Fatalf("size %d after sweeping", n)
 	}
 }
@@ -129,30 +129,30 @@ func TestBanListScopes(t *testing.T) {
 	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
 	mux, own := banKey{client: host(a)}, banKey{client: host(a), entry: "fast", own: true}
 	// Two failures toward the Mux's rule of three in ten minutes.
-	l.fail(mux, 0, 3, 10*time.Minute, time.Hour)
-	l.fail(mux, time.Second, 3, 10*time.Minute, time.Hour)
+	l.fail(mux, 0, 3, 10*time.Minute, time.Hour, testRecords)
+	l.fail(mux, time.Second, 3, 10*time.Minute, time.Hour, testRecords)
 	// Failures toward the entry's rule of three in a second, each in a window
 	// of its own, neither ban nor reset the Mux's count.
 	for i := range 4 {
-		l.fail(own, time.Duration(2+2*i)*time.Second, 3, time.Second, time.Hour)
+		l.fail(own, time.Duration(2+2*i)*time.Second, 3, time.Second, time.Hour, testRecords)
 	}
-	if l.banned(a, 10*time.Second) {
+	if l.banned(a, 10*time.Second, testRecords) {
 		t.Fatal("banned by failures in separate windows")
 	}
 	// Sweeps after failures with a short window keep the Mux's count.
 	for i := range sweepEvery * banShards {
 		ip := netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)})
-		l.fail(banKey{client: host(ip), entry: "fast", own: true}, time.Minute, 3, time.Second, time.Hour)
+		l.fail(banKey{client: host(ip), entry: "fast", own: true}, time.Minute, 3, time.Second, time.Hour, testRecords)
 	}
-	l.fail(mux, 2*time.Minute, 3, 10*time.Minute, time.Hour)
-	if !l.banned(a, 2*time.Minute) {
+	l.fail(mux, 2*time.Minute, 3, 10*time.Minute, time.Hour, testRecords)
+	if !l.banned(a, 2*time.Minute, testRecords) {
 		t.Fatal("not banned by the Mux's rule")
 	}
 	// The entry's rule bans the client as well.
 	for range 3 {
-		l.fail(banKey{client: host(b), entry: "fast", own: true}, time.Hour, 3, time.Second, time.Minute)
+		l.fail(banKey{client: host(b), entry: "fast", own: true}, time.Hour, 3, time.Second, time.Minute, testRecords)
 	}
-	if !l.banned(b, time.Hour) || len(l.list(time.Hour)) != 2 {
+	if !l.banned(b, time.Hour, testRecords) || len(l.list(time.Hour)) != 2 {
 		t.Fatalf("bans %+v", l.list(time.Hour))
 	}
 }
@@ -180,8 +180,8 @@ func TestBanForever(t *testing.T) {
 	defer func() { _ = m.Close() }()
 	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
 	m.Ban(a, math.MaxInt64)
-	m.bans.fail(banKey{client: host(b)}, m.bans.now(), 1, time.Minute, math.MaxInt64)
-	if !m.bans.banned(a, m.bans.now()) || !m.bans.banned(b, m.bans.now()) || len(m.Bans()) != 2 {
+	m.bans.fail(banKey{client: host(b)}, m.bans.now(), 1, time.Minute, math.MaxInt64, testRecords)
+	if !m.bans.banned(a, m.bans.now(), testRecords) || !m.bans.banned(b, m.bans.now(), testRecords) || len(m.Bans()) != 2 {
 		t.Fatalf("bans %+v", m.Bans())
 	}
 }
@@ -203,3 +203,6 @@ func TestBanFakeClock(t *testing.T) {
 		t.Fatalf("bans after they ended: %+v", bans)
 	}
 }
+
+// testRecords are the default bounds of tables of clients.
+var testRecords = records{max: DefaultMaxClientRecords}

@@ -295,7 +295,9 @@ func (m *Mux) admit(c net.Conn, l *listener, cs *connSettings) (admission, error
 		return admission{}, ErrRateLimited
 	}
 	if o.proxyPolicy != nil {
-		if ap, ok := addrPort(c.RemoteAddr()); ok && m.bans.banned(ap.Addr(), m.bans.now()) {
+		if ap, ok := addrPort(c.RemoteAddr()); ok && m.bans.banned(ap.Addr(), m.bans.now(), records{max: -1}) {
+			// Records bound only clients: a trusted peer is never refused
+			// for having none.
 			return admission{}, ErrBanned
 		}
 		return admission{policy: true}, nil
@@ -325,9 +327,9 @@ func (m *Mux) admitClient(a admission, client net.Addr, cs *connSettings) (admis
 	key := cs.opts.clientNet(ap.Addr())
 	a.client = key
 	switch {
-	case m.bans.banned(ap.Addr(), m.bans.now()):
+	case m.bans.banned(ap.Addr(), m.bans.now(), cs.opts.records()):
 		return a, ErrBanned
-	case cs.rate != nil && !cs.rate.allow(key):
+	case cs.rate != nil && !cs.rate.allow(key, cs.opts.records()):
 		return a, ErrRateLimited
 	case cs.opts.maxPendingPerClient <= 0:
 		return a, nil
@@ -364,7 +366,7 @@ func (m *Mux) releaseAdmitted(l *listener, a *admission, cs *connSettings, held 
 		return false
 	}
 	if o := cs.opts; err != nil && o.banFailures > 0 && o.banTime > 0 && a.client.IsValid() && banWorthy(err) {
-		return m.bans.fail(cs.banKey(l.entry, a.client), m.bans.now(), o.banFailures, o.banWindow, o.banTime)
+		return m.bans.fail(cs.banKey(l.entry, a.client), m.bans.now(), o.banFailures, o.banWindow, o.banTime, o.records())
 	}
 	return false
 }

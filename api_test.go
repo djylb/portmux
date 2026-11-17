@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -185,7 +186,7 @@ func TestBanPrefix(t *testing.T) {
 	defer func() { _ = m.Close() }()
 	m.BanPrefix(netip.MustParsePrefix("::ffff:192.0.2.0/120"), time.Minute)
 	now := m.bans.now()
-	if !m.bans.banned(netip.MustParseAddr("192.0.2.77"), now) || m.bans.banned(netip.MustParseAddr("192.0.3.1"), now) {
+	if !m.bans.banned(netip.MustParseAddr("192.0.2.77"), now, testRecords) || m.bans.banned(netip.MustParseAddr("192.0.3.1"), now, testRecords) {
 		t.Fatal("192.0.2.0/24 not banned as IPv4")
 	}
 	if bans := m.Bans(); len(bans) != 1 || bans[0].Client != netip.MustParsePrefix("192.0.2.0/24") {
@@ -480,4 +481,24 @@ func TestCloseEvents(t *testing.T) {
 		t.Fatalf("close reported without WithCloseEvents: %+v", ev)
 	case <-time.After(20 * time.Millisecond):
 	}
+}
+
+// TestPeekerConcurrent shares one Peeker between connections at once.
+func TestPeekerConcurrent(t *testing.T) {
+	p := NewPeeker([]Matcher{TLS(), HTTP1(), SSH()}, WithSniffTimeout(5*time.Second))
+	inputs := []string{"SSH-2.0-x\r\n", "GET / HTTP/1.1\r\nHost: h\r\n\r\n", "\x00\x01"}
+	wants := []int{2, 1, -1}
+	var wg sync.WaitGroup
+	for i := range 24 {
+		wg.Go(func() {
+			a, b := net.Pipe()
+			go func() { _, _ = b.Write([]byte(inputs[i%3])); _ = b.Close() }()
+			conn, got, _ := p.Peek(a)
+			if got != wants[i%3] {
+				t.Errorf("%q: Peek = %d, want %d", inputs[i%3], got, wants[i%3])
+			}
+			_ = conn.Close()
+		})
+	}
+	wg.Wait()
 }
