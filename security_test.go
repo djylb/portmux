@@ -826,15 +826,15 @@ func TestClientRecordPolicies(t *testing.T) {
 	client := func(i int) netip.Addr { return netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}) }
 	for _, tc := range []struct {
 		rec      records
+		maxSize  int64
 		newOK    bool // a new client of a full rate table passes
 		oldKept  bool // the first client keeps its bucket
-		maxSize  int64
 		unlimitd bool
 	}{
-		{records{max: 4, full: FullFailOpen}, true, true, 4, false},
-		{records{max: 4, full: FullFailClosed}, false, true, 4, false},
-		{records{max: 4, full: FullEvictOldest}, true, false, 4, false},
-		{records{max: -1}, true, true, 0, true},
+		{records{max: 4, full: FullFailOpen}, 4, true, true, false},
+		{records{max: 4, full: FullFailClosed}, 4, false, true, false},
+		{records{max: 4, full: FullEvictOldest}, 4, true, false, false},
+		{records{max: -1}, 0, true, true, true},
 	} {
 		l := newRateLimit(0.001, 1, timeshim.Real)
 		l.allowAt(host(client(0)), 0, tc.rec) // takes its one token
