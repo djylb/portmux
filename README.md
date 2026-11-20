@@ -606,7 +606,7 @@ X-Forwarded-Proto: ${scheme}
 			{Name: "api", Hosts: []string{"*.example.com"}, Path: "/api", RedirectHTTPS: &httproute.HTTPSRedirect{},
 				Proxy: &httproute.Proxy{Upstream: "app", ReplacePath: "/"}, RequestHeaders: headers},
 			{Name: "old", Path: "/old", Redirect: &httproute.Redirect{
-				To: httprewrite.MustCompile("https://${host}/new${path_rest}", httproute.Vars()), Status: 301}},
+				To: httprewrite.MustCompile("https://${host}/new/${path_rest}", httproute.Vars()), Status: 301}},
 			{Name: "health", Path: "/healthz", Respond: &httproute.Respond{Body: []byte("ok")}},
 		},
 		ErrorPages: map[int]httproute.ErrorPage{502: {Body: []byte("<h1>Backend down</h1>")}},

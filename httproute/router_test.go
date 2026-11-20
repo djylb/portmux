@@ -81,7 +81,7 @@ X-Route: ${route} ${route_path} ${path_rest}
 	if got := h.Get("Got-X-Real-Ip"); got != "127.0.0.1" {
 		t.Errorf("X-Real-IP %q", got)
 	}
-	if got := h.Get("Got-X-Route"); got != "api /api /users" {
+	if got := h.Get("Got-X-Route"); got != "api /api users" {
 		t.Errorf("X-Route %q", got)
 	}
 	// RFC 9110 7.6.1: hop-by-hop fields and those that Connection names
@@ -133,7 +133,7 @@ func TestReplacePathKeepsEscapes(t *testing.T) {
 func TestRedirectRespond(t *testing.T) {
 	checkLeaks(t)
 	_, base := startRouter(t, Options{}, Config{Routes: []Route{
-		{Path: "/old", Redirect: &Redirect{To: template(t, "https://${host}/new${path_rest}${is_args}${args}"), Status: 301}},
+		{Path: "/old", Redirect: &Redirect{To: template(t, "https://${host}/new/${path_rest}${is_args}${args}"), Status: 301}},
 		{Path: "/hello", Respond: &Respond{Status: 201, Header: http.Header{"Content-Type": {"text/plain"}}, Body: []byte("hi")},
 			ResponseHeaders: rules(t, "X-Status: ${status}")},
 		{Path: "/empty", Respond: &Respond{Status: 204, Body: []byte("ignored")}},
@@ -687,5 +687,24 @@ func TestConnTLSShared(t *testing.T) {
 	a, b := ct.state(), ct.state()
 	if a != b || !a.HandshakeComplete {
 		t.Errorf("states %p and %p, complete %v", a, b, a.HandshakeComplete)
+	}
+}
+
+// path_rest never starts with a slash: "/api" and "/api/" give the same
+// rest, so "/${path_rest}" is the path below the route either way.
+func TestPathRestNoLeadingSlash(t *testing.T) {
+	for _, tc := range []struct{ route, path, want string }{
+		{"/api", "/api/x/y", "x/y"},
+		{"/api/", "/api/x/y", "x/y"},
+		{"/api", "/api", ""},
+		{"/api", "/api/", ""},
+		{"/api/", "/api/", ""},
+	} {
+		_, base := startRouter(t, Options{}, Config{Routes: []Route{{Path: tc.route, Respond: okRespond,
+			ResponseHeaders: rules(t, "X-Rest: <${path_rest}>")}}})
+		res, _ := get(t, client(t), "GET", base+tc.path, "h", nil)
+		if got := res.Header.Get("X-Rest"); got != "<"+tc.want+">" {
+			t.Errorf("route %q path %q: rest %s, want <%s>", tc.route, tc.path, got, tc.want)
+		}
 	}
 }

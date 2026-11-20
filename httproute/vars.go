@@ -12,9 +12,10 @@ import (
 //
 //	route        the name of the route
 //	route_path   the route's Path
-//	path_rest    the decoded path after the route's Path, such as "/v1"
-//	             for "/api/v1" under "/api"; the whole path for a
-//	             PathRegexp route
+//	path_rest    the decoded path after the route's Path without its
+//	             leading slash, such as "v1" for "/api/v1" under "/api"
+//	             or "/api/"; empty for "/api" itself; the whole path
+//	             without its leading slash for a PathRegexp route
 //	match_1 ...  the groups of a PathRegexp's match, up to match_9
 //	request_id   the X-Request-Id of a trusted proxy (Config.Resolver),
 //	             else 16 random hexadecimal digits; the same for every
@@ -43,7 +44,11 @@ func Vars() httprewrite.Vars {
 		},
 		"path_rest": func(dst []byte, c *httprewrite.Context) []byte {
 			if rs, ok := c.Data.(*reqState); ok && rs.route != nil && len(rs.path) >= len(rs.route.path) {
-				dst = append(dst, rs.path[len(rs.route.path):]...)
+				rest := rs.path[len(rs.route.path):]
+				if len(rest) > 0 && rest[0] == '/' {
+					rest = rest[1:]
+				}
+				dst = append(dst, rest...)
 			}
 			return dst
 		},
