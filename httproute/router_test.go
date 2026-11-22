@@ -336,8 +336,8 @@ func TestTrailers(t *testing.T) {
 	}
 }
 
-// wsBackendHandler accepts upgrades to "echo" and echoes lines until EOF.
-func wsBackendHandler(w http.ResponseWriter, r *http.Request) {
+// serveWebSocket accepts upgrades and gives the stream to serve.
+func serveWebSocket(w http.ResponseWriter, r *http.Request, serve func(net.Conn, *bufio.ReadWriter)) {
 	if r.Header.Get("Upgrade") != "websocket" {
 		w.WriteHeader(http.StatusUpgradeRequired)
 		return
@@ -352,7 +352,13 @@ func wsBackendHandler(w http.ResponseWriter, r *http.Request) {
 		accept = "Sec-WebSocket-Accept: " + acceptKey(key) + "\r\n"
 	}
 	_, _ = io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"+accept+"\r\n")
-	_, _ = io.Copy(c, brw)
+	serve(c, brw)
+}
+
+func wsBackendHandler(w http.ResponseWriter, r *http.Request) {
+	serveWebSocket(w, r, func(c net.Conn, brw *bufio.ReadWriter) {
+		_, _ = io.Copy(c, brw)
+	})
 }
 
 func wsBackend(t *testing.T) Upstream {

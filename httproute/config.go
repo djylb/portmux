@@ -110,15 +110,17 @@ type Route struct {
 	// 413 Content Too Large. 0 means no limit, as backends usually bound
 	// uploads themselves, and a negative limit is an invalid config. It
 	// does not limit the streams of upgraded connections and of WebSockets
-	// over HTTP/2.
+	// over HTTP/2 or HTTP/3.
 	MaxRequestBody int64
 	// Upgrades are the protocols that the Upgrade field of a request may
 	// name, compared without regard to case; nil means "websocket". A
 	// request that names another has its Upgrade field removed and goes
 	// on as an ordinary request, and HTTP2-Settings is always removed, so
 	// that no upgrade to h2c carries requests past the routes. Extended
-	// CONNECT requests of HTTP/2 (RFC 8441) are routed by their path and
-	// proxied to the backend as WebSocket upgrades over HTTP/1.1.
+	// CONNECT for WebSocket over HTTP/2 (RFC 8441) or HTTP/3 (RFC 9220)
+	// is routed by path and proxied as an HTTP/1.1 WebSocket upgrade.
+	// Unsupported extended CONNECT protocols receive 501. A route that
+	// disallows WebSocket answers 400.
 	Upgrades []string
 	// UpgradeIdleTimeout closes an upgraded connection, such as a
 	// WebSocket, through which no bytes passed either way for that long; 0
@@ -231,6 +233,9 @@ type Upstream struct {
 	// Dial connects to the backend. It is called with the context of the
 	// request that needs a new connection, bounded by DialTimeout and
 	// canceled when the Router closes. Nil dials Addr over TCP.
+	// For extended CONNECT over an upstream without TLS, a connection
+	// with CloseWrite preserves the client's orderly half-close. If
+	// the connection cannot half-close, the tunnel closes.
 	Dial DialFunc
 	// TLS, if set, runs TLS over what Dial returns. Its NextProtos is
 	// replaced as HTTP2 asks.

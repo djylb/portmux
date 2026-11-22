@@ -139,6 +139,7 @@ type reqState struct {
 	keyed     *keyPool  // the transports of key, nil without one
 	host      hostmatch.Name
 	path      string
+	protocol  string // the protocol token of an extended CONNECT
 	client    forwarded.Client
 	tls       bool
 	status    int // overrides the written status: 101 and 499
@@ -481,9 +482,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 func (r *Router) route(w http.ResponseWriter, req *http.Request, st *state, rs *reqState) {
 	t := st.table
 	rs.table = t
-	if req.Method == http.MethodConnect && req.Header.Get(":protocol") == "" {
-		writeError(w, req, rs, http.StatusMethodNotAllowed)
-		return
+	if req.Method == http.MethodConnect {
+		rs.protocol = extendedConnectProtocol(req)
+		if rs.protocol == "" {
+			writeError(w, req, rs, http.StatusMethodNotAllowed)
+			return
+		}
 	}
 	rs.host = hostmatch.NormalizeHost(req.Host)
 	if !rs.host.Valid() {

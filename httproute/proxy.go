@@ -523,6 +523,9 @@ func (c *countedConn) Close() error {
 // NetConn returns the connection that Dial returned.
 func (c *countedConn) NetConn() net.Conn { return c.Conn }
 
+// CloseWrite shuts down writing while the pool still owns the connection.
+func (c *countedConn) CloseWrite() error { return closeWrite(c.Conn) }
+
 func dialPlain(ctx context.Context, _, addr string) (net.Conn, error) {
 	return connect(ctx, addr, nil)
 }
@@ -651,6 +654,9 @@ func (c *idleConn) Close() error {
 	c.timer.Stop()
 	return c.ReadWriteCloser.Close()
 }
+
+// CloseWrite shuts down writing and leaves the idle timer running for reads.
+func (c *idleConn) CloseWrite() error { return closeWrite(c.ReadWriteCloser) }
 
 var (
 	errDialPanic  = errors.New("httproute: Dial panicked")

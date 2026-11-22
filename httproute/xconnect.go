@@ -23,18 +23,32 @@ var errBadAccept = errors.New("httproute: backend answered the WebSocket handsha
 var hopFields = []string{"Connection", "Keep-Alive", "Proxy-Connection", "Proxy-Authenticate",
 	"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade", "Http2-Settings"}
 
-// proxyExtendedConnect serves a WebSocket over an HTTP/2 stream (RFC 8441)
-// from a backend that speaks WebSocket over HTTP/1.1: it sends the backend
-// an upgrade request, answers the client with 200 once the backend
-// switched protocols, and copies the stream both ways.
+// extendedConnectProtocol reads the protocol as each HTTP server exposes
+// it. HTTP/3 uses Proto for the token and for the version on ordinary
+// CONNECT, where its slash makes it invalid as a token.
+func extendedConnectProtocol(req *http.Request) string {
+	var protocol string
+	switch req.ProtoMajor {
+	case 2:
+		protocol = req.Header.Get(":protocol")
+	case 3:
+		protocol = req.Proto
+	}
+	if isToken(protocol) {
+		return protocol
+	}
+	return ""
+}
+
+// proxyExtendedConnect translates WebSocket over HTTP/2 or HTTP/3
+// (RFC 8441 and RFC 9220) to an HTTP/1.1 upgrade at the backend.
 func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState) {
-	proto := req.Header.Get(":protocol")
-	if !upgradeAllowed(rs.route, proto) {
-		writeError(w, req, rs, http.StatusBadRequest)
+	if !strings.EqualFold(rs.protocol, "websocket") {
+		writeError(w, req, rs, http.StatusNotImplemented)
 		return
 	}
-	if !strings.EqualFold(proto, "websocket") {
-		writeError(w, req, rs, http.StatusNotImplemented)
+	if !upgradeAllowed(rs.route, rs.protocol) {
+		writeError(w, req, rs, http.StatusBadRequest)
 		return
 	}
 	out := req.Clone(req.Context())
@@ -78,10 +92,12 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 		_, _ = io.Copy(w, res.Body)
 		return
 	}
+	stream := backend
 	if b, ok := res.Body.(io.ReadWriteCloser); ok {
-		backend = b // with the idle timeout of modifyResponse
+		stream = b // with the idle timeout of modifyResponse
 	}
-	defer func() { _ = backend.Close() }()
+	// Close the wrapper after the copies, so no in-flight I/O can reset its timer.
+	defer func() { _ = stream.Close() }()
 	defer context.AfterFunc(req.Context(), func() { _ = backend.Close() })()
 	rs.status = http.StatusOK
 	w.WriteHeader(http.StatusOK)
@@ -89,15 +105,28 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 	if err := rc.Flush(); err != nil {
 		return
 	}
-	// The client's half: its end closes the backend, which ends the copy
-	// below. Reads of the request body end when the handler returns.
-	go func() {
-		_, _ = io.Copy(backend, req.Body)
+	body := req.Body
+	if body == nil {
+		body = http.NoBody
+	}
+	done := make(chan struct{})
+	defer func() {
 		_ = backend.Close()
+		_ = body.Close()
+		<-done
+	}()
+	go func() {
+		defer close(done)
+		// EOF ends only the sending side. An error or cancellation
+		// also ends the backend read, unblocking the response copy.
+		_, err := io.Copy(stream, body)
+		if err != nil || req.Context().Err() != nil || closeWrite(stream) != nil {
+			_ = backend.Close()
+		}
 	}()
 	buf := make([]byte, 32<<10)
 	for {
-		n, err := backend.Read(buf)
+		n, err := stream.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil || rc.Flush() != nil {
 				return
@@ -107,6 +136,13 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 			return
 		}
 	}
+}
+
+func closeWrite(w io.Writer) error {
+	if cw, ok := w.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errors.ErrUnsupported
 }
 
 func acceptKey(key string) string {

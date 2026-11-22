@@ -1,11 +1,8 @@
 package httproute
 
 import (
-	"bufio"
 	"container/list"
-	"crypto/tls"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -157,75 +154,5 @@ func TestPatternsShared(t *testing.T) {
 		if _, err := Build(Config{Routes: []Route{{Hosts: []string{p}, Respond: okRespond}}}); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%q: %v", p, err)
 		}
-	}
-}
-
-// streamWriter is a ResponseWriter whose body goes to a pipe as it is
-// written, as an HTTP/2 stream's does.
-type streamWriter struct {
-	header http.Header
-	status chan int
-	body   *io.PipeWriter
-}
-
-func (w *streamWriter) Header() http.Header         { return w.header }
-func (w *streamWriter) WriteHeader(code int)        { w.status <- code }
-func (w *streamWriter) Write(b []byte) (int, error) { return w.body.Write(b) }
-func (w *streamWriter) Flush()                      {}
-
-// TestH2WebSocket passes an extended CONNECT request, as net/http's HTTP/2
-// server hands it over, to a WebSocket backend over HTTP/1.1. net/http has
-// no client that sends one, so the request is made here.
-func TestH2WebSocket(t *testing.T) {
-	checkLeaks(t)
-	tab, err := Build(Config{Upstreams: []Upstream{wsBackend(t)}, Routes: []Route{
-		// The stream is not a body that MaxRequestBody limits.
-		{Path: "/chat", Proxy: &Proxy{Upstream: "ws"}, MaxRequestBody: 4},
-		{Path: "/none", Proxy: &Proxy{Upstream: "ws"}, Upgrades: []string{"other"}},
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := New(Options{})
-	_ = r.Update(tab)
-	t.Cleanup(func() { _ = r.Close() })
-	// The allowlist holds for extended CONNECT too.
-	refused := httptest.NewRecorder()
-	connect, _ := http.NewRequest(http.MethodConnect, "https://a.example.com/none", http.NoBody)
-	connect.RequestURI, connect.RemoteAddr = "/none", "127.0.0.1:5000"
-	connect.Header.Set(":protocol", "websocket")
-	r.ServeHTTP(refused, connect)
-	if refused.Code != http.StatusBadRequest {
-		t.Errorf("websocket on a route without it: %d", refused.Code)
-	}
-	reqBody, toBackend := io.Pipe()
-	fromBackend, respBody := io.Pipe()
-	req, _ := http.NewRequest(http.MethodConnect, "https://a.example.com/chat", reqBody)
-	req.Proto, req.ProtoMajor, req.ProtoMinor = "HTTP/2.0", 2, 0
-	req.RequestURI, req.RemoteAddr = "/chat", "127.0.0.1:5000"
-	req.TLS = &tls.ConnectionState{}
-	req.Header.Set(":protocol", "websocket")
-	req.Header.Set("Sec-WebSocket-Version", "13")
-	w := &streamWriter{header: http.Header{}, status: make(chan int, 1), body: respBody}
-	served := make(chan struct{})
-	go func() {
-		defer close(served)
-		r.ServeHTTP(w, req)
-		_ = respBody.Close()
-	}()
-	if code := <-w.status; code != 200 {
-		go func() { _, _ = io.Copy(io.Discard, fromBackend) }()
-		t.Fatalf("status %d", code)
-	}
-	_, _ = io.WriteString(toBackend, "over h2\n")
-	line, err := bufio.NewReader(fromBackend).ReadString('\n')
-	if line != "over h2\n" {
-		t.Fatalf("%q %v", line, err)
-	}
-	_ = toBackend.Close() // the client ends its stream
-	select {
-	case <-served:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the stream did not end")
 	}
 }

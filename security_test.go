@@ -3,7 +3,6 @@ package portmux
 import (
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -476,14 +475,16 @@ func TestRoutingRecipes(t *testing.T) {
 	}
 }
 
-// TestHostileConnectionMix runs floods of idle, slow, garbage and valid
-// connections at once and checks that every valid one is delivered.
+// TestHostileConnectionMix keeps the pending slots under pressure from idle,
+// slow and garbage connections and checks that every valid one is delivered.
 func TestHostileConnectionMix(t *testing.T) {
-	m := startMux(t, WithMaxPending(32), WithSniffTimeout(2*time.Second))
+	const maxPending = 32
+	m := startMux(t, WithMaxPending(maxPending), WithSniffTimeout(time.Minute))
 	web := m.Listen(HTTP1(Host("ok.example")))
 	m.Listen(TLS())
 	serve(t, m)
-	go func() {
+	var responders sync.WaitGroup
+	responders.Go(func() {
 		for {
 			c, err := web.Accept()
 			if err != nil {
@@ -492,48 +493,61 @@ func TestHostileConnectionMix(t *testing.T) {
 			_, _ = c.Write([]byte("ok"))
 			_ = c.Close()
 		}
-	}()
+	})
+	t.Cleanup(func() {
+		_ = web.Close()
+		responders.Wait()
+	})
 
-	stop := make(chan struct{})
-	var attackers sync.WaitGroup
-	payloads := []string{"", "GET / HTTP/1.1\r\nX: ", "\x16\x03\x01\x10\x00", "\xff\xfe garbage"}
-	for _, payload := range payloads {
-		attackers.Go(func() {
-			tick := time.NewTicker(2 * time.Millisecond)
-			defer tick.Stop()
-			for {
-				select {
-				case <-stop:
-					return
-				case <-tick.C:
-				}
-				c, err := net.Dial("tcp", m.Addr().String())
-				if err != nil {
-					continue
-				}
-				_, _ = c.Write([]byte(payload))
-				time.AfterFunc(500*time.Millisecond, func() { _ = c.Close() })
-			}
-		})
-	}
-	time.Sleep(200 * time.Millisecond) // let the flood fill the pending limit
-	defer func() {
-		close(stop)
-		attackers.Wait()
-	}()
-
-	for i := range 50 {
-		c, err := net.Dial("tcp", m.Addr().String())
+	// Keep at most one connection waiting for Accept. Winsock can refuse
+	// dials when its listen queue fills, before the mux sees the connection.
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	connect := func(payload string) net.Conn {
+		t.Helper()
+		c, err := dialer.Dial("tcp", m.Addr().String())
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
-		_, _ = fmt.Fprint(c, "GET / HTTP/1.1\r\nHost: ok.example\r\n\r\n")
+		t.Cleanup(func() { _ = c.Close() })
+		_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if payload != "" {
+			if _, err := io.WriteString(c, payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return c
+	}
+	hostile := func(payload string) {
+		t.Helper()
+		want := m.Stats().Accepted + 1
+		connect(payload)
+		waitUntil(t, "the mux accepts the hostile connection", func() bool {
+			return m.Stats().Accepted >= want
+		})
+	}
+	stalled := []string{"", "GET / HTTP/1.1\r\nX: ", "\x16\x03\x01\x10\x00"}
+	for i := range maxPending {
+		hostile(stalled[i%len(stalled)])
+	}
+	if got := m.Stats().Pending; got != maxPending {
+		t.Fatalf("pending = %d, want %d", got, maxPending)
+	}
+
+	for i := range 50 {
+		hostile("\xff\xfe garbage")
+		for _, payload := range stalled {
+			hostile(payload)
+		}
+		c := connect("GET / HTTP/1.1\r\nHost: ok.example\r\n\r\n")
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 		b, err := io.ReadAll(c)
 		_ = c.Close()
 		if err != nil || string(b) != "ok" {
 			t.Fatalf("valid client %d: %q, %v (stats %+v)", i, b, err, m.Stats())
 		}
+	}
+	if st := m.Stats(); st.Evicted == 0 {
+		t.Fatalf("pending limit did not evict any connection (stats %+v)", st)
 	}
 }
 
