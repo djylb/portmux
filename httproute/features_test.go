@@ -262,7 +262,7 @@ func TestProxyProtocolUpstream(t *testing.T) {
 	t.Cleanup(srv.Close)
 	trusted, _ := forwarded.ParsePrefixSet("127.0.0.0/8")
 	_, base := startRouter(t, Options{}, Config{
-		Resolver: &forwarded.Resolver{Trusted: trusted},
+		Resolver: &forwarded.Resolver{Trusted: trusted, Metadata: forwarded.TrustProto},
 		Upstreams: []Upstream{
 			{Name: "v1", Addr: ln.Addr().String(), ProxyProtocol: 1},
 			{Name: "v2", Addr: ln.Addr().String(), ProxyProtocol: 2},

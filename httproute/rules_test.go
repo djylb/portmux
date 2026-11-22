@@ -64,7 +64,7 @@ func TestFilters(t *testing.T) {
 	yes, no := true, false
 	trusted, _ := forwarded.ParsePrefixSet("127.0.0.0/8")
 	_, base := startRouter(t, Options{}, Config{
-		Resolver:     &forwarded.Resolver{Trusted: trusted},
+		Resolver:     &forwarded.Resolver{Trusted: trusted, Metadata: forwarded.TrustProto},
 		AbortNoRoute: true,
 		Routes: []Route{
 			{Name: "secure", Hosts: []string{"a.com"}, TLS: &yes, Respond: okRespond, ResponseHeaders: rules(t, "X-Route: ${route}")},

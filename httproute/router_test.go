@@ -164,7 +164,7 @@ func TestRedirectHTTPS(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, base := startRouter(t, Options{}, Config{
-		Resolver: &forwarded.Resolver{Trusted: trusted},
+		Resolver: &forwarded.Resolver{Trusted: trusted, Metadata: forwarded.TrustProto},
 		Routes: []Route{
 			{Hosts: []string{"a.example.com"}, RedirectHTTPS: &HTTPSRedirect{}, Respond: okRespond},
 			{Hosts: []string{"b.example.com"}, RedirectHTTPS: &HTTPSRedirect{Port: 8443, Status: 301}, Respond: okRespond},

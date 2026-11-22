@@ -39,6 +39,8 @@ type Config struct {
 	// Resolver, if set, finds the client of a request behind trusted
 	// proxies, for the client variables, DialInfo.Client and the scheme
 	// that RedirectHTTPS checks. Without it the client is the TCP peer.
+	// The scheme and host count only when its Metadata trusts them
+	// (forwarded.TrustProto, forwarded.TrustHost).
 	Resolver *forwarded.Resolver
 }
 
@@ -83,9 +85,9 @@ type Route struct {
 	Headers []HeaderMatch
 	// TLS, if set, takes only requests that came over TLS (true) or not
 	// (false): over a TLS connection, or from a trusted proxy that
-	// Config.Resolver finds and that recorded "https". Neither the
-	// scheme of an absolute request target nor fields from untrusted
-	// clients count.
+	// Config.Resolver finds, with forwarded.TrustProto, and that recorded
+	// "https". Neither the scheme of an absolute request target nor fields
+	// from untrusted clients count.
 	TLS *bool
 	// RedirectHTTPS, if set, redirects requests that did not come over
 	// TLS to https before the action runs.

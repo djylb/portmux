@@ -14,18 +14,18 @@ func waitReadable(c net.Conn) error {
 	if !ok {
 		return nil
 	}
-	rc, err := sc.SyscallConn()
-	if err != nil {
-		return nil
+	// Errors other than the deadline, such as a closed connection or no
+	// raw access, are left to Read.
+	if rc, err := sc.SyscallConn(); err == nil {
+		waited := false
+		err = rc.Read(func(uintptr) bool {
+			done := waited
+			waited = true
+			return done
+		})
+		if err != nil && isTimeout(err) {
+			return err
+		}
 	}
-	waited := false
-	err = rc.Read(func(uintptr) bool {
-		done := waited
-		waited = true
-		return done
-	})
-	if err != nil && !isTimeout(err) {
-		return nil // leave other errors, such as a closed connection, to Read
-	}
-	return err
+	return nil
 }
