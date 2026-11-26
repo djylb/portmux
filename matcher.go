@@ -308,7 +308,7 @@ func (m *regexpMatcher) Match(in *Input) Result {
 }
 
 func (m *regexpMatcher) String() string {
-	return "Regexp(" + quote(m.re.String()) + ", " + strconv.Itoa(m.n) + ")"
+	return "Regexp(" + quote(regexpText(m.re)) + ", " + strconv.Itoa(m.n) + ")"
 }
 
 // minSilence is the shortest silence that Silent waits for.
@@ -353,7 +353,7 @@ func HTTP2Preface() Matcher {
 }
 
 // SSH matches SSH clients that send their identification string before the
-// server's, as OpenSSH does. Use Silent for clients that wait for the server.
+// server's. Use Silent for clients that wait for the server.
 func SSH() Matcher {
 	return prefixMatcher{prefixes: []string{"SSH-"}, name: "SSH"}
 }

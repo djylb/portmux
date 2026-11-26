@@ -23,20 +23,24 @@ import (
 // When a PROXY protocol header was parsed, RemoteAddr and LocalAddr report its
 // addresses.
 type Conn struct {
-	conn    net.Conn
-	pending []byte
-	buf     *[]byte
-	parsed             // what matching found, set once it ended
-	track   *connTrack // for WithCloseEvents, or nil
-	proxy   *proxyproto.Header
-	route   *Route
-	mux     *Mux      // counts the connection while open, with ln
-	ln      *listener // the listener it came from, or nil
-	entry   string
-	stripe  uint8 // of the counters, and the shard of the pending set
-	mu      sync.Mutex
-	drained atomic.Bool
-	open    atomic.Bool // counted as open by its route, listener and Mux
+	conn          net.Conn
+	pending       []byte
+	readErr       error
+	replayDone    chan struct{} // waiters for an outstanding WriteTo
+	buf           *[]byte
+	parsed                   // what matching found, set once it ended
+	track         *connTrack // for WithCloseEvents, or nil
+	proxy         *proxyproto.Header
+	route         *Route
+	mux           *Mux      // counts the connection while open, with ln
+	ln            *listener // the listener it came from, or nil
+	entry         string
+	writingPrefix bool
+	closed        bool
+	stripe        uint8 // of the counters, and the shard of the pending set
+	mu            sync.Mutex
+	drained       atomic.Bool
+	open          atomic.Bool // counted as open by its route, listener and Mux
 }
 
 // Unread returns a copy of the bytes that are still to be replayed: the bytes
@@ -57,32 +61,107 @@ func (c *Conn) Unread() []byte {
 type connTrack struct {
 	clock         timeshim.Clock
 	start         time.Time
-	read, written atomic.Int64
+	event         Event
+	startErr      error
 	observe       func(Event)
+	mu            sync.Mutex
+	active        int
+	read, written int64
+	closing       bool
+	duration      time.Duration
+}
+
+// begin and end keep a close event pending until I/O already in progress
+// has reported its byte count. Only connections with close events use them.
+func (t *connTrack) begin() { t.mu.Lock(); t.active++; t.mu.Unlock() }
+func (c *Conn) end(read, written int64) {
+	t := c.track
+	t.mu.Lock()
+	t.read += read
+	t.written += written
+	t.active--
+	c.reportCloseLocked(t)
+}
+
+// reportCloseLocked releases t.mu and reports a close once the last
+// outstanding operation has accounted for its bytes.
+func (c *Conn) reportCloseLocked(t *connTrack) {
+	if !t.closing || t.active != 0 {
+		t.mu.Unlock()
+		return
+	}
+	t.closing = false
+	read, written, duration := t.read, t.written, t.duration
+	t.mu.Unlock()
+	ev := t.event
+	ev.Closed, ev.Read, ev.Written, ev.Duration = true, read, written, duration
+	c.mux.observeWith(t.observe, ev)
+}
+
+// accepted starts measurement at transfer to a handler or listener.
+func (c *Conn) accepted() *Conn {
+	if t := c.track; t != nil {
+		t.start, t.startErr = clockNow(t.clock)
+	}
+	return c
+}
+
+// A measurement failure is reported with the close event. Ownership of a
+// connection already handed to its server is independent of its telemetry.
+func clockNow(clock timeshim.Clock) (now time.Time, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = NewPanicError(v)
+		}
+	}()
+	return clock.Now(), nil
 }
 
 // Read reads the replayed bytes first, then from the client.
-func (c *Conn) Read(p []byte) (int, error) {
-	n, err := c.read(p)
-	if t := c.track; t != nil {
-		t.read.Add(int64(n))
+func (c *Conn) Read(p []byte) (n int, err error) {
+	if c.track != nil {
+		c.track.begin()
+		defer func() { c.end(int64(n), 0) }()
 	}
-	return n, err
+	return c.read(p)
+}
+
+func (c *Conn) lockReplay() {
+	c.mu.Lock()
+	for c.writingPrefix && !c.closed {
+		if c.replayDone == nil {
+			c.replayDone = make(chan struct{})
+		}
+		done := c.replayDone
+		c.mu.Unlock()
+		<-done
+		c.mu.Lock()
+	}
 }
 
 func (c *Conn) read(p []byte) (int, error) {
 	if !c.drained.Load() {
-		c.mu.Lock()
+		c.lockReplay()
 		if len(c.pending) > 0 {
 			n := copy(p, c.pending)
 			c.pending = c.pending[n:]
 			if len(c.pending) == 0 {
+				err := c.readErr
+				c.readErr = nil
 				c.releaseLocked()
+				c.mu.Unlock()
+				return n, err
 			}
 			c.mu.Unlock()
 			return n, nil
 		}
-		c.releaseLocked() // nothing to replay
+		err := c.readErr
+		c.readErr = nil
+		c.releaseLocked()
+		if err != nil {
+			c.mu.Unlock()
+			return 0, err
+		}
 		c.mu.Unlock()
 	}
 	return c.conn.Read(p)
@@ -92,7 +171,7 @@ func (c *Conn) read(p []byte) (int, error) {
 // replay, so that a client that sent nothing yet holds none.
 func (c *Conn) dropEmpty() {
 	c.mu.Lock()
-	if len(c.pending) == 0 {
+	if !c.writingPrefix && len(c.pending) == 0 && c.readErr == nil {
 		c.releaseLocked()
 	}
 	c.mu.Unlock()
@@ -100,54 +179,93 @@ func (c *Conn) dropEmpty() {
 
 // WriteTo writes the replayed bytes and then copies the rest of the stream to
 // w, so io.Copy can still use the underlying connection's fast paths.
-func (c *Conn) WriteTo(w io.Writer) (int64, error) {
-	n, err := c.writeTo(w)
-	if t := c.track; t != nil {
-		t.read.Add(n)
+func (c *Conn) WriteTo(w io.Writer) (n int64, err error) {
+	if c.track != nil {
+		c.track.begin()
+		defer func() { c.end(n, 0) }()
 	}
-	return n, err
+	return c.writeTo(w)
 }
 
 func (c *Conn) writeTo(w io.Writer) (int64, error) {
 	var written int64
 	if !c.drained.Load() {
-		c.mu.Lock()
-		pending, buf := c.pending, c.buf
-		c.pending, c.buf = nil, nil
-		c.drained.Store(true)
-		c.mu.Unlock()
+		c.lockReplay()
+		pending, buf, readErr := c.pending, c.buf, c.readErr
+		c.pending, c.buf, c.readErr = nil, nil, nil
 		if len(pending) > 0 {
-			n, err := w.Write(pending)
+			c.writingPrefix = true
+			c.mu.Unlock()
+			n, err := c.writePrefix(w, pending, buf, readErr)
 			written = int64(n)
-			putBuffer(buf)
 			if err != nil {
 				return written, err
 			}
 		} else {
+			c.drained.Store(true)
+			c.mu.Unlock()
 			putBuffer(buf)
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				readErr = nil
+			}
+			return written, readErr
 		}
 	}
 	n, err := io.Copy(w, c.conn)
 	return written + n, err
 }
 
+// writePrefix owns buf until the destination reports how much it accepted.
+func (c *Conn) writePrefix(w io.Writer, pending []byte, buf *[]byte, readErr error) (n int, err error) {
+	defer func() {
+		c.mu.Lock()
+		if !c.closed && (n < len(pending) || readErr != nil && err != nil) {
+			c.pending, c.buf, c.readErr = pending[n:], buf, readErr
+			buf = nil
+		} else {
+			c.drained.Store(true)
+		}
+		c.finishReplayLocked()
+		c.mu.Unlock()
+		putBuffer(buf)
+	}()
+	n, err = w.Write(pending)
+	if n < 0 || n > len(pending) {
+		n, err = 0, io.ErrShortWrite
+	}
+	if n < len(pending) && err == nil {
+		err = io.ErrShortWrite
+	}
+	return
+}
+
+func (c *Conn) finishReplayLocked() {
+	c.writingPrefix = false
+	if c.replayDone != nil {
+		close(c.replayDone)
+		c.replayDone = nil
+	}
+}
+
 // ReadFrom copies r to the connection, so io.Copy can still use the underlying
 // connection's fast paths.
-func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
-	n, err := io.Copy(c.conn, r)
-	if t := c.track; t != nil {
-		t.written.Add(n)
+func (c *Conn) ReadFrom(r io.Reader) (n int64, err error) {
+	if c.track != nil {
+		c.track.begin()
+		defer func() { c.end(0, n) }()
 	}
-	return n, err
+	return io.Copy(c.conn, r)
 }
 
 // Write writes to the client.
-func (c *Conn) Write(p []byte) (int, error) {
-	n, err := c.conn.Write(p)
-	if t := c.track; t != nil {
-		t.written.Add(int64(n))
+func (c *Conn) Write(p []byte) (n int, err error) {
+	if c.track != nil {
+		c.track.begin()
+		defer func() { c.end(0, int64(n)) }()
 	}
-	return n, err
+	return c.conn.Write(p)
 }
 
 // Close closes the connection.
@@ -156,14 +274,27 @@ func (c *Conn) Write(p []byte) (int, error) {
 func (c *Conn) Close() error {
 	err := c.conn.Close()
 	c.mu.Lock()
+	c.closed = true
+	c.finishReplayLocked()
 	c.pending = nil
+	c.readErr = nil
 	c.releaseLocked()
 	c.mu.Unlock()
 	if c.closeOpen() {
 		if t := c.track; t != nil {
-			ev := c.event(nil)
-			ev.Closed, ev.Duration, ev.Read, ev.Written = true, t.clock.Now().Sub(t.start), t.read.Load(), t.written.Load()
-			c.mux.observeWith(t.observe, ev)
+			var duration time.Duration
+			clockErr := t.startErr
+			if clockErr == nil {
+				var now time.Time
+				now, clockErr = clockNow(t.clock)
+				if clockErr == nil {
+					duration = now.Sub(t.start)
+				}
+			}
+			t.mu.Lock()
+			t.event.Err = clockErr
+			t.closing, t.duration = true, duration
+			c.reportCloseLocked(t)
 		}
 	}
 	return err
@@ -274,26 +405,21 @@ func (c *Conn) Value(key any) any {
 	return c.value(key)
 }
 
-// event returns the event of the connection with err: its addresses, its
-// route and what matching found.
-func (c *Conn) event(err error) Event {
-	ev := c.eventOf(&c.parsed, err)
-	ev.Route = c.route
-	return ev
+type eventAddresses struct{ remote, local, peer net.Addr }
+
+func (in *Input) setPeer(c net.Conn) {
+	in.peer = c.RemoteAddr()
+	in.remote = in.peer
+	in.local = c.LocalAddr()
 }
 
-// eventOf returns the event of the connection with err and p, what matching
-// found, without its route, which only a delivered connection has.
-func (c *Conn) eventOf(p *parsed, err error) Event {
-	return Event{Entry: c.entry, Remote: c.RemoteAddr(), Local: c.LocalAddr(), Peer: c.conn.RemoteAddr(), Err: err,
+func (in *Input) addresses() eventAddresses {
+	return eventAddresses{remote: in.remote, local: in.local, peer: in.peer}
+}
+
+func (a eventAddresses) event(entry string, route *Route, p *parsed, err error) Event {
+	return Event{Entry: entry, Route: route, Err: err, Remote: a.remote, Local: a.local, Peer: a.peer,
 		Name: p.requestedName(), ClientHello: p.hello, HTTPRequest: p.req, HTTP2Request: p.req2, values: p.values}
-}
-
-// acceptEvent returns the event of c, accepted from a listener of entry and
-// refused with err before it was taken, as Conn.event would.
-func acceptEvent(entry string, c net.Conn, err error) Event {
-	peer := c.RemoteAddr()
-	return Event{Entry: entry, Remote: peer, Local: c.LocalAddr(), Peer: peer, Err: err}
 }
 
 // parsed is what matching found out about a connection: the protocol heads
@@ -352,6 +478,7 @@ func (c *Conn) Route() *Route {
 func (c *Conn) releaseLocked() {
 	putBuffer(c.buf)
 	c.buf = nil
+	c.pending = nil
 	c.drained.Store(true)
 }
 

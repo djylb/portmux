@@ -122,6 +122,8 @@ type records struct {
 // isFull reports whether a table of n records has no room for another.
 func (r records) isFull(n int64) bool { return r.max >= 0 && n >= int64(r.max) }
 
+func (r records) reserve(n *atomic.Int64) bool { return r.max != 0 && addBelow(n, r.max) }
+
 // sweepEvery is how many checks a shard of a rateLimit or a banList makes
 // between sweeps of the records it no longer needs.
 const sweepEvery = 1024
@@ -152,6 +154,7 @@ func (b *tokenBucket) refilled(rate, burst float64, now time.Duration) float64 {
 
 // take refills b at now and takes a token, reporting whether there was one.
 func (b *tokenBucket) take(rate, burst float64, now time.Duration) bool {
+	now = max(b.last, now)
 	b.tokens, b.last = b.refilled(rate, burst, now), now
 	if b.tokens < 1 {
 		return false
@@ -181,9 +184,9 @@ type rateShard struct {
 	bucket    map[netip.Prefix]tokenBucket
 }
 
-func newRateLimit(rate float64, burst int, clk timeshim.Clock) *rateLimit {
+func newRateLimit(rate float64, burst int, clk timeshim.Clock, epoch time.Time) *rateLimit {
 	// The maps of the shards are made on first use.
-	return &rateLimit{rate: rate, burst: float64(max(burst, 1)), clock: clk, epoch: clk.Now()}
+	return &rateLimit{rate: rate, burst: float64(max(burst, 1)), clock: clk, epoch: epoch}
 }
 
 // allow takes a token for a new connection of client and reports whether
@@ -206,8 +209,7 @@ func (l *rateLimit) allowAt(client netip.Prefix, now time.Duration, rec records)
 			l.sweepAll(sh, now, rec)
 		}
 		switch {
-		case !rec.isFull(l.size.Load()):
-			l.size.Add(1)
+		case rec.reserve(&l.size):
 		case rec.full == FullFailClosed:
 			return false
 		case rec.full != FullEvictOldest || !l.evict(sh):

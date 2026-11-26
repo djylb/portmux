@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/djylb/netx/forwarded"
+	"github.com/djylb/netx/wsconn"
 )
 
 // echo answers with what it received, as fields of its response.
@@ -349,7 +350,7 @@ func serveWebSocket(w http.ResponseWriter, r *http.Request, serve func(net.Conn,
 	defer func() { _ = c.Close() }()
 	accept := ""
 	if key := r.Header.Get("Sec-WebSocket-Key"); key != "" {
-		accept = "Sec-WebSocket-Accept: " + acceptKey(key) + "\r\n"
+		accept = "Sec-WebSocket-Accept: " + wsconn.AcceptKey(key) + "\r\n"
 	}
 	_, _ = io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"+accept+"\r\n")
 	serve(c, brw)
@@ -573,7 +574,7 @@ func TestHTTP2(t *testing.T) {
 		_ = r.Serve(tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{certificate()}, NextProtos: []string{"h2", "http/1.1"}}))
 	}()
 	t.Cleanup(func() { _ = r.Close(); <-done })
-	tr := &http.Transport{ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	tr := &http.Transport{DialContext: (&net.Dialer{}).DialContext, ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	t.Cleanup(tr.CloseIdleConnections)
 	req, _ := http.NewRequest("GET", "https://"+ln.Addr().String()+"/x", nil)
 	req.Host = "a.example.com"

@@ -1,9 +1,11 @@
 package httproute
 
 import (
+	"bufio"
 	"cmp"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/djylb/netx"
 	"github.com/djylb/netx/forwarded"
+	"github.com/djylb/portmux"
 	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/internal/pmap"
@@ -46,8 +49,7 @@ type Options struct {
 	// them.
 	ErrorLog *log.Logger
 	// Clock is the source of time of the router: of event durations, the
-	// timeouts of upgraded connections, the expiry of remembered Basic
-	// credentials and the closing of replaced connection pools; nil means
+	// idle timeouts of upgraded connections; nil means
 	// timeshim.Real. Server timeouts and dial deadlines use the system clock.
 	Clock timeshim.Clock
 	// Observer, if set, is called once for every request when it is done.
@@ -66,21 +68,22 @@ type Event struct {
 	Path string
 	// Client is the client, as Config.Resolver finds it.
 	Client forwarded.Client
-	// Status is the response status: 101 for upgrades,
+	// Status is the response status, zero for an unobserved response on a hijacked connection, 101 for upgrades,
 	// StatusClientClosedRequest when the client went away first.
 	Status int
 	// Written counts the bytes of the response body.
 	Written  int64
 	Duration time.Duration
-	// Err is the error of a failed proxy round trip.
+	// Err reports a failed proxy round trip, an aborted request, or a recovered panic.
 	Err error
 }
 
 // Router routes requests by a Table. Create it with New.
 type Router struct {
-	opts  Options
-	clock timeshim.Clock
-	state atomic.Pointer[state]
+	observerPanic atomic.Pointer[portmux.PanicError]
+	opts          Options
+	clock         timeshim.Clock
+	state         atomic.Pointer[state]
 
 	mu      sync.Mutex         // serialises Update; guards retired and closed
 	retired map[*pool]struct{} // replaced pools with connections in use
@@ -90,13 +93,14 @@ type Router struct {
 	ctx   context.Context //nolint:containedctx // the Router's lifetime, canceled by Shutdown and Close; requests and dials end with it
 	stop  context.CancelFunc
 
-	ln      *netx.ChanListener // for ServeConn
-	lnDone  chan struct{}
-	active  atomic.Int64
-	drained chan struct{}
-	lnOnce  sync.Once
-	closing atomic.Bool
-	closed  bool // under mu
+	ln          *netx.ChanListener // for ServeConn
+	lnDone      chan struct{}
+	active      atomic.Int64
+	drained     chan struct{}
+	drainedOnce sync.Once
+	lnOnce      sync.Once
+	closing     atomic.Bool
+	closed      bool // under mu
 }
 
 // state is what a request is matched against: a table and its upstreams
@@ -200,7 +204,7 @@ func New(o Options) *Router {
 		retired: map[*pool]struct{}{},
 		ln:      netx.NewChanListener(nil, 64),
 		lnDone:  make(chan struct{}),
-		drained: make(chan struct{}, 1),
+		drained: make(chan struct{}),
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	r.ctx, r.stop = context.WithValue(ctx, serverKey, r), stop
@@ -232,17 +236,8 @@ func connContext(ctx context.Context, c net.Conn) context.Context {
 	if _, ok := c.(*tls.Conn); ok {
 		return ctx // the server reads it itself
 	}
-	for range 16 {
-		u, ok := c.(interface{ NetConn() net.Conn })
-		if !ok {
-			return ctx
-		}
-		if c = u.NetConn(); c == nil {
-			return ctx
-		}
-		if tc, ok := c.(*tls.Conn); ok {
-			return context.WithValue(ctx, tlsKey, &connTLS{conn: tc})
-		}
+	if tc, ok := netx.ConnAs[*tls.Conn](c); ok {
+		return context.WithValue(ctx, tlsKey, &connTLS{conn: tc})
 	}
 	return ctx
 }
@@ -269,16 +264,17 @@ func (c *connTLS) state() *tls.ConnectionState {
 // Update replaces the routes with those of t; requests already routed keep
 // the table they were matched with. A nil t removes every route. Upstreams
 // of t whose settings other than Dial equal those of an upstream of the
-// same name in the current table keep its idle connections; idle
+// same name in the current table keep its idle connections for plain HTTP.
+// A TLS pool is kept only for an unchanged compiled upstream; idle
 // connections of the others are closed. Update returns net.ErrClosed after
 // Shutdown or Close.
 func (r *Router) Update(t *Table) error {
-	if t == nil {
+	if t == nil || t.common == nil {
 		t = emptyTable
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return net.ErrClosed
 	}
 	old := r.state.Load()
@@ -307,17 +303,15 @@ func (r *Router) Update(t *Table) error {
 	})
 	r.state.Store(&state{table: t, upstreams: bs.Map()})
 	for _, p := range drop {
+		p.retired.Store(r)
 		r.retired[p] = struct{}{}
 	}
+	r.mu.Unlock()
 	// Connections of replaced pools that were in use become idle later:
 	// close them as they do, until none is left.
 	for _, p := range drop {
 		p.CloseIdleConnections()
-		if p.open.Load() == 0 {
-			delete(r.retired, p)
-		} else if p.drain == nil {
-			p.drain = r.clock.AfterFunc(retireTick, func() { r.drainRetired(p) })
-		}
+		r.dropEmptyPool(p)
 	}
 	return nil
 }
@@ -368,6 +362,9 @@ func (r *Router) ServeConn(c net.Conn) error {
 func (r *Router) Shutdown(ctx context.Context) error {
 	r.markClosed()
 	err := r.srv.Shutdown(ctx)
+	if ctx.Err() != nil {
+		_ = r.srv.Close()
+	}
 	return r.finish(ctx, err)
 }
 
@@ -385,53 +382,51 @@ func (r *Router) markClosed() {
 	r.closing.Store(true)
 	r.mu.Lock()
 	r.closed = true
+	if r.active.Load() == 0 {
+		r.drainedOnce.Do(func() { close(r.drained) })
+	}
 	r.mu.Unlock()
 }
 
 func (r *Router) finish(ctx context.Context, err error) error {
 	_ = r.ln.Close()
 	r.stop()
-	for r.active.Load() != 0 {
-		select {
-		case <-r.drained:
-		case <-ctx.Done():
-			if err == nil {
-				err = ctx.Err()
-			}
-			r.closeIdle()
-			return err
+	select {
+	case <-r.drained:
+	case <-ctx.Done():
+		if err == nil {
+			err = ctx.Err()
 		}
+		r.closeIdle()
+		return err
 	}
+
 	r.closeIdle()
 	r.lnOnce.Do(func() { close(r.lnDone) })
 	<-r.lnDone
 	return err
 }
 
-// retireTick is how often a replaced pool closes the connections that
-// went idle since.
-const retireTick = 200 * time.Millisecond
-
-// drainRetired closes the idle connections of a replaced pool, and drops
-// the pool once it has none.
-func (r *Router) drainRetired(p *pool) {
-	p.CloseIdleConnections()
+// dropEmptyPool forgets a retired pool once its final connection closes.
+func (r *Router) dropEmptyPool(p *pool) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if p.open.Load() == 0 {
 		delete(r.retired, p)
-		return
 	}
-	p.drain.Reset(retireTick)
+	r.mu.Unlock()
 }
 
 func (r *Router) closeIdle() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var pools []*pool
 	for _, b := range r.state.Load().upstreams.All() {
-		b.pool.CloseIdleConnections()
+		pools = append(pools, b.pool)
 	}
 	for p := range r.retired {
+		pools = append(pools, p)
+	}
+	r.mu.Unlock()
+	for _, p := range pools {
 		p.CloseIdleConnections()
 	}
 }
@@ -447,39 +442,80 @@ func (r *Router) enter() bool {
 
 func (r *Router) leave() {
 	if r.active.Add(-1) == 0 && r.closing.Load() {
-		select {
-		case r.drained <- struct{}{}:
-		default:
-		}
+		r.drainedOnce.Do(func() { close(r.drained) })
 	}
 }
 
 // ServeHTTP routes a request.
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	if !r.enter() {
-		writePlainError(w, req, http.StatusServiceUnavailable)
-		return
+	entered := r.enter()
+	if entered {
+		defer r.leave()
 	}
-	defer r.leave()
-	st := r.state.Load()
 	rs := &reqState{router: r, tls: req.TLS != nil}
-	if r.opts.Observer == nil {
-		r.route(w, req, st, rs)
+	rec := &recorder{ResponseWriter: w}
+	var start time.Time
+	defer func() {
+		v := recover()
+		cause, _ := v.(error)
+		abort := errors.Is(cause, http.ErrAbortHandler)
+		if v != nil {
+			if abort {
+				rs.err = http.ErrAbortHandler
+				if rec.status == 0 && !rec.hijacked {
+					rs.status = StatusClientClosedRequest
+				}
+			} else {
+				rs.err = portmux.NewPanicError(v)
+				r.opts.ErrorLog.Print(rs.err)
+				if rec.status == 0 && !rec.hijacked {
+					writePlainError(rec, req, http.StatusInternalServerError)
+				} else {
+					abort = true
+				}
+			}
+		}
+		if r.opts.Observer != nil {
+			r.observe(req, rs, rec, start)
+		}
+		if abort {
+			panic(http.ErrAbortHandler)
+		}
+	}()
+	if r.opts.Observer != nil {
+		start = r.clock.Now()
+	}
+	if !entered {
+		writePlainError(rec, req, http.StatusServiceUnavailable)
 		return
 	}
-	start := r.clock.Now()
-	rec := &recorder{ResponseWriter: w}
-	r.route(rec, req, st, rs)
-	ev := Event{Method: req.Method, Host: rs.host.String(), Path: rs.path, Client: rs.client,
-		Status: cmp.Or(rs.status, rec.status, http.StatusOK), Written: rec.written,
-		Duration: r.clock.Now().Sub(start), Err: rs.err}
+	r.route(rec, req, r.state.Load(), rs)
+}
+
+// LastObserverPanic reports the most recent observer panic, or nil. The returned error is read-only.
+func (r *Router) LastObserverPanic() *portmux.PanicError { return r.observerPanic.Load() }
+
+func (r *Router) observe(req *http.Request, rs *reqState, rec *recorder, start time.Time) {
+	defer func() {
+		if v := recover(); v != nil {
+			err := portmux.NewPanicError(v)
+			r.observerPanic.Store(err)
+			r.opts.ErrorLog.Print(err)
+		}
+	}()
+	status := cmp.Or(rec.status, rs.status)
+	if status == 0 && !rec.hijacked {
+		status = http.StatusOK
+	}
+	ev := Event{Method: req.Method, Host: rs.host.String(), Path: rs.path, Client: rs.client, Status: status, Written: rec.written, Duration: r.clock.Now().Sub(start), Err: rs.err}
 	if rs.route != nil {
 		ev.Route = rs.route.name
 	}
 	r.opts.Observer(ev)
 }
 
-func (r *Router) route(w http.ResponseWriter, req *http.Request, st *state, rs *reqState) {
+func (r *Router) route(rec *recorder, req *http.Request, st *state, rs *reqState) {
+	w := rec.writer()
 	t := st.table
 	rs.table = t
 	if req.Method == http.MethodConnect {
@@ -534,10 +570,11 @@ func (r *Router) route(w http.ResponseWriter, req *http.Request, st *state, rs *
 	if rt.upstream != "" {
 		b, _ := st.upstreams.Get(rt.upstream)
 		rs.up, rs.transport = b.up, b.pool
-	}
-	if rt.https != nil && !rs.secure() {
-		redirectHTTPS(w, req, rs)
-		return
+		defer func() {
+			if b.pool.retired.Load() != nil {
+				b.pool.CloseIdleConnections()
+			}
+		}()
 	}
 	// The stream of an extended CONNECT is a tunnel, not a body to limit.
 	if rt.maxBody > 0 && req.Body != nil && req.Body != http.NoBody && req.Method != http.MethodConnect {
@@ -545,7 +582,11 @@ func (r *Router) route(w http.ResponseWriter, req *http.Request, st *state, rs *
 			writeError(w, req, rs, http.StatusRequestEntityTooLarge)
 			return
 		}
-		req.Body = http.MaxBytesReader(w, req.Body, rt.maxBody)
+		req.Body = http.MaxBytesReader(rec.ResponseWriter, req.Body, rt.maxBody)
+	}
+	if rt.https != nil && !rs.secure() {
+		redirectHTTPS(w, req, rs)
+		return
 	}
 	ctx = context.WithValue(ctx, stateKey, rs)
 	if ctx.Value(serverKey) != r {
@@ -604,28 +645,286 @@ func redirectHTTPS(w http.ResponseWriter, req *http.Request, rs *reqState) {
 	w.WriteHeader(cmp.Or(rs.route.https.Status, http.StatusPermanentRedirect))
 }
 
-// recorder records the status and size of a response for events. Unwrap
-// lets http.ResponseController reach the writer's Flush and Hijack.
+// recorder tracks the final response and bytes accepted before a hijack.
 type recorder struct {
 	http.ResponseWriter
-	status  int
-	written int64
+	status   int
+	written  int64
+	hijacked bool
 }
 
 func (w *recorder) WriteHeader(code int) {
-	if w.status == 0 && (code >= 200 || code == http.StatusSwitchingProtocols) {
+	w.ResponseWriter.WriteHeader(code)
+	if !w.hijacked && w.status == 0 && (code >= 200 || code == http.StatusSwitchingProtocols) {
 		w.status = code
 	}
-	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *recorder) Write(b []byte) (int, error) {
-	if w.status == 0 {
+	n, err := w.ResponseWriter.Write(b)
+	if w.status == 0 && !w.hijacked {
 		w.status = http.StatusOK
 	}
-	n, err := w.ResponseWriter.Write(b)
 	w.written += int64(n)
 	return n, err
 }
 
-func (w *recorder) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *recorder) Unwrap() http.ResponseWriter {
+	if _, ok := w.ResponseWriter.(unwrapper); ok {
+		return struct {
+			rawResponseWriter
+			hijackRecorder
+		}{rawResponseWriter{w.ResponseWriter}, hijackRecorder{w}}
+	}
+	return w.ResponseWriter
+}
+
+type rawResponseWriter struct{ http.ResponseWriter }
+
+func (w rawResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+type unwrapper interface{ Unwrap() http.ResponseWriter }
+
+type flushRecorder struct{ r *recorder }
+
+func (f flushRecorder) Flush() { _ = f.r.FlushError() }
+
+func (w *recorder) FlushError() error {
+	err := http.NewResponseController(w.ResponseWriter).Flush()
+	if w.status == 0 && !w.hijacked && !errors.Is(err, http.ErrNotSupported) {
+		w.status = http.StatusOK
+	}
+	return err
+}
+
+type hijackRecorder struct{ r *recorder }
+
+func (h hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := http.NewResponseController(h.r.ResponseWriter).Hijack()
+	if err == nil {
+		h.r.hijacked = true
+	}
+	return conn, rw, err
+}
+
+// closeNotifier is the legacy notification method exposed by some HTTP servers.
+type closeNotifier interface{ CloseNotify() <-chan bool }
+
+type readFromRecorder struct{ *recorder }
+
+func (w readFromRecorder) ReadFrom(src io.Reader) (int64, error) {
+	n, err := w.ResponseWriter.(io.ReaderFrom).ReadFrom(src)
+	if n > 0 && w.status == 0 && !w.hijacked {
+		w.status = http.StatusOK
+	}
+	w.written += n
+	return n, err
+}
+
+type notifyRecorder struct {
+	*recorder
+	closeNotifier
+}
+
+type readNotifyRecorder struct {
+	readFromRecorder
+	closeNotifier
+}
+
+type flushHijack struct {
+	flushRecorder
+	hijackRecorder
+}
+
+// writer preserves the optional method set of the underlying writer. Go
+// interface assertions inspect the concrete method set, so each combination
+// must have its own concrete wrapper.
+func (w *recorder) writer() http.ResponseWriter {
+	const (
+		flush = 1 << iota
+		hijack
+		push
+		notify
+		readFrom
+	)
+	var methods int
+	if _, ok := w.ResponseWriter.(http.Flusher); ok {
+		methods |= flush
+	}
+	if _, ok := w.ResponseWriter.(http.Hijacker); ok {
+		methods |= hijack
+	}
+	p, ok := w.ResponseWriter.(http.Pusher)
+	if ok {
+		methods |= push
+	}
+	c, ok := w.ResponseWriter.(closeNotifier)
+	if ok {
+		methods |= notify
+	}
+	if _, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		methods |= readFrom
+	}
+	switch methods {
+	case flush:
+		return struct {
+			*recorder
+			flushRecorder
+		}{w, flushRecorder{w}}
+	case hijack:
+		return struct {
+			*recorder
+			hijackRecorder
+		}{w, hijackRecorder{w}}
+	case flush | hijack:
+		return struct {
+			*recorder
+			flushHijack
+		}{w, flushHijack{flushRecorder{w}, hijackRecorder{w}}}
+	case push:
+		return struct {
+			*recorder
+			http.Pusher
+		}{w, p}
+	case flush | push:
+		return struct {
+			*recorder
+			flushRecorder
+			http.Pusher
+		}{w, flushRecorder{w}, p}
+	case hijack | push:
+		return struct {
+			*recorder
+			hijackRecorder
+			http.Pusher
+		}{w, hijackRecorder{w}, p}
+	case flush | hijack | push:
+		return struct {
+			*recorder
+			flushHijack
+			http.Pusher
+		}{w, flushHijack{flushRecorder{w}, hijackRecorder{w}}, p}
+	case notify:
+		return notifyRecorder{w, c}
+	case flush | notify:
+		return struct {
+			notifyRecorder
+			flushRecorder
+		}{notifyRecorder{w, c}, flushRecorder{w}}
+	case hijack | notify:
+		return struct {
+			notifyRecorder
+			hijackRecorder
+		}{notifyRecorder{w, c}, hijackRecorder{w}}
+	case flush | hijack | notify:
+		return struct {
+			notifyRecorder
+			flushHijack
+		}{notifyRecorder{w, c}, flushHijack{flushRecorder{w}, hijackRecorder{w}}}
+	case push | notify:
+		return struct {
+			notifyRecorder
+			http.Pusher
+		}{notifyRecorder{w, c}, p}
+	case flush | push | notify:
+		return struct {
+			notifyRecorder
+			flushRecorder
+			http.Pusher
+		}{notifyRecorder{w, c}, flushRecorder{w}, p}
+	case hijack | push | notify:
+		return struct {
+			notifyRecorder
+			hijackRecorder
+			http.Pusher
+		}{notifyRecorder{w, c}, hijackRecorder{w}, p}
+	case flush | hijack | push | notify:
+		return struct {
+			notifyRecorder
+			flushHijack
+			http.Pusher
+		}{notifyRecorder{w, c}, flushHijack{flushRecorder{w}, hijackRecorder{w}}, p}
+	case readFrom:
+		return readFromRecorder{w}
+	case flush | readFrom:
+		return struct {
+			readFromRecorder
+			flushRecorder
+		}{readFromRecorder{w}, flushRecorder{w}}
+	case hijack | readFrom:
+		return struct {
+			readFromRecorder
+			hijackRecorder
+		}{readFromRecorder{w}, hijackRecorder{w}}
+	case flush | hijack | readFrom:
+		return struct {
+			readFromRecorder
+			flushHijack
+		}{readFromRecorder{w}, flushHijack{flushRecorder{w}, hijackRecorder{w}}}
+	case push | readFrom:
+		return struct {
+			readFromRecorder
+			http.Pusher
+		}{readFromRecorder{w}, p}
+	case flush | push | readFrom:
+		return struct {
+			readFromRecorder
+			flushRecorder
+			http.Pusher
+		}{readFromRecorder{w}, flushRecorder{w}, p}
+	case hijack | push | readFrom:
+		return struct {
+			readFromRecorder
+			hijackRecorder
+			http.Pusher
+		}{readFromRecorder{w}, hijackRecorder{w}, p}
+	case flush | hijack | push | readFrom:
+		return struct {
+			readFromRecorder
+			flushHijack
+			http.Pusher
+		}{readFromRecorder{w}, flushHijack{flushRecorder{w}, hijackRecorder{w}}, p}
+	case notify | readFrom:
+		return readNotifyRecorder{readFromRecorder{w}, c}
+	case flush | notify | readFrom:
+		return struct {
+			readNotifyRecorder
+			flushRecorder
+		}{readNotifyRecorder{readFromRecorder{w}, c}, flushRecorder{w}}
+	case hijack | notify | readFrom:
+		return struct {
+			readNotifyRecorder
+			hijackRecorder
+		}{readNotifyRecorder{readFromRecorder{w}, c}, hijackRecorder{w}}
+	case flush | hijack | notify | readFrom:
+		return struct {
+			readNotifyRecorder
+			flushHijack
+		}{readNotifyRecorder{readFromRecorder{w}, c}, flushHijack{flushRecorder{w}, hijackRecorder{w}}}
+	case push | notify | readFrom:
+		return struct {
+			readNotifyRecorder
+			http.Pusher
+		}{readNotifyRecorder{readFromRecorder{w}, c}, p}
+	case flush | push | notify | readFrom:
+		return struct {
+			readNotifyRecorder
+			flushRecorder
+			http.Pusher
+		}{readNotifyRecorder{readFromRecorder{w}, c}, flushRecorder{w}, p}
+	case hijack | push | notify | readFrom:
+		return struct {
+			readNotifyRecorder
+			hijackRecorder
+			http.Pusher
+		}{readNotifyRecorder{readFromRecorder{w}, c}, hijackRecorder{w}, p}
+	case flush | hijack | push | notify | readFrom:
+		return struct {
+			readNotifyRecorder
+			flushHijack
+			http.Pusher
+		}{readNotifyRecorder{readFromRecorder{w}, c}, flushHijack{flushRecorder{w}, hijackRecorder{w}}, p}
+	default:
+		return w
+	}
+}

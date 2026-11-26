@@ -5,6 +5,8 @@ import (
 	"io"
 	"slices"
 	"strings"
+
+	wire "github.com/djylb/netx/httphead"
 )
 
 // pseudoFields are the pseudo-header fields of a request that the parser
@@ -98,6 +100,9 @@ func (s *HTTP2Scanner) Scan(data []byte) (*Request, error) {
 		}
 		s.pos = end
 		s.frames++
+		if typ == frameSettings && (stream != 0 || size%6 != 0 || flags&flagAck != 0 && size != 0 || !validSettings(data[start:end])) {
+			return nil, ErrInvalid
+		}
 		switch {
 		case s.frames == 1:
 			// The preface is followed by a SETTINGS frame.
@@ -126,7 +131,7 @@ func (s *HTTP2Scanner) Scan(data []byte) (*Request, error) {
 				start++
 			}
 			if flags&flagPriority != 0 {
-				if start+5 > end {
+				if start+5 > end || binary.BigEndian.Uint32(data[start:])&0x7fffffff == stream {
 					return nil, ErrInvalid
 				}
 				start += 5
@@ -136,9 +141,48 @@ func (s *HTTP2Scanner) Scan(data []byte) (*Request, error) {
 			if flags&flagEndHeaders != 0 {
 				return s.request(data)
 			}
-		case typ == frameContinuation, s.frames > http2MaxFrames:
+		case s.frames > http2MaxFrames || !beforeHeaders(typ, stream, data[start:end]):
 			return nil, ErrInvalid
 		}
+	}
+}
+
+// validSettings checks the constrained values of client SETTINGS.
+func validSettings(payload []byte) bool {
+	for len(payload) >= 6 {
+		id, v := binary.BigEndian.Uint16(payload), binary.BigEndian.Uint32(payload[2:])
+		switch id {
+		case 2, 8, 9:
+			if v > 1 {
+				return false
+			}
+		case 4:
+			if v > 0x7fffffff {
+				return false
+			}
+		case 5:
+			if v < 16384 || v > 0xffffff {
+				return false
+			}
+		}
+		payload = payload[6:]
+	}
+	return len(payload) == 0
+}
+
+// beforeHeaders checks frames that may precede the first request.
+func beforeHeaders(typ byte, stream uint32, payload []byte) bool {
+	switch typ {
+	case 0, 3, 5, 7, frameContinuation: // DATA, RST_STREAM, PUSH_PROMISE, GOAWAY, CONTINUATION
+		return false
+	case 2: // PRIORITY
+		return stream != 0 && len(payload) == 5 && binary.BigEndian.Uint32(payload)&0x7fffffff != stream
+	case 6: // PING
+		return stream == 0 && len(payload) == 8
+	case 8: // WINDOW_UPDATE
+		return stream == 0 && len(payload) == 4 && binary.BigEndian.Uint32(payload)&0x7fffffff != 0
+	default:
+		return true // extension frames are ignored
 	}
 }
 
@@ -201,13 +245,13 @@ func (s *HTTP2Scanner) request(data []byte) (*Request, error) {
 		fields.WriteString("\r\n")
 	})
 	switch {
-	case err != nil, !ok, hosts > 1, r.Method == "":
+	case err != nil, !ok, hosts > 1, !wire.ValidFieldName(r.Method):
 		return nil, ErrInvalid
 	case authority != "" && hosts == 1 && !strings.EqualFold(authority, host):
 		// A server may take either for the host (RFC 9113, Section 8.3.1).
 		return nil, ErrInvalid
 	case r.Method == methodConnect:
-		if r.RequestURI != "" || scheme != "" || authority == "" {
+		if seen[1] || seen[2] || authority == "" {
 			return nil, ErrInvalid
 		}
 	case scheme == "" || r.RequestURI != "*" && !strings.HasPrefix(r.RequestURI, "/"):
@@ -232,18 +276,14 @@ func (s *HTTP2Scanner) request(data []byte) (*Request, error) {
 // tabs, as RFC 9113 requires and net/http checks.
 func validHTTP2Field(f hpackField) bool {
 	name := strings.TrimPrefix(f.name, ":")
-	if name == "" {
+	if !wire.ValidFieldName(name) || strings.ContainsAny(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") || wire.TrimOWS(f.value) != f.value || !wire.ValidFieldValue(f.value) {
 		return false
 	}
-	for i := range len(name) {
-		if c := name[i]; c <= ' ' || 'A' <= c && c <= 'Z' || c >= 0x7f {
-			return false
-		}
-	}
-	for i := range len(f.value) {
-		if c := f.value[i]; c < ' ' && c != '\t' || c == 0x7f {
-			return false
-		}
+	switch name {
+	case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
+		return false
+	case "te":
+		return strings.EqualFold(f.value, "trailers")
 	}
 	return true
 }

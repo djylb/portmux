@@ -55,6 +55,10 @@ func TestExtendedConnectWebSocket(t *testing.T) {
 	checkLeaks(t)
 	const finalFrame = "\x88\x02\x03\xe8" // WebSocket close frame, status 1000.
 	up := backend(t, "ws", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/ordinary" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if req.URL.Path == "/refused" {
 			http.Error(w, "backend refused", http.StatusForbidden)
 			return
@@ -92,6 +96,7 @@ func TestExtendedConnectWebSocket(t *testing.T) {
 				{"ordinary", "/chat", "", http.StatusMethodNotAllowed},
 				{"denied", "/denied", "websocket", http.StatusBadRequest},
 				{"unsupported", "/chat", "unknown", http.StatusNotImplemented},
+				{"ordinary-backend-success", "/ordinary", "websocket", http.StatusBadGateway},
 				{"backend-refused", "/refused", "websocket", http.StatusForbidden},
 			} {
 				t.Run(tc.name, func(t *testing.T) {

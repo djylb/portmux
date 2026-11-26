@@ -294,9 +294,10 @@ func (c clockOption) apply(o *options) { o.clock = c.c }
 // for each delivered connection, when its server closes it with Conn.Close:
 // with Closed set, how long it was open and how many bytes it carried, for
 // access logs. The Mux then counts the bytes of delivered connections, which
-// costs an atomic addition per read and write; without it, they are not
-// counted. It applies to connections accepted after it is set, whose close
-// events go to the observer of that time; see WithObserver.
+// uses a tracking record per connection and takes a lock at the start and end
+// of each I/O operation. Outstanding I/O delays publication of the close event.
+// If the clock panics, the event carries a *PanicError and zero Duration.
+// Each connection uses the observer in effect when it was accepted.
 func WithCloseEvents(on bool) Option {
 	return optionFunc(func(o *options) {
 		o.closeEvents = on

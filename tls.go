@@ -37,12 +37,11 @@ func (t tlsMatcher) String() string { return call("TLS", t, describe[TLSFilter])
 // SNI. Names compare case-insensitively. It panics on a pattern that
 // hostmatch.CheckPattern refuses.
 func SNI(patterns ...string) TLSFilter {
-	return sniFilter{patterns: slices.Clone(patterns), hosts: hostSet(patterns)}
+	return sniFilter{hosts: hostmatch.NewSet(patterns...)}
 }
 
 type sniFilter struct {
-	patterns []string
-	hosts    *hostmatch.Set
+	hosts *hostmatch.Set
 }
 
 func (f sniFilter) Match(h *tlshello.Hello) bool { return f.hosts.MatchName(h.Name()) }
@@ -109,7 +108,7 @@ func parseVersion(s string) (uint16, bool) {
 	return 0, false
 }
 
-func (f sniFilter) String() string { return call("SNI", f.patterns, quote) }
+func (f sniFilter) String() string { return call("SNI", f.hosts.Patterns(), quote) }
 
 // ALPN accepts ClientHellos that offer at least one of the protocols.
 func ALPN(protocols ...string) TLSFilter {

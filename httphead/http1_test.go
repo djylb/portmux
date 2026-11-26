@@ -63,6 +63,11 @@ func TestParse(t *testing.T) {
 		{"absolute form and another host", "GET http://abs.example/p HTTP/1.1\r\nHost: other\r\n\r\n", "invalid", "", "", ""},
 		{"line breaks first", "\r\n\r\nGET /x HTTP/1.1\r\nHost: h\r\n\r\n", "request", "GET", "h", "/x"},
 		{"too many line breaks first", "\r\n\r\n\r\nGET /x HTTP/1.1\r\n\r\n", "invalid", "", "", ""},
+		{"connect path", "CONNECT / HTTP/1.1\r\n\r\n", "invalid", "", "", ""},
+		{"get star", "GET * HTTP/1.1\r\n\r\n", "invalid", "", "", ""},
+		{"default port with leading zero", "GET http://h:080/a HTTP/1.1\r\nHost: h\r\n\r\n", "request", "GET", "h:080", "/a"},
+		{"invalid literal", "GET http://[x:y]/ HTTP/1.1\r\n\r\n", "invalid", "", "", ""},
+		{"different ports", "GET http://h:81/a HTTP/1.1\r\nHost: h:80\r\n\r\n", "invalid", "", "", ""},
 		{"connect", "CONNECT target.example:443 HTTP/1.1\r\nHost: target.example:443\r\n\r\n", "request", "CONNECT", "target.example:443", ""},
 		{"options star", "OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n", "request", "OPTIONS", "h", "*"},
 		{"duplicate host", "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", "invalid", "", "", ""},
@@ -212,4 +217,10 @@ func FuzzParse(f *testing.F) {
 			_ = got.Header()
 		}
 	})
+}
+
+func TestPartialQueryRejected(t *testing.T) {
+	if _, err := Parse([]byte("GET /?good=1&bad=% HTTP/1.1\r\n\r\n")); outcome(err) != "invalid" {
+		t.Fatal(err)
+	}
 }

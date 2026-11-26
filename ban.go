@@ -135,6 +135,10 @@ type banShard struct {
 	mu      sync.Mutex
 	checks  sweepCount
 	clients map[banKey]banEntry
+	// earliest bounds the next time a sweep can remove a record.
+	earliest time.Duration
+	keys     []banKey // dense index for bounded admission sweeps
+	cursor   int
 }
 
 // banKey names a record of a client: the one with its ban and the failures
@@ -151,6 +155,7 @@ type banEntry struct {
 	window   time.Duration // length of the failure window
 	until    time.Duration // end of the ban, since epoch; zero when not banned
 	failures int
+	index    int // in banShard.keys
 }
 
 func newBanList(clk timeshim.Clock) *banList {
@@ -178,7 +183,19 @@ func (l *banList) banned(ip netip.Addr, now time.Duration, rec records, entry st
 		}
 		known = known || ok
 	}
-	return !known && rec.full == FullFailClosed && rec.isFull(l.size.Load())
+	if known || rec.full != FullFailClosed {
+		return false
+	}
+	for i := range l.shards {
+		if !rec.isFull(l.size.Load()) {
+			return false
+		}
+		sh := &l.shards[i]
+		sh.mu.Lock()
+		l.reclaim(sh, now)
+		sh.mu.Unlock()
+	}
+	return rec.isFull(l.size.Load())
 }
 
 // bannedKey reports whether client is banned at now, and whether it has a
@@ -187,12 +204,83 @@ func (l *banList) bannedKey(client netip.Prefix, now time.Duration, entry string
 	sh := l.shard(client)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	e, ok := sh.clients[banKey{client: client}]
-	if !ok && own {
+	key := banKey{client: client}
+	e, ok := l.live(sh, key, now)
+	if ok && e.until > now {
+		return true, true
+	}
+	if own {
 		_, ok = sh.clients[banKey{client: client, entry: entry, own: true}]
 	}
-	return ok && e.until > now, ok
+	return false, ok
 }
+
+// live removes an expired shared record under its shard lock, so its slot
+// can be used immediately for a new entry-specific failure window.
+func (l *banList) live(sh *banShard, key banKey, now time.Duration) (banEntry, bool) {
+	e, ok := sh.clients[key]
+	if ok && e.expired(now) {
+		sh.remove(key)
+		l.size.Add(-1)
+		return banEntry{}, false
+	}
+	return e, ok
+}
+
+func (sh *banShard) put(key banKey, e banEntry) {
+	expiry := max(e.until, banEnd(e.start, e.window))
+	if len(sh.clients) == 0 || expiry < sh.earliest {
+		sh.earliest = expiry
+	}
+	if prev, ok := sh.clients[key]; ok {
+		e.index = prev.index
+	} else {
+		e.index = len(sh.keys)
+		sh.keys = append(sh.keys, key)
+	}
+	sh.clients[key] = e
+}
+
+// remove swaps the last key into the freed index.
+func (sh *banShard) remove(key banKey) {
+	e, ok := sh.clients[key]
+	if !ok {
+		return
+	}
+	last := len(sh.keys) - 1
+	if e.index != last {
+		moved := sh.keys[last]
+		m := sh.clients[moved]
+		m.index = e.index
+		sh.clients[moved] = m
+		sh.keys[e.index] = moved
+	}
+	sh.keys[last] = banKey{}
+	sh.keys = sh.keys[:last]
+	delete(sh.clients, key)
+}
+
+// reclaim checks a bounded part of a full shard. The next admission
+// continues at the cursor even when no visited entry was expired.
+func (l *banList) reclaim(sh *banShard, now time.Duration) {
+	if now < sh.earliest {
+		return
+	}
+	for range min(evictSample, len(sh.keys)) {
+		if sh.cursor >= len(sh.keys) {
+			sh.cursor = 0
+		}
+		key := sh.keys[sh.cursor]
+		if sh.clients[key].expired(now) {
+			sh.remove(key)
+			l.size.Add(-1)
+			return
+		}
+		sh.cursor++
+	}
+}
+
+func (e banEntry) expired(now time.Duration) bool { return e.until <= now && now-e.start >= e.window }
 
 // fail counts a failed connection in the record key and bans its client for
 // d once failures connections failed within window. It reports whether it
@@ -206,7 +294,7 @@ func (l *banList) fail(key banKey, now time.Duration, failures int, window, d ti
 		l.sweep(sh, now)
 	}
 	ban := banKey{client: key.client}
-	b, banned := sh.clients[ban]
+	b, banned := l.live(sh, ban, now)
 	if banned && b.until > now {
 		return false // already banned
 	}
@@ -214,30 +302,33 @@ func (l *banList) fail(key banKey, now time.Duration, failures int, window, d ti
 	if !ok && !l.track(sh, now, rec, ban) {
 		return false
 	}
-	if now-e.start > window {
+	if !ok || e.failures == 0 || now-e.start >= window {
 		e.start, e.failures = now, 0
 	}
 	e.window = window
 	if e.failures++; e.failures < failures {
-		sh.clients[key] = e
+		sh.put(key, e)
 		return false
 	}
 	e.failures = 0
-	sh.clients[key] = e
 	if key != ban {
-		if !banned && !l.track(sh, now, rec, key) {
-			return false
+		sh.remove(key)
+		if banned {
+			l.size.Add(-1)
 		}
 		e = b
 	}
+	if e.failures == 0 {
+		e.window = 0
+	}
 	e.until = banEnd(now, d)
-	sh.clients[ban] = e
+	sh.put(ban, e)
 	return true
 }
 
 // banEnd returns now+d, or the largest time for a ban too long to add.
 func banEnd(now, d time.Duration) time.Duration {
-	if d > math.MaxInt64-now {
+	if now > math.MaxInt64-d {
 		return math.MaxInt64
 	}
 	return now + d
@@ -246,8 +337,7 @@ func banEnd(now, d time.Duration) time.Duration {
 // track makes room for a new record in sh, by rec, and reports whether
 // there was some. Evicting, it keeps keep and the records of bans.
 func (l *banList) track(sh *banShard, now time.Duration, rec records, keep banKey) bool {
-	if !rec.isFull(l.size.Load()) {
-		l.size.Add(1)
+	if rec.reserve(&l.size) {
 		if sh.clients == nil {
 			sh.clients = make(map[banKey]banEntry)
 		}
@@ -306,7 +396,7 @@ func (sh *banShard) evictOldest(now time.Duration, keep banKey) bool {
 		}
 	}
 	if found {
-		delete(sh.clients, victim) // its room goes to the new record
+		sh.remove(victim) // its room goes to the new record
 	}
 	return found
 }
@@ -336,9 +426,9 @@ func (l *banList) set(key banKey, now, d time.Duration) bool {
 		if sh.clients == nil {
 			sh.clients = make(map[banKey]banEntry)
 		}
-		sh.clients[key] = banEntry{start: now, until: banEnd(now, d)}
+		sh.put(key, banEntry{start: now, until: banEnd(now, d)})
 	case ok:
-		delete(sh.clients, key)
+		sh.remove(key)
 		l.size.Add(-1)
 	}
 	return was
@@ -347,10 +437,16 @@ func (l *banList) set(key banKey, now, d time.Duration) bool {
 // sweep forgets the records of clients that are not banned and whose window
 // has passed.
 func (l *banList) sweep(sh *banShard, now time.Duration) {
+	if now < sh.earliest {
+		return
+	}
+	sh.earliest = math.MaxInt64
 	for key, e := range sh.clients {
-		if e.until <= now && now-e.start > e.window {
-			delete(sh.clients, key)
+		if e.expired(now) {
+			sh.remove(key)
 			l.size.Add(-1)
+		} else {
+			sh.earliest = min(sh.earliest, max(e.until, banEnd(e.start, e.window)))
 		}
 	}
 }

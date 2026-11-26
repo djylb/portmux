@@ -8,12 +8,12 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"path"
-	"strings"
 	"time"
 
 	"github.com/djylb/netx/forwarded"
+	wire "github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/httprewrite"
+	"github.com/djylb/portmux/httphead"
 )
 
 // MaxRegexpLen bounds the length of Route.PathRegexp.
@@ -51,7 +51,7 @@ type Route struct {
 	// Names that are not empty must be unique.
 	Name string
 	// Hosts are host name patterns as hostmatch takes them, such as
-	// "example.com", "*.example.com", "api-*.example.com" and "*", which
+	// "example.com", "*.example.com", ".example.com" and "*", which
 	// hostmatch.CheckPattern must accept; "" matches requests without a
 	// host. "*", like no Hosts at all, matches every request, also those
 	// without a host. Names and patterns compare in lower case and without
@@ -64,16 +64,16 @@ type Route struct {
 	// "/" matches only paths below it. A Path that ends with '*' is a
 	// prefix of bytes: "/api*" also matches "/apix".
 	Path string
-	// Exact makes Path match only the path itself, as nginx's
-	// "location =" does.
+	// Exact makes Path match only the path itself.
 	Exact bool
-	// CaseInsensitivePath compares Path, or PathRegexp, without regard to
+	// CaseInsensitivePath compares a literal Path without regard to
 	// the case of ASCII letters, for backends that do so, such as on
-	// Windows file systems, where "/ADMIN" reaches "/admin".
+	// Windows file systems, where "/ADMIN" reaches "/admin". For PathRegexp,
+	// express case matching in the regexp itself.
 	CaseInsensitivePath bool
 	// PathRegexp, if set, matches the decoded, clean path with a Go
-	// regular expression (RE2, linear in the path) instead of Path, which
-	// must then be empty. Like nginx's "~" it is not anchored: "/admin"
+	// regular expression (linear in the path) instead of Path, which
+	// must then be empty. The expression is unanchored: "/admin"
 	// matches "/public/admin-ui"; anchor it with ^ and $ to match whole
 	// paths. Its groups are the variables ${match_1} to ${match_9}. It is
 	// at most MaxRegexpLen bytes long. The path "*" of "OPTIONS *"
@@ -108,7 +108,8 @@ type Route struct {
 	ResponseHeaders []httprewrite.Rule
 	// ErrorPages answer the route's errors, before those of the Config.
 	ErrorPages map[int]ErrorPage
-	// MaxRequestBody limits request bodies; larger ones are answered with
+	// MaxRequestBody limits bytes read from request bodies. An excessive known
+	// length, or a proxy read exceeding the limit, receives
 	// 413 Content Too Large. 0 means no limit, as backends usually bound
 	// uploads themselves, and a negative limit is an invalid config. It
 	// does not limit the streams of upgraded connections and of WebSockets
@@ -225,7 +226,8 @@ type ErrorPage struct {
 
 // Upstream is a backend that Proxy actions pass requests to. Each upstream
 // keeps its own pool of idle connections, which a Router keeps across
-// Updates while the upstream's settings other than Dial stay the same.
+// Updates for plain HTTP while settings other than Dial stay the same. A TLS
+// upstream retains its pool when Table.With leaves that upstream unchanged.
 type Upstream struct {
 	// Name identifies the upstream; it must be unique and not empty.
 	Name string
@@ -379,16 +381,7 @@ func validRedirectStatus(s int) bool {
 
 // isToken reports whether s is an HTTP token, as method and field names are.
 func isToken(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := range len(s) {
-		c := s[i]
-		if c >= 0x80 || c <= ' ' || strings.IndexByte("\"(),/:;<=>?@[\\]{}\x7f", c) >= 0 {
-			return false
-		}
-	}
-	return true
+	return wire.ValidFieldName(s)
 }
 
 // isCleanPath reports whether p is a clean absolute path, as request paths
@@ -397,9 +390,5 @@ func isCleanPath(p string) bool {
 	if p == "" || p[0] != '/' {
 		return false
 	}
-	c := path.Clean(p)
-	if strings.HasSuffix(p, "/") && c != "/" {
-		c += "/"
-	}
-	return c == p
+	return httphead.CleanDecodedPath(p) == p
 }

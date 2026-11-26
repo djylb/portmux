@@ -416,7 +416,6 @@ func TestResolveHosts(t *testing.T) {
 	}
 }
 
-//goland:noinspection HttpUrlsUsage
 func TestDomainMatchesH2C(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://www.example.com/", nil)
 	data := testutil.H2CBytes(t, req)

@@ -43,6 +43,7 @@ type routeSet struct {
 
 // routeState is the part of a route's configuration that can change.
 type routeState struct {
+	silences []time.Duration
 	priority int
 	matchers []Matcher
 	entries  []string
@@ -75,7 +76,14 @@ func (s *routeSet) clone() routeSet {
 func (m *Mux) Batch(fn func(b *Batch) error) error {
 	base := m.table.Load()
 	b := &Batch{m: m, base: base, view: base.clone()}
-	err := fn(b)
+	err := func() (err error) {
+		defer func() {
+			if v := recover(); v != nil {
+				err = NewPanicError(v)
+			}
+		}()
+		return fn(b)
+	}()
 	b.done = true
 	var removed []*Route
 	if err == nil {
@@ -135,9 +143,14 @@ func kindOf(cfg RouteConfig) routeKind {
 	return routeKind{reject: cfg.Reject, fallback: cfg.Fallback}
 }
 
+func matcherSilences(ms []Matcher) (out []time.Duration) {
+	reportSilences(ms, func(d time.Duration) { out = append(out, d) })
+	return
+}
+
 // stateOf returns the changeable settings of cfg.
 func stateOf(cfg RouteConfig) routeState {
-	return routeState{priority: cfg.Priority, matchers: slices.Clone(cfg.Matchers), entries: entryList(cfg.Entries), maxConns: cfg.MaxConns,
+	return routeState{silences: matcherSilences(cfg.Matchers), priority: cfg.Priority, matchers: slices.Clone(cfg.Matchers), entries: entryList(cfg.Entries), maxConns: cfg.MaxConns,
 		dispatchTimeout: cfg.DispatchTimeout, maxQueued: cfg.MaxQueued, resolve: cfg.Resolve, handler: cfg.Handler}
 }
 
@@ -150,6 +163,10 @@ func (b *Batch) Add(cfg RouteConfig) (*Route, error) {
 	if err := kindOf(cfg).validate(&st); err != nil {
 		return nil, err
 	}
+	return b.add(cfg, st)
+}
+
+func (b *Batch) add(cfg RouteConfig, st routeState) (*Route, error) {
 	r := &Route{
 		mux:       b.m,
 		name:      cfg.Name,
@@ -179,7 +196,8 @@ func (b *Batch) Add(cfg RouteConfig) (*Route, error) {
 // SetMatchers replaces the matchers of r.
 func (b *Batch) SetMatchers(r *Route, matchers ...Matcher) error {
 	ms := slices.Clone(matchers)
-	return b.update(r, func(st *routeState) { st.matchers = ms })
+	silences := matcherSilences(ms)
+	return b.update(r, func(st *routeState) { st.matchers, st.silences = ms, silences })
 }
 
 // SetEntries limits r to connections of the entries, or lets it apply to
@@ -253,13 +271,13 @@ func (b *Batch) Upsert(cfg RouteConfig) (*Route, error) {
 	}
 	r := b.view.names[cfg.Name]
 	if r == nil {
-		return b.Add(cfg)
+		return b.add(cfg, st)
 	}
 	if r.routeKind != kindOf(cfg) {
 		if err := b.Remove(r); err != nil {
 			return nil, err
 		}
-		return b.Add(cfg)
+		return b.add(cfg, st)
 	}
 	if err := b.update(r, func(cur *routeState) { *cur = st }); err != nil {
 		return nil, err

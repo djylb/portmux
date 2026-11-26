@@ -148,7 +148,7 @@ func TestPathPrefixSegments(t *testing.T) {
 		{"/api/", "/api/v1", true},
 		{"/", "/anything", true},
 		{"", "/anything", true},
-		{"/admin", "/admin;jsessionid=1", true}, // parameters, as Tomcat strips them
+		{"/admin", "/admin;jsessionid=1", true}, // path parameters
 		{"/admin", "/admin;x/secret", true},
 		{"/adm", "/admin;x", false},
 	}

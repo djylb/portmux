@@ -1,11 +1,11 @@
 package portmux
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -30,6 +30,7 @@ type sniffer struct {
 	seq      uint64    // accept order of a connection from Serve
 	deadline time.Time // sniff deadline, zero without one
 	armed    time.Time // read deadline currently set on the connection
+	decided  time.Time
 	silentAt time.Duration
 	table    *table
 	rules    *ruleSet    // the table's rules for entry
@@ -62,12 +63,19 @@ var snifferPool = sync.Pool{New: func() any { return new(sniffer) }}
 // keeps the options it starts with.
 func newSniffer(conn *Conn, opts *options, start time.Time) *sniffer {
 	s := snifferPool.Get().(*sniffer)
-	s.conn, s.opts, s.start = conn, opts, start
+	s.conn, s.opts = conn, opts
 	s.in.entry = conn.entry
-	if opts.sniffTimeout > 0 {
-		s.deadline = s.start.Add(opts.sniffTimeout)
+	if !start.IsZero() {
+		s.startAt(start)
 	}
 	return s
+}
+
+func (s *sniffer) startAt(start time.Time) {
+	s.start = start
+	if s.opts.sniffTimeout > 0 {
+		s.deadline = start.Add(s.opts.sniffTimeout)
+	}
 }
 
 // release returns s to the pool, keeping its timer and the room of dead.
@@ -76,36 +84,27 @@ func (s *sniffer) release() {
 	snifferPool.Put(s)
 }
 
-// arrival is when the Mux started on a connection, once it had a pending
-// slot, and the counter stripe it uses. Connections from Serve are also
-// numbered in accept order.
-type arrival struct {
-	start  time.Time
-	seq    uint64
-	stripe uint8
-}
-
 // serveConn matches c, which the caller counted as pending, and delivers it,
 // with cs, the settings that the connection follows throughout. Connections
 // from Serve come with their listener, which counts them, and their
 // admission; they may be evicted while undecided. For a route with a
 // handler, serveConn returns the handler instead of calling it, so that the
 // connection no longer counts as pending while the handler runs.
-func (m *Mux) serveConn(c net.Conn, l *listener, a admission, cs *connSettings, entry string, at arrival) (handler func(*Conn), conn *Conn, err error) {
-	conn = &Conn{conn: c, entry: entry, stripe: at.stripe}
-	s := newSniffer(conn, cs.opts, at.start)
-	s.seq = at.seq
-	m.undelivered.add(s, l != nil)
+func (m *Mux) serveConn(s *sniffer, l *listener, a admission, cs *connSettings, handlerEvent *Event) (handler func(*Conn), conn *Conn, err error) {
+	conn = s.conn
 	// held reports that the connection holds the pending slot and the
 	// client's pending count of its admission; it gives them back once
 	// matched, so that one that waits for Accept holds neither.
 	held, delivered := l != nil, false
 	defer func() {
 		if p := recover(); p != nil {
-			err = &PanicError{Value: p, Stack: debug.Stack()}
+			err = NewPanicError(p)
 		}
-		err = m.settle(s, l, &a, cs, held, delivered, err)
+		err = m.settle(s, l, &a, cs, held, delivered, err, handlerEvent)
 	}()
+	if l == nil {
+		s.in.setPeer(conn.conn)
+	}
 	// Close may have run between add and here without seeing conn.
 	if m.closed.Load() {
 		return nil, conn, net.ErrClosed
@@ -121,10 +120,22 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, cs *connSettings, 
 			return nil, conn, err
 		}
 		var st routeState
+		if cs.opts.observer != nil {
+			s.decided = time.Now()
+		}
 		if err = m.claim(s, r, &st); err != nil {
 			return nil, conn, err
 		}
-		m.open(conn, l, cs)
+		m.open(conn, l)
+		if o := cs.opts; o.observer != nil {
+			*handlerEvent = s.event(r, nil)
+			if o.closeEvents {
+				if conn.track == nil {
+					conn.track = &connTrack{observe: o.observer, clock: o.clock}
+				}
+				conn.track.event = *handlerEvent
+			}
+		}
 		// The buffer is dropped only once delivered: matched again, the
 		// connection still reads into it.
 		if st.handler != nil {
@@ -151,7 +162,8 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, cs *connSettings, 
 			return nil, conn, err
 		}
 		// Matched again, it may read again, which Close must interrupt.
-		m.undelivered.add(s, false)
+		s.decided = time.Time{}
+		m.undelivered.add(s)
 		if m.closed.Load() {
 			return nil, conn, net.ErrClosed
 		}
@@ -165,7 +177,7 @@ func (m *Mux) serveConn(c net.Conn, l *listener, a admission, cs *connSettings, 
 // reports that the connection still holds its pending slot and the client's
 // pending count. It returns err, or ErrEvicted for a connection evicted while
 // it was undecided.
-func (m *Mux) settle(s *sniffer, l *listener, a *admission, cs *connSettings, held, delivered bool, err error) error {
+func (m *Mux) settle(s *sniffer, l *listener, a *admission, cs *connSettings, held, delivered bool, err error, handlerEvent *Event) error {
 	conn, stripe := s.conn, s.conn.stripe
 	m.undelivered.remove(s)
 	if s.evicted.Load() && err != nil {
@@ -176,9 +188,11 @@ func (m *Mux) settle(s *sniffer, l *listener, a *admission, cs *connSettings, he
 	observer := cs.opts.observer
 	var ev Event
 	if observer != nil {
-		p := s.in.parsed()
-		ev = conn.eventOf(&p, err)
-		ev.Elapsed, ev.Sniffed = time.Since(s.start), len(s.buf)
+		if delivered {
+			ev = *handlerEvent
+		} else {
+			ev = s.event(nil, err)
+		}
 	}
 	s.release()
 	// The outcome is counted before the connection leaves pending and
@@ -201,11 +215,10 @@ func (m *Mux) settle(s *sniffer, l *listener, a *admission, cs *connSettings, he
 	// connection closed, so that a client that connects again at once
 	// is held to the limits and bans that this connection leaves.
 	if l != nil {
-		ev.Banned = m.releaseAdmitted(l, a, cs, held, err)
+		ev.Banned, err = m.releaseAdmitted(l, a, cs, held, err)
+		ev.Err = err
 	}
-	if delivered {
-		ev.Route = conn.route
-	} else {
+	if !delivered {
 		_ = conn.Close()
 	}
 	if observer != nil {
@@ -214,23 +227,35 @@ func (m *Mux) settle(s *sniffer, l *listener, a *admission, cs *connSettings, he
 	return err
 }
 
+// event captures the decision before its input returns to the pool.
+func (s *sniffer) event(route *Route, err error) Event {
+	p := s.in.parsed()
+	ev := s.in.addresses().event(s.conn.entry, route, &p, err)
+	decided := s.decided
+	if decided.IsZero() {
+		decided = time.Now()
+	}
+	ev.Elapsed, ev.Sniffed = decided.Sub(s.start), len(s.buf)
+	return ev
+}
+
 // admitProxied calls the PROXY protocol policy, reads the header that it asks
 // for, and then applies the per-client rules that waited for the policy, to
 // the peer, or for the header, to its source; see admission. It records what
 // it learns in a as it goes, also on failure and on a panic, for what settle
 // gives back and counts toward bans.
 func (m *Mux) admitProxied(s *sniffer, l *listener, a *admission, cs *connSettings) error {
-	c, entry := s.conn.conn, s.in.entry
+	entry := s.in.entry
 	var err error
 	switch {
 	case l == nil:
-		a.proxy = proxyPolicyFor(cs.opts, entry, c)
+		a.proxy = proxyPolicyFor(cs.opts, &s.in)
 	case a.policy:
 		// Here rather than in the accept loop, which a slow or panicking
 		// policy would hold up or bring down.
-		if a.proxy = proxyPolicyFor(cs.opts, entry, c); a.proxy != proxyproto.Ignore {
+		if a.proxy = proxyPolicyFor(cs.opts, &s.in); a.proxy != proxyproto.Ignore {
 			a.proxied = true
-		} else if *a, err = m.admitClient(*a, entry, c.RemoteAddr(), cs); err != nil {
+		} else if *a, err = m.admitClient(*a, entry, s.in.peer, cs); err != nil {
 			return err
 		}
 	}
@@ -239,8 +264,8 @@ func (m *Mux) admitProxied(s *sniffer, l *listener, a *admission, cs *connSettin
 	}
 	if a.proxied {
 		// The client is the source of the header, if there was one.
-		a.header = s.conn.proxy != nil
-		*a, err = m.admitClient(*a, entry, s.conn.RemoteAddr(), cs)
+		a.header = s.conn.proxy != nil && s.conn.proxy.Source != nil
+		*a, err = m.admitClient(*a, entry, s.in.remote, cs)
 	}
 	return err
 }
@@ -268,7 +293,11 @@ func (m *Mux) decide(s *sniffer) (*Route, error) {
 		}
 		if s.via != r {
 			// A resolver chose r: it must serve the connection's entry.
-			if st := m.table.Load().routes[r]; len(st.entries) > 0 && !slices.Contains(st.entries, s.in.entry) {
+			st, ok := s.table.routes[r]
+			if !ok {
+				return nil, ErrInvalidRoute
+			}
+			if len(st.entries) > 0 && !slices.Contains(st.entries, s.in.entry) {
 				return nil, ErrEntryMismatch
 			}
 		}
@@ -280,7 +309,9 @@ func (m *Mux) decide(s *sniffer) (*Route, error) {
 // it out of the pending set and counts it as matched and open on r. It sets st
 // to the settings of r, or returns why r cannot take the connection.
 func (m *Mux) claim(s *sniffer, r *Route, st *routeState) error {
-	s.handOver(r)
+	if err := s.handOver(r); err != nil {
+		return err
+	}
 	// A decided connection leaves the pending set, so that Close does not
 	// close it once it is delivered.
 	m.undelivered.remove(s)
@@ -306,7 +337,7 @@ func (m *Mux) claim(s *sniffer, r *Route, st *routeState) error {
 	if r.reject {
 		return ErrRefused
 	}
-	*st = m.table.Load().routes[r]
+	*st = s.table.routes[r]
 	if !r.tryOpen(st.maxConns) {
 		return ErrConnLimit
 	}
@@ -314,19 +345,12 @@ func (m *Mux) claim(s *sniffer, r *Route, st *routeState) error {
 }
 
 // open counts conn, which its route counted as open, as open by the Mux and
-// its listener l, and measures it for its close event when cs asks for one.
-func (m *Mux) open(conn *Conn, l *listener, cs *connSettings) {
+// its listener l.
+func (m *Mux) open(conn *Conn, l *listener) {
 	conn.mux, conn.ln = m, l
-	if o := cs.opts; o.closeEvents && o.observer != nil {
-		conn.track = &connTrack{clock: o.clock, start: o.clock.Now(), observe: o.observer}
-	}
 	conn.open.Store(true)
 	m.count(l, conn.stripe, func(c *counters) { c.open.Add(1) })
 }
-
-// maxProxyHeaderLen is the longest PROXY header, a version 2 header with the
-// largest payload.
-const maxProxyHeaderLen = 16 + 0xffff
 
 // readProxyHeader reads a PROXY header when mode expects one, then sets
 // the addresses that matchers see. A missing header is reported with
@@ -338,8 +362,15 @@ const maxProxyHeaderLen = 16 + 0xffff
 func (s *sniffer) readProxyHeader(mode proxyproto.Policy, tables *atomic.Pointer[table]) error {
 	defer func() {
 		c := s.conn
-		s.in.remote, s.in.local, s.in.proxy = c.RemoteAddr(), c.LocalAddr(), c.proxy
-		s.in.peer = c.conn.RemoteAddr()
+		s.in.proxy = c.proxy
+		if h := c.proxy; h != nil {
+			if h.Source != nil {
+				s.in.remote = h.Source
+			}
+			if h.Destination != nil {
+				s.in.local = h.Destination
+			}
+		}
 	}()
 	if mode == proxyproto.Ignore {
 		return nil
@@ -372,7 +403,13 @@ func (s *sniffer) readProxyHeader(mode proxyproto.Policy, tables *atomic.Pointer
 			}
 			return s.readErr()
 		}
-		s.read(maxProxyHeaderLen, rs)
+		limit := len(s.buf) + 1
+		if len(s.buf) >= 16 && s.buf[0] == 13 {
+			limit = 16 + int(binary.BigEndian.Uint16(s.buf[14:16]))
+		}
+		if err := s.read(limit, rs); err != nil {
+			return err
+		}
 	}
 }
 
@@ -388,7 +425,8 @@ func (s *sniffer) match(tables *atomic.Pointer[table], maxSniffBytes int) (*Rout
 		}
 		// A read for the PROXY header may have taken bytes beyond the limit,
 		// which matchers do not see.
-		in.data = s.buf[s.off:min(len(s.buf), limit)]
+		end := min(len(s.buf), limit)
+		in.data = s.buf[s.off:end:end]
 		eof := s.err != nil && errors.Is(s.err, io.EOF)
 		if eof && len(in.data) == 0 {
 			return nil, io.EOF
@@ -400,6 +438,9 @@ func (s *sniffer) match(tables *atomic.Pointer[table], maxSniffBytes int) (*Rout
 			return r, nil
 		case NoMatch:
 			if r := s.rules.fallback; r != nil {
+				if len(in.data) == 0 {
+					break
+				}
 				s.via = r
 				return r, nil
 			}
@@ -427,7 +468,9 @@ func (s *sniffer) match(tables *atomic.Pointer[table], maxSniffBytes int) (*Rout
 			}
 			s.err = nil
 		}
-		s.read(limit, s.rules)
+		if err := s.read(limit, s.rules); err != nil {
+			return nil, err
+		}
 	}
 }
 
@@ -459,7 +502,7 @@ func isTimeout(err error) bool {
 // read appends at most limit-len(buf) bytes, growing the buffer as needed.
 // Without bytes yet, the read deadline stops at the next silence check of t.
 // The read error is kept in s.err for after the new bytes were examined.
-func (s *sniffer) read(limit int, rs *ruleSet) {
+func (s *sniffer) read(limit int, rs *ruleSet) error {
 	want := s.deadline
 	if rs != nil && len(s.buf) == s.off {
 		for _, d := range rs.silences {
@@ -472,14 +515,22 @@ func (s *sniffer) read(limit int, rs *ruleSet) {
 		}
 	}
 	if !want.Equal(s.armed) {
-		_ = s.conn.conn.SetReadDeadline(want)
+		if err := s.conn.conn.SetReadDeadline(want); err != nil {
+			return err
+		}
 		s.armed = want
 	}
+	s.readBytes(limit)
+	return nil
+}
+
+// readBytes keeps a read error beside its bytes for the next match or replay.
+func (s *sniffer) readBytes(limit int) {
 	if s.buf == nil {
 		// Idle clients hold no buffer: wait until the connection is readable
 		// before taking one from the pool.
-		if err := waitReadable(s.conn.conn); err != nil {
-			s.err = err
+		s.err = waitReadable(s.conn.conn)
+		if s.err != nil {
 			return
 		}
 		s.conn.buf = getBuffer()
@@ -518,9 +569,12 @@ func (s *sniffer) readErr() error {
 
 // handOver clears the read deadline and attaches the bytes read and the
 // parses to the connection, with the route that matched it, if any.
-func (s *sniffer) handOver(r *Route) {
-	if !s.armed.IsZero() {
-		_ = s.conn.conn.SetReadDeadline(time.Time{})
+func (s *sniffer) handOver(r *Route) error {
+	var err error
+	armed := !s.armed.IsZero()
+	ownTimeout := armed && s.err != nil && isTimeout(s.err) && !time.Now().Before(s.armed)
+	if armed {
+		err = clearReadDeadline(s.conn.conn)
 		s.armed = time.Time{}
 	}
 	c := s.conn
@@ -535,6 +589,21 @@ func (s *sniffer) handOver(r *Route) {
 		p.name = &name
 	}
 	c.parsed = p
+	if s.err != nil && !ownTimeout {
+		c.readErr = s.err
+	}
+	return err
+}
+
+// Clearing the deadline also runs during Peek panic recovery. Preserve the
+// replay even if the supplied connection panics during cleanup.
+func clearReadDeadline(c net.Conn) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = NewPanicError(v)
+		}
+	}()
+	return c.SetReadDeadline(time.Time{})
 }
 
 // deliver hands the connection to r's Accept, with the queue limit and the

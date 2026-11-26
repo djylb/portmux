@@ -34,8 +34,10 @@ func (m *Mux) Entry(name string) *Entry {
 // entry, which a program can check for when it configures the entries.
 func (m *Mux) Entries() []string {
 	names := make(map[string]bool)
-	for name := range m.table.Load().byEntry {
-		names[name] = true
+	for _, st := range m.table.Load().routes {
+		for _, name := range st.entries {
+			names[name] = true
+		}
 	}
 	if entries := m.entries.Load(); entries != nil {
 		for name := range *entries {
@@ -43,7 +45,7 @@ func (m *Mux) Entries() []string {
 		}
 	}
 	m.mu.Lock()
-	for _, l := range m.listeners {
+	for l := range m.listeners {
 		names[l.entry] = true
 	}
 	m.mu.Unlock()
@@ -71,6 +73,9 @@ func (e *Entry) ServeConn(c net.Conn) error { return e.m.serveOne(e.name, c) }
 // which the entry's WithMaxPendingPerClient and WithMaxQueued limit, are
 // those of all entries.
 func (e *Entry) SetOptions(opts ...EntryOption) {
+	if !slices.ContainsFunc(opts, func(o EntryOption) bool { return o != nil }) {
+		return
+	}
 	m := e.m
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -190,7 +195,7 @@ func (m *Mux) newEntryConfig(old *entryConfig, set [numEntrySettings]func(*optio
 	case old != nil && old.ownRate && old.cs.rate != nil && old.cs.opts.rate == o.rate && old.cs.opts.rateBurst == o.rateBurst:
 		c.cs.rate = old.cs.rate
 	default:
-		c.cs.rate = newRateLimit(o.rate, o.rateBurst, o.clock)
+		c.cs.rate = newRateLimit(o.rate, o.rateBurst, m.bans.clock, m.bans.epoch)
 	}
 	return c
 }

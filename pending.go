@@ -1,6 +1,7 @@
 package portmux
 
 import (
+	"net"
 	"sync"
 )
 
@@ -76,14 +77,10 @@ func (p *pendingSet) shard(s *sniffer) *pendingShard {
 	return &p.shards[s.conn.stripe%pendingShards]
 }
 
-func (p *pendingSet) add(s *sniffer, evictable bool) {
+func (p *pendingSet) add(s *sniffer) {
 	sh := p.shard(s)
 	sh.mu.Lock()
-	if evictable {
-		sh.idle.insert(s)
-	} else {
-		sh.busy.push(s)
-	}
+	sh.busy.push(s)
 	sh.mu.Unlock()
 }
 
@@ -99,33 +96,35 @@ func (p *pendingSet) remove(s *sniffer) {
 // evictOldest closes the undecided connection from Serve that was accepted
 // first. It reports whether there was one.
 func (p *pendingSet) evictOldest() bool {
-	oldest := -1
-	var oldestSeq uint64
-	for i := range p.shards {
-		sh := &p.shards[i]
-		sh.mu.Lock()
-		if h := sh.idle.head; h != nil && (oldest < 0 || h.seq < oldestSeq) {
-			oldest, oldestSeq = i, h.seq
+	for {
+		oldest := -1
+		var oldestSeq uint64
+		for i := range p.shards {
+			sh := &p.shards[i]
+			sh.mu.Lock()
+			if h := sh.idle.head; h != nil && (oldest < 0 || h.seq < oldestSeq) {
+				oldest, oldestSeq = i, h.seq
+			}
+			sh.mu.Unlock()
 		}
+		if oldest < 0 {
+			return false
+		}
+		sh := &p.shards[oldest]
+		sh.mu.Lock()
+		s := sh.idle.head
+		if s == nil || s.seq != oldestSeq {
+			sh.mu.Unlock()
+			continue
+		}
+		sh.idle.remove(s)
+		sh.busy.push(s)
+		s.evicted.Store(true)
+		c := s.conn.conn
 		sh.mu.Unlock()
+		_ = c.Close()
+		return true
 	}
-	if oldest < 0 {
-		return false
-	}
-	sh := &p.shards[oldest]
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	s := sh.idle.head
-	if s == nil {
-		return false
-	}
-	sh.idle.remove(s)
-	sh.busy.push(s)
-	// The lock keeps the sniffer from being released and reused while its
-	// connection is closed.
-	s.evicted.Store(true)
-	_ = s.conn.conn.Close()
-	return true
 }
 
 // closeAll closes the underlying connections without releasing their
@@ -133,12 +132,16 @@ func (p *pendingSet) evictOldest() bool {
 func (p *pendingSet) closeAll() {
 	for i := range p.shards {
 		sh := &p.shards[i]
+		var conns []net.Conn
 		sh.mu.Lock()
 		for _, l := range []*sniffList{&sh.idle, &sh.busy} {
 			for s := l.head; s != nil; s = s.next {
-				_ = s.conn.conn.Close()
+				conns = append(conns, s.conn.conn)
 			}
 		}
 		sh.mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
 	}
 }

@@ -131,18 +131,21 @@ func (r *Route) Accept() (net.Conn, error) {
 
 // AcceptConn is Accept with the concrete connection type.
 func (r *Route) AcceptConn() (*Conn, error) {
+	if r.isClosed() {
+		return nil, net.ErrClosed
+	}
 	// A connection already waiting is taken without blocking, which only
 	// locks the route's channel.
 	select {
 	case c := <-r.ch:
-		return c, nil
+		return c.accepted(), nil
 	default:
 	}
 	r.accepting.Add(1)
 	defer r.accepting.Add(-1)
 	select {
 	case c := <-r.ch:
-		return c, nil
+		return c.accepted(), nil
 	case <-r.done:
 		return nil, net.ErrClosed
 	}

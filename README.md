@@ -131,7 +131,7 @@ func forward(l net.Listener, addr string) {
 | HTTP       | `Host`, `HostRegexp`, `Path`, `PathPrefix`, `PathRegexp`, `Method`, `Header`, `HeaderRegexp`, `Query`, `WebSocket` |
 | TLS        | `SNI`, `SNIRegexp`, `ALPN`, `MinTLSVersion`, `fingerprint.MatchJA4`, `fingerprint.MatchJA3`                        |
 
-- Host patterns are those of nginx and Envoy: an exact name;
+- Host patterns include an exact name;
   `*.example.com`, any name below example.com at any depth (`a.b.example.com`
   too) but not example.com itself; `.example.com`, example.com and every
   name below it; `*`, any name; and `""`, a hello or request without a name.
@@ -342,9 +342,11 @@ func resolveSites(sites *hostmatch.Map[[2]*portmux.Route]) portmux.ResolveFunc {
   their suffix (`*.` before `.` on a tie), then `*`. `LookupFunc`
   and `Matches` fall back to wider patterns for policies of your own. Lookups
   take no lock, and allocate nothing for lowercase names and those that
-  `Input` prepared. `Set`, `Delete` and `Edit`, which applies many changes
-  at once, publish an immutable `hostmatch.Snapshot`; `Load` returns the
-  current one.
+  `Input` prepared. `Set`, `Delete` and `TryEdit`, which applies many changes
+  at once, publish an immutable `hostmatch.Snapshot`. Check the result of
+  `TryEdit`: `hostmatch.ErrEditConflict` means another writer committed first;
+  a callback panic returns a `*hostmatch.PanicError`. Either error discards the batch.
+  `Load` returns the current snapshot.
 - `ResolveHosts` and `ResolveDomain` route TLS, HTTP/1.x and h2c by the name
   the client asks for, and protocols of your own by the name a matcher sets
   with `Input.SetRequestedName`. Paths are for the HTTP server behind the
@@ -372,7 +374,10 @@ func loadRule(m *portmux.Mux, name, text string, office portmux.Matcher) error {
 }
 ```
 
-`ParseMatcher` reads what matchers print, as in
+Built-in rules within parser limits describe themselves in `ParseMatcher` syntax,
+including the line-anchor semantics of POSIX regular expressions. Use
+`FormatMatcher` to check a rule before saving its description. For custom rules, save the original text and reuse the same
+`Names` on reload. `ParseMatcher` reads expressions such as
 `And(office, TLS(SNI("*.example.com"), MinTLSVersion(1.2)))`, so the matchers
 of routes can be stored and read back, next to the other settings of their
 `RouteConfig`. `Names` supplies your own matchers and filters, also with
@@ -643,7 +648,7 @@ Within a level, the most specific host pattern wins, as `hostmatch.Map`
 ranks them: the exact name, then the longer wildcard suffix
 (`*.api.example.com` before `*.example.com`), then `*`; then the route
 listed first. `Hosts: ["*"]` is the same as no `Hosts`: it takes requests
-without a host too. `PathRegexp` is not anchored, as nginx's `~` is not:
+without a host too. `PathRegexp` is unanchored:
 `/admin` matches `/public/admin-ui`, so write `^/admin$` for whole paths.
 
 | Routes                                                      | Request                | Route                      |
@@ -661,7 +666,8 @@ whose path servers read differently, or that holds a control character once
 decoded, get 400, and so do hosts that are not ASCII host names. The
 backend gets the path the route was chosen by, with the client's escapes
 where they fit, unless `Proxy.SendRawPath` is set. `CaseInsensitivePath`
-serves backends that ignore case. `TLS` filters on whether the request came
+compares literal paths with ASCII case folding. Specify regexp case matching in the
+expression. `TLS` filters on whether the request came
 over TLS, by the connection or a trusted proxy alone. `Build` refuses
 routes that match the same requests as one before them for a host, and
 routes that one before them hides entirely.
@@ -671,7 +677,9 @@ routes that one before them hides entirely.
   `Table`, compiling only the host patterns it touches, so one change is
   cheap in a table of any size. `Update` replaces the table while serving,
   and requests keep the table they were matched with. Upstreams whose
-  settings stay the same keep their idle connections.
+  transport settings stay the same keep their idle connections. TLS upstreams
+  keep their pool only when the compiled upstream is reused, as with an
+  unchanged upstream in `Table.With`. Rebuilding it starts a fresh TLS pool.
 - A `DialFunc` gets the request's context and a `DialInfo` with the route,
   host and client; it is where load balancing goes. A `*StatusError` it
   returns sets the status, such as 503 for a backend that is offline;
@@ -699,8 +707,9 @@ routes that one before them hides entirely.
   `HashPassword` (PBKDF2-HMAC-SHA256 in a self-describing form), or a
   `Verify` function of yours. Verified credentials are remembered for
   `CacheTTL`, at most `CacheSize` of them (1024; `DisableCache` remembers
-  none), the least recently used dropped first, until the table is
-  replaced; at most one hash per CPU runs at a time. `Allow` is asked for
+  none), with the least recently used dropped first. Unchanged routes in
+  tables derived by `With` share their credential cache. Built-in verifiers
+  share a process-wide budget set by the initial `GOMAXPROCS`. `Allow` is asked for
   every request with valid credentials, remembered ones too, so that an
   account that expires or is disabled is refused at once.
 - Upgrades are limited to `Route.Upgrades`, `websocket` by default; other

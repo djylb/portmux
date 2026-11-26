@@ -152,3 +152,17 @@ func parse(dump string) (goroutine, bool) {
 	}
 	return goroutine{id: id, top: fn, stack: dump}, true
 }
+
+// Check registers a cleanup that reports goroutines started during the test.
+func Check(t *testing.T) {
+	t.Helper()
+	base := make(map[uint64]bool)
+	for _, g := range goroutines() {
+		base[g.id] = true
+	}
+	t.Cleanup(func() {
+		if err := find(settleWait, base); err != nil {
+			t.Error(err)
+		}
+	})
+}

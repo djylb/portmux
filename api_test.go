@@ -366,7 +366,9 @@ func TestRequestedNameOfYourOwn(t *testing.T) {
 func TestPeekAny(t *testing.T) {
 	for data, want := range map[string]int{"SSH-2.0-x\r\n": 2, "GET / HTTP/1.1\r\nHost: h\r\n\r\n": 1, "\x00\x01": -1} {
 		a, b := net.Pipe()
-		go func() { _, _ = b.Write([]byte(data)); _ = b.Close() }()
+		defer func() { _ = b.Close() }()
+		done := make(chan struct{})
+		go func() { defer close(done); _, _ = b.Write([]byte(data)) }()
 		conn, i, err := PeekAny(a, []Matcher{TLS(), HTTP1(), SSH()})
 		if i != want || (want >= 0) != (err == nil) {
 			t.Errorf("%q: PeekAny = %d, %v; want %d", data, i, err, want)
@@ -378,6 +380,7 @@ func TestPeekAny(t *testing.T) {
 			t.Fatalf("%q: PeekAny returned no Conn", data)
 		}
 		_ = conn.Close()
+		<-done
 	}
 }
 
@@ -492,12 +495,15 @@ func TestPeekerConcurrent(t *testing.T) {
 	for i := range 24 {
 		wg.Go(func() {
 			a, b := net.Pipe()
-			go func() { _, _ = b.Write([]byte(inputs[i%3])); _ = b.Close() }()
+			defer func() { _ = b.Close() }()
+			done := make(chan struct{})
+			go func() { defer close(done); _, _ = b.Write([]byte(inputs[i%3])) }()
 			conn, got, _ := p.Peek(a)
 			if got != wants[i%3] {
 				t.Errorf("%q: Peek = %d, want %d", inputs[i%3], got, wants[i%3])
 			}
 			_ = conn.Close()
+			<-done
 		})
 	}
 	wg.Wait()

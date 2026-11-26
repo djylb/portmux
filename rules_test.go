@@ -42,7 +42,10 @@ func TestParseMatcherRoundTrip(t *testing.T) {
 	}
 	called := make(map[string]bool)
 	for _, m := range matchers {
-		text := describe(m)
+		text := m.(fmt.Stringer).String()
+		if formatted, err := FormatMatcher(m); err != nil || formatted != text {
+			t.Fatalf("String %q, FormatMatcher %q, error %v", text, formatted, err)
+		}
 		for _, c := range regexp.MustCompile(`(\w+)\(`).FindAllStringSubmatch(text, -1) {
 			called[c[1]] = true
 		}

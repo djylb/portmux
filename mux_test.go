@@ -116,14 +116,13 @@ func httpServer(t *testing.T, l net.Listener, name string) {
 	t.Cleanup(func() { _ = srv.Close() })
 }
 
-//goland:noinspection HttpUrlsUsage
 func TestHTTPServersOnRoutes(t *testing.T) {
 	m := startMux(t)
 	httpServer(t, m.Listen(HTTP1(Host("api.example.com"), PathPrefix("/v1/"))), "api")
 	httpServer(t, m.Listen(HTTP1()), "web")
 	serve(t, m)
 
-	client := &http.Client{Transport: &http.Transport{}}
+	client := &http.Client{Transport: &http.Transport{DialContext: (&net.Dialer{}).DialContext}}
 	t.Cleanup(client.CloseIdleConnections)
 	get := func(host, path string) string {
 		t.Helper()
@@ -864,7 +863,7 @@ func TestMaxSniffBytesAfterProxyHeader(t *testing.T) {
 	seen := 0
 	replayed := 0
 	if _, err := m.Add(RouteConfig{Matchers: []Matcher{MatcherFunc(func(in *Input) Result {
-		seen = max(seen, len(in.Bytes()))
+		seen = max(seen, cap(in.Bytes()))
 		if !in.Final() {
 			return NeedMore
 		}
@@ -878,7 +877,7 @@ func TestMaxSniffBytesAfterProxyHeader(t *testing.T) {
 	if err := m.ServeConn(&memConn{data: data}); err != nil {
 		t.Fatal(err)
 	}
-	if seen != 16 || replayed != 1000 {
+	if seen != 16 || replayed != 16 {
 		t.Fatalf("matchers saw %d bytes, the connection replays %d", seen, replayed)
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -20,16 +19,17 @@ import (
 // connections handed over with ServeConn. Routes can be added, changed and
 // removed at any time. Its methods are safe for concurrent use.
 type Mux struct {
+	observerPanic atomic.Pointer[PanicError]
 	// base holds the options of the Mux and its buckets of
 	// WithRateLimitPerClient, the settings of the entries without options of
 	// their own.
 	base  atomic.Pointer[connSettings]
 	table atomic.Pointer[table]
 
-	quit      chan struct{} // closed when no new connections are taken
-	quitOnce  sync.Once
-	closeOnce sync.Once
-	closed    atomic.Bool
+	quit          chan struct{} // closed when no new connections are taken
+	closed        atomic.Bool
+	closeDone     chan struct{}
+	listenersDone chan struct{}
 
 	undelivered pendingSet
 	seq         atomic.Uint64 // orders routes added with equal priority
@@ -43,7 +43,7 @@ type Mux struct {
 	// mu guards listeners, orders changes of the routes and options, which
 	// are read without it.
 	mu        sync.Mutex
-	listeners map[net.Listener]*listener
+	listeners map[*listener]net.Listener
 	serving   sync.WaitGroup // Serve calls, which Shutdown waits for
 }
 
@@ -56,16 +56,18 @@ type listener struct {
 	addr   net.Addr
 	counts stripedCounters
 	// The token bucket of WithRateLimitPerListener, used by Serve alone, and
-	// the start of its clock, zero until its first use.
-	tokens tokenBucket
-	epoch  time.Time
+	// the start of its clock.
+	tokens      tokenBucket
+	epoch       time.Time
+	rateStarted bool
 }
 
 // allow takes a token of the listener's bucket and reports whether there was
 // one.
 func (l *listener) allow(rate float64, burst int, now time.Time) bool {
 	b := float64(max(burst, 1))
-	if l.epoch.IsZero() {
+	if !l.rateStarted {
+		l.rateStarted = true
 		l.epoch, l.tokens = now, tokenBucket{tokens: b}
 	}
 	return l.tokens.take(rate, b, now.Sub(l.epoch))
@@ -75,7 +77,8 @@ func (l *listener) allow(rate float64, burst int, now time.Time) bool {
 func New(opts ...Option) *Mux {
 	m := &Mux{
 		quit:      make(chan struct{}),
-		listeners: make(map[net.Listener]*listener),
+		closeDone: make(chan struct{}), listenersDone: make(chan struct{}),
+		listeners: make(map[*listener]net.Listener),
 		slots:     newSlotLimit(),
 		perClient: pendingLimit{count: make(map[netip.Prefix]int)},
 	}
@@ -83,7 +86,7 @@ func New(opts ...Option) *Mux {
 	m.bans = newBanList(o.clock)
 	base := &connSettings{opts: &o}
 	if o.rate > 0 {
-		base.rate = newRateLimit(o.rate, o.rateBurst, o.clock)
+		base.rate = newRateLimit(o.rate, o.rateBurst, m.bans.clock, m.bans.epoch)
 	}
 	m.base.Store(base)
 	m.table.Store(newTable(routeSet{}, nil))
@@ -117,7 +120,7 @@ func (m *Mux) SetOptions(opts ...Option) {
 	if o.rate != old.opts.rate || o.rateBurst != old.opts.rateBurst {
 		base.rate = nil
 		if o.rate > 0 {
-			base.rate = newRateLimit(o.rate, o.rateBurst, o.clock)
+			base.rate = newRateLimit(o.rate, o.rateBurst, m.bans.clock, m.bans.epoch)
 		}
 	}
 	m.base.Store(base)
@@ -209,7 +212,7 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 		return net.ErrClosed
 	}
 	defer m.serving.Done()
-	defer m.removeListener(ln)
+	defer m.removeListener(l, ln)
 
 	var delay time.Duration
 	for {
@@ -240,16 +243,20 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 		cs := m.settings(entry)
 		// A connection counts as accepted once it is served or rejected, so
 		// that one waiting for a pending slot is not counted yet.
-		a, err := m.admit(c, l, cs)
+		s := newSniffer(&Conn{conn: c, entry: entry, stripe: stripe}, cs.opts, time.Time{})
+		a, err := m.admit(s, l, cs)
 		if err != nil {
-			ev := acceptEvent(entry, c, err)
+			ev := s.in.addresses().event(entry, nil, &parsed{}, err)
+			s.release()
 			m.count(l, stripe, func(c *counters) { c.accepted.Add(1) })
 			m.reject(l, stripe, err)
 			_ = c.Close()
 			m.observeWith(cs.opts.observer, ev)
 			continue
 		}
-		if !m.acquireSlot() {
+		s.seq = seq
+		if !m.acquireSlot(s) {
+			s.release()
 			_ = c.Close()
 			if a.counted {
 				m.perClient.release(a.client)
@@ -264,7 +271,8 @@ func (m *Mux) serve(entry string, ln net.Listener) error {
 		})
 		// The sniff timeout runs from here, so that the wait for a slot does
 		// not use it up.
-		go m.serveAccepted(c, a, cs, l, arrival{start: time.Now(), seq: seq, stripe: stripe})
+		s.startAt(time.Now())
+		go func() { _ = m.dispatchConn(s, l, a, cs) }()
 	}
 }
 
@@ -289,13 +297,19 @@ type admission struct {
 // accepted by Serve. With a PROXY protocol policy, it checks only that the
 // peer is not banned: serveConn calls the policy and applies the rules, to
 // the source of the header for a peer that sends one.
-func (m *Mux) admit(c net.Conn, l *listener, cs *connSettings) (admission, error) {
+func (m *Mux) admit(s *sniffer, l *listener, cs *connSettings) (result admission, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = NewPanicError(v)
+		}
+	}()
+	s.in.setPeer(s.conn.conn)
 	o := cs.opts
 	if o.listenerRate > 0 && !l.allow(o.listenerRate, o.listenerBurst, o.clock.Now()) {
 		return admission{}, ErrRateLimited
 	}
 	if o.proxyPolicy != nil {
-		if ap, ok := addrPort(c.RemoteAddr()); ok && m.bans.banned(ap.Addr(), m.bans.now(), records{max: -1}, "", false) {
+		if ap, ok := addrPort(s.in.peer); ok && m.bans.banned(ap.Addr(), m.bans.now(), records{max: -1}, "", false) {
 			// Records bound only clients: a trusted peer is never refused
 			// for having none.
 			return admission{}, ErrBanned
@@ -306,15 +320,15 @@ func (m *Mux) admit(c net.Conn, l *listener, cs *connSettings) (admission, error
 	if o.maxPendingPerClient <= 0 && cs.rate == nil && o.banFailures <= 0 && m.bans.size.Load() == 0 {
 		return a, nil
 	}
-	return m.admitClient(a, l.entry, c.RemoteAddr(), cs)
+	return m.admitClient(a, l.entry, s.in.peer, cs)
 }
 
 // proxyPolicyFor returns the PROXY protocol policy of o for c on entry.
-func proxyPolicyFor(o *options, entry string, c net.Conn) proxyproto.Policy {
+func proxyPolicyFor(o *options, in *Input) proxyproto.Policy {
 	if o.proxyPolicy == nil {
 		return proxyproto.Ignore
 	}
-	return o.proxyPolicy(entry, c.RemoteAddr(), c.LocalAddr())
+	return o.proxyPolicy(in.entry, in.peer, in.local)
 }
 
 // admitClient applies the per-client rules to client, the peer of a
@@ -355,7 +369,7 @@ func (m *Mux) freeAdmitted(a *admission) {
 // if any, toward banning the client, unless the client is a peer trusted to
 // send PROXY headers that sent none. It reports whether that banned the
 // client.
-func (m *Mux) releaseAdmitted(l *listener, a *admission, cs *connSettings, held bool, err error) (banned bool) {
+func (m *Mux) releaseAdmitted(l *listener, a *admission, cs *connSettings, held bool, err error) (bool, error) {
 	if held {
 		m.freeAdmitted(a)
 	}
@@ -363,35 +377,43 @@ func (m *Mux) releaseAdmitted(l *listener, a *admission, cs *connSettings, held 
 	// banned for its own failures, which would refuse every client behind
 	// it: only the sources of its headers are.
 	if a.proxied && !a.header {
-		return false
+		return false, err
 	}
 	if o := cs.opts; err != nil && o.banFailures > 0 && o.banTime > 0 && a.client.IsValid() && banWorthy(err) {
-		return m.bans.fail(cs.banKey(l.entry, a.client), m.bans.now(), o.banFailures, o.banWindow, o.banTime, o.records())
+		now, clockErr := clockNow(m.bans.clock)
+		if clockErr != nil {
+			return false, errors.Join(err, clockErr)
+		}
+		return m.bans.fail(cs.banKey(l.entry, a.client), now.Sub(m.bans.epoch), o.banFailures, o.banWindow, o.banTime, o.records()), err
 	}
-	return false
+	return false, err
 }
 
-// serveAccepted serves a connection from Serve in its own goroutine, which
-// then runs the handler of its route, if any.
-func (m *Mux) serveAccepted(c net.Conn, a admission, cs *connSettings, l *listener, at arrival) {
-	handler, conn, _ := m.serveConn(c, l, a, cs, l.entry, at)
+// dispatchConn releases admission and matching state before calling a handler.
+func (m *Mux) dispatchConn(s *sniffer, l *listener, a admission, cs *connSettings) error {
+	var delivery Event
+	handler, conn, err := m.serveConn(s, l, a, cs, &delivery)
 	if handler != nil {
-		_ = m.runHandler(handler, conn, cs)
+		return m.runHandler(handler, conn, cs, &delivery)
 	}
+	return err
 }
 
 // runHandler calls the handler of a route with conn, a connection of the
 // settings cs. A panic is recovered: the connection is closed and the panic
 // reported as a *PanicError, to the observer and to the caller.
-func (m *Mux) runHandler(handler func(*Conn), conn *Conn, cs *connSettings) (err error) {
+func (m *Mux) runHandler(handler func(*Conn), conn *Conn, cs *connSettings, delivery *Event) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			err = &PanicError{Value: p, Stack: debug.Stack()}
+			err = NewPanicError(p)
 			_ = conn.Close()
-			m.observeWith(cs.opts.observer, conn.event(err))
+		}
+		if err != nil && cs.opts.observer != nil {
+			delivery.Err = err
+			m.observeWith(cs.opts.observer, *delivery)
 		}
 	}()
-	handler(conn)
+	handler(conn.accepted())
 	return nil
 }
 
@@ -413,11 +435,11 @@ func (m *Mux) ServeConn(c net.Conn) error {
 }
 
 func (m *Mux) serveOne(entry string, c net.Conn) error {
-	at := arrival{start: time.Now(), stripe: newStripe()}
+	start, stripe := time.Now(), newStripe()
 	// Pending before the check, so that Shutdown, which stops taking
 	// connections before it waits for pending ones, either waits for this one
 	// or makes the check fail.
-	counts := m.total.at(at.stripe)
+	counts := m.total.at(stripe)
 	counts.pending.Add(1)
 	if m.quitting() {
 		counts.pending.Add(-1)
@@ -426,11 +448,9 @@ func (m *Mux) serveOne(entry string, c net.Conn) error {
 	}
 	counts.accepted.Add(1)
 	cs := m.settings(entry)
-	handler, conn, err := m.serveConn(c, nil, admission{}, cs, entry, at)
-	if handler != nil {
-		err = m.runHandler(handler, conn, cs)
-	}
-	return err
+	s := newSniffer(&Conn{conn: c, entry: entry, stripe: stripe}, cs.opts, start)
+	m.undelivered.add(s)
+	return m.dispatchConn(s, nil, admission{}, cs)
 }
 
 // Shutdown stops taking new connections, closes the listeners, and waits until
@@ -472,43 +492,72 @@ func (m *Mux) Shutdown(ctx context.Context) error {
 
 // Close closes the listeners and every connection that was not delivered yet.
 // Routes then return net.ErrClosed from Accept. Delivered connections are not
-// affected. It returns the first error from closing a listener.
+// affected. The caller that closes the listeners receives their first error.
+// An overlapping or reentrant call returns net.ErrClosed while resources
+// are being closed. Calls after closure completes return nil.
 func (m *Mux) Close() error {
-	var err error
-	m.closeOnce.Do(func() {
-		// Changes applied before closed is set install routes that are
-		// closed here; later ones close the routes they add themselves.
-		m.mu.Lock()
-		m.closed.Store(true)
-		routes := m.table.Load().order
+	m.mu.Lock()
+	if m.closed.Load() {
 		m.mu.Unlock()
-		err = m.stop()
-		// Each route has its own done channel, so that Accept and dispatch
-		// do not contend on a channel shared by the whole Mux.
-		for _, r := range routes {
-			r.closeListener()
+		select {
+		case <-m.closeDone:
+		default:
+			return net.ErrClosed
 		}
-		m.undelivered.closeAll()
-	})
-	return err
+		select {
+		case <-m.listenersDone:
+			return nil
+		default:
+			return net.ErrClosed
+		}
+	}
+	m.closed.Store(true)
+	for _, r := range m.table.Load().order {
+		r.closeListener()
+	}
+	listeners := m.detachListeners()
+	m.mu.Unlock()
+	err := m.closeListeners(listeners)
+	m.undelivered.closeAll()
+	close(m.closeDone)
+	select {
+	case <-m.listenersDone:
+		return err
+	default:
+		return net.ErrClosed
+	}
 }
 
-// stop stops taking new connections and closes the listeners.
-func (m *Mux) stop() error {
-	var err error
-	m.quitOnce.Do(func() {
-		m.mu.Lock()
+// detachListeners stops admission under m.mu. The caller closes the
+// detached listeners after releasing the lock, so their methods may reenter.
+func (m *Mux) detachListeners() map[*listener]net.Listener {
+	listeners := m.listeners
+	if listeners != nil {
 		close(m.quit)
-		lns := m.listeners
 		m.listeners = nil
-		m.mu.Unlock()
-		for ln := range lns {
-			if cerr := ln.Close(); cerr != nil && err == nil {
-				err = cerr
-			}
+	}
+	return listeners
+}
+
+func (m *Mux) closeListeners(listeners map[*listener]net.Listener) error {
+	if listeners == nil {
+		return nil
+	}
+	defer close(m.listenersDone)
+	var first error
+	for _, ln := range listeners {
+		if err := ln.Close(); err != nil && first == nil {
+			first = err
 		}
-	})
-	return err
+	}
+	return first
+}
+
+func (m *Mux) stop() error {
+	m.mu.Lock()
+	listeners := m.detachListeners()
+	m.mu.Unlock()
+	return m.closeListeners(listeners)
 }
 
 func (m *Mux) quitting() bool {
@@ -526,14 +575,14 @@ func (m *Mux) addListener(ln net.Listener, l *listener) bool {
 	if m.listeners == nil {
 		return false
 	}
-	m.listeners[ln] = l
+	m.listeners[l] = ln
 	m.serving.Add(1)
 	return true
 }
 
-func (m *Mux) removeListener(ln net.Listener) {
+func (m *Mux) removeListener(l *listener, ln net.Listener) {
 	m.mu.Lock()
-	delete(m.listeners, ln)
+	delete(m.listeners, l)
 	m.mu.Unlock()
 	_ = ln.Close()
 }
@@ -542,13 +591,13 @@ func (m *Mux) removeListener(ln net.Listener) {
 // entry when none are given, or a combined address when there are several.
 func (m *Mux) addr(entries []string) net.Addr {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	addrs := make(listenAddrs, 0, len(m.listeners))
-	for _, l := range m.listeners {
+	for l := range m.listeners {
 		if len(entries) == 0 || slices.Contains(entries, l.entry) {
 			addrs = append(addrs, l.addr)
 		}
 	}
+	m.mu.Unlock()
 	if len(addrs) == 1 {
 		return addrs[0]
 	}
@@ -582,22 +631,32 @@ func addrString(a net.Addr) string {
 // exits, and waits. It reports false when the Mux stops taking connections.
 // The limit, which bounds the Mux as a whole, is read again at each try, so
 // that a higher one lets a waiting Serve go on.
-func (m *Mux) acquireSlot() bool {
-	if m.slots.tryAcquire(m.options().maxPending) {
+func (m *Mux) acquireSlot(s *sniffer) bool {
+	try := func() bool {
+		sh := m.undelivered.shard(s)
+		sh.mu.Lock()
+		defer sh.mu.Unlock()
+		if !m.slots.tryAcquire(m.options().maxPending) {
+			return false
+		}
+		sh.idle.insert(s)
 		return true
 	}
-	m.undelivered.evictOldest()
+	if try() {
+		return true
+	}
 	m.slots.waiters.Add(1)
 	defer m.slots.waiters.Add(-1)
 	for {
 		// Checked after registering as a waiter, so that no release is
 		// missed.
-		if m.slots.tryAcquire(m.options().maxPending) {
+		if try() {
 			if m.slots.waiters.Load() > 1 {
 				m.slots.signal() // another slot may be free for the next waiter
 			}
 			return true
 		}
+		m.undelivered.evictOldest()
 		select {
 		case <-m.slots.free:
 		case <-m.quit:

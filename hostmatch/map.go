@@ -1,9 +1,11 @@
 package hostmatch
 
 import (
+	"errors"
+
+	"github.com/djylb/portmux/internal/panicerr"
 	"iter"
 	"strings"
-	"sync"
 	"sync/atomic"
 
 	"github.com/djylb/portmux/internal/pmap"
@@ -46,12 +48,11 @@ type Snapshot[V any] struct {
 }
 
 // Map is a Snapshot that changes in place: Set and Delete publish a new
-// Snapshot, which lookups then see. Lookups take no lock; changes are
-// serialised. Its zero value is an empty map ready to use. Use Edit to
-// apply many changes as one.
+// Snapshot, which lookups then see. Lookups take no lock. Concurrent writers
+// publish by compare-and-swap. Its zero value is ready to use. Use TryEdit
+// to apply many changes as one.
 type Map[V any] struct {
 	cur atomic.Pointer[Snapshot[V]]
-	mu  sync.Mutex // serialises changes
 }
 
 // hostEntry is a pattern, as it compares, and its value.
@@ -317,19 +318,12 @@ func (b *MapBuilder[V]) Set(pattern string, v V) {
 }
 
 // Update sets pattern to what fn returns for its value, and whether it had
-// one, looking an exact name up once. It panics on a pattern that
+// one. The callback may snapshot or edit b. It panics on a pattern that
 // CheckPattern refuses.
 func (b *MapBuilder[V]) Update(pattern string, fn func(old V, ok bool) V) {
 	mustPattern(pattern)
-	p := parseHostPattern(pattern)
-	if p.kind != patternExact {
-		old, ok := b.Get(pattern)
-		b.Set(pattern, fn(old, ok))
-		return
-	}
-	edit(&b.exact, b.base.exact).Update(p.key, func(e hostEntry[V], ok bool) hostEntry[V] {
-		return hostEntry[V]{pattern: p.key, value: fn(e.value, ok)}
-	})
+	old, ok := b.Get(pattern)
+	b.Set(pattern, fn(old, ok))
 }
 
 // Delete removes pattern and reports whether it was set.
@@ -394,27 +388,53 @@ func (b *MapBuilder[V]) Snapshot() *Snapshot[V] {
 // is.
 func (m *Map[V]) Load() *Snapshot[V] { return m.cur.Load() }
 
-// Edit applies the changes that fn makes to b as one: lookups see all of
-// them or none. fn must not call methods of m.
-func (m *Map[V]) Edit(fn func(b *MapBuilder[V])) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	b := m.cur.Load().Builder()
+// PanicError describes a panic recovered from an edit callback.
+type PanicError = panicerr.PanicError
+
+// ErrEditConflict reports that another edit published a snapshot first.
+var ErrEditConflict = errors.New("hostmatch: snapshot changed during edit")
+
+// TryEdit applies the changes that fn makes to b as one: lookups see all of
+// them or none. It calls fn once, outside any lock. If a concurrent edit
+// published first, it returns ErrEditConflict. A callback panic returns a
+// *PanicError. Either error discards the entire batch.
+func (m *Map[V]) TryEdit(fn func(b *MapBuilder[V])) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = panicerr.New(v)
+		}
+	}()
+	if !m.tryEdit(fn) {
+		return ErrEditConflict
+	}
+	return nil
+}
+
+func (m *Map[V]) tryEdit(fn func(b *MapBuilder[V])) bool {
+	old := m.cur.Load()
+	b := old.Builder()
 	fn(b)
-	m.cur.Store(b.Snapshot())
+	next := b.Snapshot()
+	return m.cur.CompareAndSwap(old, next)
 }
 
 // Set maps pattern to v, replacing the value it had. It panics on a
 // pattern that CheckPattern refuses.
 func (m *Map[V]) Set(pattern string, v V) {
-	mustPattern(pattern)
-	m.Edit(func(b *MapBuilder[V]) { b.Set(pattern, v) })
+	for {
+		if m.tryEdit(func(b *MapBuilder[V]) { b.Set(pattern, v) }) {
+			return
+		}
+	}
 }
 
 // Delete removes pattern and reports whether it was set.
 func (m *Map[V]) Delete(pattern string) (deleted bool) {
-	m.Edit(func(b *MapBuilder[V]) { deleted = b.Delete(pattern) })
-	return deleted
+	for {
+		if m.tryEdit(func(b *MapBuilder[V]) { deleted = b.Delete(pattern) }) {
+			return deleted
+		}
+	}
 }
 
 // Get returns the value of pattern itself, without matching.

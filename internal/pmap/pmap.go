@@ -458,20 +458,9 @@ func (b *Builder[V]) Set(key string, v V) {
 	}
 }
 
-// Update sets key to what fn returns for its value, and whether it had one,
-// looking key up once.
+// Update sets key to the result of fn. The callback may snapshot or edit b.
 func (b *Builder[V]) Update(key string, fn func(old V, ok bool) V) {
-	if b.gathering(0) {
-		if i, ok := b.index[key]; ok {
-			b.list[i].val = fn(b.list[i].val, true)
-			return
-		}
-		var zero V
-		b.index[key] = len(b.list)
-		b.list = append(b.list, slot[V]{key: key, val: fn(zero, false)})
-		return
-	}
-	old, ok := b.m.Get(key)
+	old, ok := b.Get(key)
 	b.Set(key, fn(old, ok))
 }
 

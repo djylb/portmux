@@ -144,3 +144,23 @@ func TestUpdate(t *testing.T) {
 		}
 	}
 }
+
+func TestGatherPanicKeepsIndex(t *testing.T) {
+	b := Map[int]{}.Builder()
+	b.Grow(8)
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("callback did not panic")
+			}
+		}()
+		b.Update("x", func(int, bool) int { panic("value") })
+	}()
+	if _, ok := b.Get("x"); ok {
+		t.Fatal("published incomplete value")
+	}
+	b.Set("x", 1)
+	if value, ok := b.Map().Get("x"); !ok || value != 1 {
+		t.Fatal(value, ok)
+	}
+}

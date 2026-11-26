@@ -9,8 +9,7 @@ import (
 	"strings"
 )
 
-// Set matches host names against patterns, as nginx and Envoy match server
-// names:
+// Set matches host names against these patterns:
 //
 //   - an exact name, such as "example.com";
 //   - "*.example.com", any name below example.com, at any depth, but not

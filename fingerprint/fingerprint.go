@@ -184,6 +184,9 @@ func MatchJA3(fingerprints ...string) Filter {
 // filter hashes the hello only when the first part of its fingerprint, which
 // costs nothing to compute, is that of one of the filter's.
 func (f Filter) Match(h *tlshello.Hello) bool {
+	if len(f.fingerprints) == 0 {
+		return false
+	}
 	if f.ja4 {
 		a := ja4A(h)
 		found := false

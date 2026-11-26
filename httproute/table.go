@@ -3,6 +3,8 @@ package httproute
 import (
 	"cmp"
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/djylb/netx/forwarded"
 	"github.com/djylb/netx/httprewrite"
+	"github.com/djylb/portmux"
 	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/internal/pmap"
@@ -93,7 +96,7 @@ type transportKey struct {
 	maxResponseHeader     int64
 	disableKeepAlives     bool
 	http2                 bool
-	tls                   bool
+	tlsPolicy             *upstream
 }
 
 // defaultUpgrades are the upgrades of a Route without Upgrades; it is
@@ -363,7 +366,7 @@ func checkOverlap(pattern string, run []*route) error {
 	}
 	groups := map[string][]*route{}
 	for _, rt := range run {
-		k := rt.pathKey()
+		k := rt.pathGroup()
 		groups[k] = append(groups[k], rt)
 	}
 	for _, g := range groups {
@@ -377,13 +380,13 @@ func checkOverlap(pattern string, run []*route) error {
 func checkPairs(pattern string, list []*route) error {
 	for j, b := range list {
 		for _, a := range list[:j] {
-			if a.level() != b.level() || a.pathKey() != b.pathKey() || a.ci != b.ci {
+			if !a.coversPath(b) {
 				continue
 			}
 			if !covers(a, b) {
 				continue
 			}
-			if covers(b, a) {
+			if b.coversPath(a) && covers(b, a) {
 				return invalid("routes %s and %s match the same requests for host %q", a.label(), b.label(), pattern)
 			}
 			return invalid("route %s never matches for host %q: route %s before it matches all it does", b.label(), pattern, a.label())
@@ -424,9 +427,15 @@ func compileUpstream(u Upstream) (*upstream, error) {
 }
 
 func (u *upstream) key() transportKey {
+	// TLS configs can contain callbacks and mutable trust stores. Only an unchanged
+	// compiled upstream can carry its verified connections to the next table.
+	var policy *upstream
+	if u.TLS != nil {
+		policy = u
+	}
 	return transportKey{
 		name:                  u.Name,
-		tls:                   u.TLS != nil,
+		tlsPolicy:             policy,
 		dialTimeout:           u.DialTimeout,
 		responseHeaderTimeout: u.ResponseHeaderTimeout,
 		idleConnTimeout:       u.IdleConnTimeout,
@@ -439,7 +448,10 @@ func (u *upstream) key() transportKey {
 }
 
 func invalidRoute(name string, err error) error {
-	return invalid("route %s: %s", name, strings.TrimPrefix(err.Error(), ErrInvalidConfig.Error()+": "))
+	if errors.Is(err, ErrInvalidConfig) {
+		return fmt.Errorf("route %s: %w", name, err)
+	}
+	return fmt.Errorf("%w: route %s: %w", ErrInvalidConfig, name, err)
 }
 
 func checkUpstream(u Upstream) error {
@@ -498,18 +510,37 @@ func subset(a, b []string) bool {
 	return true
 }
 
-func (rt *route) pathKey() string {
-	switch {
-	case rt.re != nil:
+// Runs already share the path level, length and raw-prefix mode.
+func (rt *route) pathGroup() string {
+	if rt.re != nil {
 		return rt.re.String()
-	case rt.ci && rt.raw:
-		return strings.ToLower(rt.path) + "*"
-	case rt.ci:
-		return strings.ToLower(rt.path)
-	case rt.raw:
-		return rt.path + "*"
 	}
-	return rt.path
+	return asciiLower(rt.path)
+}
+
+func (rt *route) coversPath(b *route) bool {
+	if rt.re != nil {
+		return rt.re.String() == b.re.String()
+	}
+	if rt.ci {
+		return asciiFoldPrefix(rt.path, b.path)
+	}
+	return rt.path == b.path && (!b.ci || !strings.ContainsAny(b.path, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"))
+}
+
+func asciiLower(s string) string {
+	for i := range len(s) {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			b := []byte(s)
+			for j := i; j < len(b); j++ {
+				if b[j] >= 'A' && b[j] <= 'Z' {
+					b[j] += 32
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
 }
 
 func b2i(b bool) int {
@@ -526,7 +557,13 @@ func (rt *route) label() string {
 	return "#" + strconv.Itoa(rt.order)
 }
 
-func (cm *common) compile(r *Route, upstreams *pmap.Builder[upstreamEntry]) (*route, error) {
+func (cm *common) compile(r *Route, upstreams *pmap.Builder[upstreamEntry]) (compiled *route, compileErr error) {
+	defer func() {
+		if v := recover(); v != nil {
+			compiled = nil
+			compileErr = portmux.NewPanicError(v)
+		}
+	}()
 	rt := &route{name: r.Name, path: r.Path, exact: r.Exact, ci: r.CaseInsensitivePath,
 		methods: r.Methods, https: r.RedirectHTTPS, maxBody: r.MaxRequestBody,
 		idle: r.UpgradeIdleTimeout, response: r.ResponseHeaders}
@@ -539,7 +576,7 @@ func (cm *common) compile(r *Route, upstreams *pmap.Builder[upstreamEntry]) (*ro
 		}
 		src := r.PathRegexp
 		if r.CaseInsensitivePath {
-			src = "(?i)" + src
+			return nil, invalid("CaseInsensitivePath requires a literal Path; specify case matching in PathRegexp")
 		}
 		re, err := regexp.Compile(src)
 		if err != nil {
@@ -595,6 +632,9 @@ func (cm *common) compile(r *Route, upstreams *pmap.Builder[upstreamEntry]) (*ro
 		}
 	}
 	for _, h := range r.Headers {
+		if strings.EqualFold(h.Name, "Host") {
+			return nil, invalid("use Hosts to match Host")
+		}
 		if !isToken(h.Name) {
 			return nil, invalid("header field name %q is not a token", h.Name)
 		}

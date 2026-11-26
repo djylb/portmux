@@ -32,7 +32,7 @@ func (m *Mux) Snapshot() Snapshot {
 		snap.Routes[i] = r.info(t)
 	}
 	m.mu.Lock()
-	for _, l := range m.listeners {
+	for l := range m.listeners {
 		snap.Listeners = append(snap.Listeners, ListenerInfo{Entry: l.entry, Addr: l.addr, Stats: l.counts.stats()})
 	}
 	m.mu.Unlock()
@@ -240,11 +240,11 @@ type Event struct {
 	// Err is why the connection was closed, or the Accept error; it is nil
 	// for a delivered connection. A delivered connection whose route handler
 	// panics is reported once more, after its delivery, with its Route and
-	// a *PanicError; that event is not counted in Stats again.
+	// a *PanicError; that event is not counted in Stats again. A close event
+	// reports a *PanicError and zero Duration if its clock panicked.
 	Err error
 	// Elapsed is the time from taking the connection, as in
-	// WithSniffTimeout, to the decision, by the monotonic clock, whose ticks are coarse on some systems such as
-	// Windows.
+	// WithSniffTimeout, to the decision, measured by the monotonic clock.
 	Elapsed time.Duration
 	// Sniffed is the number of bytes read while matching, including a PROXY
 	// header.
@@ -266,7 +266,7 @@ type Event struct {
 	// Duration, Read and Written, of an event of WithCloseEvents that
 	// Closed reports, tell how long after its delivery the connection was
 	// closed with Conn.Close, and how many bytes it returned to its server
-	// and took from it.
+	// and took from it. In-flight I/O delays the event until its byte count is known.
 	Duration time.Duration
 	Read     int64
 	Written  int64
@@ -295,9 +295,18 @@ func (m *Mux) observe(ev Event) {
 }
 
 // observeWith passes ev to fn, the observer of the settings that ev is of,
-// unless fn is nil or ev reports a failure after the Mux was closed.
+// unless fn is nil or ev reports a rejection after the Mux was closed.
+// Events of already delivered connections retain their observer.
 func (m *Mux) observeWith(fn func(Event), ev Event) {
-	if fn != nil && (ev.Err == nil || !m.closed.Load()) {
+	if fn != nil && (ev.Route != nil || ev.Err == nil || !m.closed.Load()) {
+		defer func() {
+			if v := recover(); v != nil {
+				m.observerPanic.Store(NewPanicError(v))
+			}
+		}()
 		fn(ev)
 	}
 }
+
+// LastObserverPanic reports the most recent observer panic, or nil. The returned error is read-only.
+func (m *Mux) LastObserverPanic() *PanicError { return m.observerPanic.Load() }

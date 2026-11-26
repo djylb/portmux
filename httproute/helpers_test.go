@@ -15,13 +15,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/djylb/netx/httprewrite"
+	"github.com/djylb/portmux/internal/leakcheck"
 )
 
 // checkLeaks fails the test when goroutines that it started are still
@@ -29,34 +29,7 @@ import (
 // runs last.
 func checkLeaks(t *testing.T) {
 	t.Helper()
-	base, _ := goroutines()
-	t.Cleanup(func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			n, stacks := goroutines()
-			if n <= base {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("%d goroutines, %d before:\n%s", n, base, stacks)
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	})
-}
-
-// goroutines counts the goroutines, without the one that js/wasm runs for
-// events now and then, and returns their stacks.
-func goroutines() (int, string) {
-	buf := make([]byte, 1<<20)
-	stacks := string(buf[:runtime.Stack(buf, true)])
-	n := 0
-	for g := range strings.SplitSeq(stacks, "\n\n") {
-		if strings.HasPrefix(g, "goroutine ") && !strings.Contains(g, "runtime.handleEvent") {
-			n++
-		}
-	}
-	return n, stacks
+	leakcheck.Check(t)
 }
 
 // backend starts an HTTP server for h and returns an upstream that dials it.
@@ -102,7 +75,7 @@ func startRouter(t *testing.T, o Options, c Config) (*Router, string) {
 // client returns an HTTP client whose idle connections close with the test.
 func client(t *testing.T) *http.Client {
 	t.Helper()
-	tr := &http.Transport{DisableCompression: true}
+	tr := &http.Transport{DialContext: (&net.Dialer{}).DialContext, DisableCompression: true}
 	t.Cleanup(tr.CloseIdleConnections)
 	return &http.Client{Transport: tr, Timeout: 10 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}

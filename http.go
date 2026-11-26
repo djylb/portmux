@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 
+	wire "github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux/hostmatch"
 	"github.com/djylb/portmux/httphead"
 )
@@ -38,16 +39,15 @@ func (h httpMatcher) String() string { return call("HTTP1", h, describe[HTTPFilt
 // without a host. It panics on a pattern that hostmatch.CheckPattern
 // refuses.
 func Host(patterns ...string) HTTPFilter {
-	return hostFilter{patterns: slices.Clone(patterns), hosts: hostSet(patterns)}
+	return hostFilter{hosts: hostmatch.NewSet(patterns...)}
 }
 
 type hostFilter struct {
-	patterns []string
-	hosts    *hostmatch.Set
+	hosts *hostmatch.Set
 }
 
 func (f hostFilter) Match(r *httphead.Request) bool { return f.hosts.MatchName(r.Name()) }
-func (f hostFilter) String() string                 { return call("Host", f.patterns, quote) }
+func (f hostFilter) String() string                 { return call("Host", f.hosts.Patterns(), quote) }
 
 // Method accepts requests with one of the methods. Methods are case-sensitive.
 func Method(methods ...string) HTTPFilter {
@@ -157,7 +157,7 @@ func (f headerRegexpFilter) Match(r *httphead.Request) bool {
 }
 
 func (f headerRegexpFilter) String() string {
-	return call("HeaderRegexp", []string{f.name, f.re.String()}, quote)
+	return call("HeaderRegexp", []string{f.name, regexpText(f.re)}, quote)
 }
 
 // regexpFilter matches a value of a request or hello with a regular
@@ -178,7 +178,7 @@ func newRegexpFilter[T any](name string, re *regexp.Regexp, match func(T, *regex
 
 func (f regexpFilter[T]) Match(v T) bool { return f.match(v, f.re) }
 
-func (f regexpFilter[T]) String() string { return call(f.name, []string{f.re.String()}, quote) }
+func (f regexpFilter[T]) String() string { return call(f.name, []string{regexpText(f.re)}, quote) }
 
 func (f listFilter) String() string { return call(f.name, f.values, quote) }
 
@@ -227,8 +227,7 @@ func (webSocketFilter) Match(r *httphead.Request) bool {
 func (webSocketFilter) String() string { return "WebSocket()" }
 
 func hasToken(list string, tokens []string) bool {
-	for part := range strings.SplitSeq(list, ",") {
-		part = strings.Trim(part, " \t")
+	for part := range wire.Tokens(list) {
 		for _, t := range tokens {
 			if strings.EqualFold(part, t) {
 				return true

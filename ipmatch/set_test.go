@@ -29,7 +29,7 @@ func TestSetMatchesLinearLookup(t *testing.T) {
 		netip.MustParsePrefix("::ffff:198.51.100.0/120"),
 		netip.MustParsePrefix("ffff::/16"))
 	set := NewSet(prefixes...)
-	if set.ranges == nil {
+	if set.index == nil {
 		t.Fatal("no ranges for a long list")
 	}
 	linear := func(a netip.Addr) bool {

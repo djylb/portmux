@@ -1,8 +1,10 @@
 package portmux
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"regexp"
 	"regexp/syntax"
 	"strconv"
@@ -71,17 +73,21 @@ func (e *ParseError) Unwrap() error { return e.Err }
 //
 //	And(RemoteIP(10.0.0.0/8), TLS(SNI("*.example.com"), MinTLSVersion(1.2)))
 //
-// so that routes can be kept in configuration files and databases: every
-// built-in matcher and filter prints text that ParseMatcher turns into an
-// equal matcher, except RemoteIPFunc and LocalIPFunc, whose functions have no
-// text; name them in names to keep them as text. Strings are Go string literals; prefixes, ports, durations
-// and versions are written bare. names, which may be nil, supplies the
-// matchers and filters of your own.
+// FormatMatcher produces text for built-in rules. Strings are Go string
+// literals. Prefixes, ports, durations and versions are written bare.
+// names, which may be nil, supplies custom matchers and filters. A panic
+// in a registered factory is returned as a *PanicError.
 //
 // Calls nest at most 100 deep, and regular expressions are limited to about
 // 1000 instructions, so that a rule cannot exhaust the stack or make each
 // connection cost much; build larger ones in code.
-func ParseMatcher(text string, names *Names) (Matcher, error) {
+func ParseMatcher(text string, names *Names) (m Matcher, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			m = nil
+			err = NewPanicError(v)
+		}
+	}()
 	p := &parser{text: text, names: names}
 	if names == nil {
 		p.names = &Names{}
@@ -91,6 +97,92 @@ func ParseMatcher(text string, names *Names) (Matcher, error) {
 		return nil, err
 	}
 	return p.matcher(n)
+}
+
+var errUnrepresentable = errors.New("portmux: matcher has no built-in text representation within the nesting limit")
+
+// FormatMatcher returns reloadable text for a rule composed entirely of
+// built-in matchers and filters, within the limits of ParseMatcher.
+// For custom rules, persist the original configuration text and parse it
+// with the same Names. Named descriptions are for display.
+func FormatMatcher(m Matcher) (string, error) {
+	if !portableRule(m, 1) {
+		return "", errUnrepresentable
+	}
+	text := describe(m)
+	if _, err := ParseMatcher(text, nil); err != nil {
+		return "", err
+	}
+	return text, nil
+}
+
+// portableRule checks the entire tree before invoking any String method.
+// In particular a custom description can spell a different built-in rule.
+func portableRule(v any, depth int) bool {
+	if depth > maxParseDepth {
+		return false
+	}
+	switch v := v.(type) {
+	case andMatcher:
+		return portableChildren([]Matcher(v), depth)
+	case orMatcher:
+		return portableChildren([]Matcher(v), depth)
+	case notMatcher:
+		return portableRule(v.m, depth+1)
+	case httpMatcher:
+		return portableChildren([]HTTPFilter(v), depth)
+	case http2Matcher:
+		return portableChildren([]HTTPFilter(v), depth)
+	case tlsMatcher:
+		return portableChildren([]TLSFilter(v), depth)
+	case filterSet[*httphead.Request]:
+		return portableChildren(v.filters, depth)
+	case filterSet[*tlshello.Hello]:
+		return portableChildren(v.filters, depth)
+	case ipMatcher:
+		return v.set != nil
+	case *regexpMatcher:
+		return v != nil
+	case headerRegexpFilter, regexpFilter[*httphead.Request], regexpFilter[*tlshello.Hello]:
+		return true
+	case alwaysMatcher, anyMatcher, prefixMatcher, binaryMatcher, domainMatcher, portMatcher, silentMatcher,
+		hostFilter, listFilter, queryFilter, headerFilter, webSocketFilter, sniFilter, minVersionFilter, alpnFilter:
+		return true
+	default:
+		return false
+	}
+}
+
+// regexpText makes POSIX line anchors and character classes explicit in
+// the syntax used by ParseMatcher. Leftmost-longest selection does not
+// affect the boolean result used by any matcher.
+func regexpText(re *regexp.Regexp) string {
+	src := re.String()
+	regular, err := regexp.Compile(src)
+	if err == nil {
+		if reflect.DeepEqual(re, regular) {
+			return src
+		}
+		regular.Longest()
+		if reflect.DeepEqual(re, regular) {
+			return src
+		}
+	}
+	// CompilePOSIX is the only other constructor dialect.
+	tree, err := syntax.Parse(src, syntax.POSIX)
+	if err == nil {
+		return tree.String()
+	}
+	return src
+}
+
+func portableChildren[T any](children []T, depth int) bool {
+	for _, v := range children {
+		if !portableRule(v, depth+1) {
+			return false
+		}
+	}
+	return true
 }
 
 // node is a parsed call, bare word or string.
@@ -382,7 +474,7 @@ func (p *parser) matcher(n *node) (Matcher, error) {
 func custom[T any](p *parser, n *node, funcs map[string]func(args ...string) (T, error), kind string) (T, error) {
 	var zero T
 	build, ok := funcs[n.text]
-	if !ok {
+	if !ok || build == nil {
 		return zero, p.fail(n.pos, "unknown %s %s", kind, n.text)
 	}
 	args, err := each(n.args, func(a *node) (string, error) {

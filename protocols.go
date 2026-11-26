@@ -3,6 +3,8 @@ package portmux
 import (
 	"bytes"
 	"encoding/binary"
+	"regexp"
+	"unicode/utf8"
 )
 
 // SOCKS5 matches SOCKS5 clients by their greeting: version 5 and a non-empty
@@ -56,6 +58,9 @@ func matchSOCKS4(b []byte) Result {
 	}
 	// SOCKS4a: an address of 0.0.0.x with x != 0 is followed by a host name.
 	if b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] != 0 {
+		if len(rest) > 0 && rest[0] == 0 {
+			return NoMatch
+		}
 		if _, res = cutNulField(rest); res != Match {
 			return res
 		}
@@ -139,7 +144,16 @@ func matchMQTT(b []byte) Result {
 	if i >= len(b) {
 		return NeedMore
 	}
-	return matchPrefixes(b[i+1:], mqttProtocols)
+	length := 0
+	for j := 1; j <= i; j++ {
+		length |= int(b[j]&127) << (7 * (j - 1))
+	}
+	payload := b[i+1:]
+	res := matchPrefixes(payload[:min(len(payload), length)], mqttProtocols)
+	if res == NeedMore && (length < 7 || len(payload) >= length) {
+		return NoMatch
+	}
+	return res
 }
 
 // RDP matches Remote Desktop clients by the X.224 connection request that
@@ -205,7 +219,8 @@ func matchIf(ok bool) Result {
 // XMPP matches XMPP clients and servers by the stream header they open with,
 // an optional XML declaration and a stream:stream element in the jabber:client
 // or jabber:server namespace, or that of a component. It decides once the
-// stream element is complete, and rules out a stream header longer than 2 KiB.
+// stream element is complete. It requires both the stream prefix binding
+// and the default content namespace, and rules out headers longer than 2 KiB.
 func XMPP() Matcher {
 	return binaryMatcher{name: "XMPP", match: matchXMPP}
 }
@@ -214,6 +229,8 @@ func XMPP() Matcher {
 // so that a header sent a byte at a time is not scanned again at length on
 // every read.
 const maxXMPPHeader = 2 << 10
+
+const xmlns = "xmlns"
 
 func matchXMPP(b []byte) Result {
 	res := matchXMPPHeader(b[:min(len(b), maxXMPPHeader)])
@@ -240,16 +257,281 @@ func matchXMPPHeader(b []byte) Result {
 		if !ok {
 			return NeedMore
 		}
+		if !xmppDeclaration.Match(b[:len(b)-len(after)]) {
+			return NoMatch
+		}
 		rest = bytes.TrimLeft(after, " \t\r\n")
 		if res := matchPrefixes(rest, []string{stream}); res != Match {
 			return res
 		}
 	}
-	end := bytes.IndexByte(rest, '>')
-	if end < 0 {
-		return NeedMore
+	var quote byte
+	for i, c := range rest {
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '>':
+			return matchIf(xmppAttributes(rest[len(stream):i]))
+		}
 	}
-	return matchIf(bytes.Contains(rest[:end], []byte("jabber:")))
+	return NeedMore
+}
+
+// XML declarations in XMPP use XML 1.0 and UTF-8.
+var xmppDeclaration = regexp.MustCompile(`^<\?xml[ \t\r\n]+version[ \t\r\n]*=[ \t\r\n]*('1\.0'|"1\.0")([ \t\r\n]+encoding[ \t\r\n]*=[ \t\r\n]*(?i:'UTF-8'|"UTF-8"))?([ \t\r\n]+standalone[ \t\r\n]*=[ \t\r\n]*('yes'|'no'|"yes"|"no"))?[ \t\r\n]*\?>$`)
+
+// streamAttrs scans one bounded start tag. A nil name marks the end.
+type streamAttrs []byte
+
+func (a *streamAttrs) next() (name, value []byte, valid bool) {
+	const space = " \t\r\n"
+	rest := bytes.TrimLeft(*a, space)
+	if len(rest) == 0 {
+		return nil, nil, true
+	}
+	if len(rest) == len(*a) {
+		return nil, nil, false
+	}
+	i := bytes.IndexAny(rest, "="+space)
+	if i < 1 {
+		return nil, nil, false
+	}
+	name = rest[:i]
+	rest = bytes.TrimLeft(rest[i:], space)
+	if len(rest) == 0 || rest[0] != '=' {
+		return nil, nil, false
+	}
+	rest = bytes.TrimLeft(rest[1:], space)
+	if len(rest) == 0 || rest[0] != '\'' && rest[0] != '"' {
+		return nil, nil, false
+	}
+	end := bytes.IndexByte(rest[1:], rest[0])
+	if end < 0 {
+		return nil, nil, false
+	}
+	*a = rest[2+end:]
+	return name, rest[1 : 1+end], true
+}
+
+const (
+	xmlNS    = "http://www.w3.org/XML/1998/namespace"
+	xmlnsNS  = "http://www.w3.org/2000/xmlns/"
+	streamNS = "http://etherx.jabber.org/streams"
+)
+
+func xmppAttributes(header []byte) bool {
+	var namespace, stream bool
+	var seen uint64
+	for attrs := streamAttrs(header); ; {
+		prior := streamAttrs(header[:len(header)-len(attrs)])
+		name, value, ok := attrs.next()
+		if !ok || name == nil {
+			return ok && namespace && stream
+		}
+		prefix, local := xmlParts(name)
+		if !xmlName(local) || len(prefix) > 0 && !xmlName(prefix) || !validXMLValue(value) {
+			return false
+		}
+		uri := xmlAttrNS(prefix, header)
+		if len(prefix) > 0 && len(uri) == 0 {
+			return false
+		}
+
+		// Only a repeated bit needs the exact expanded-name check.
+		bit := uint64(1) << ((int(local[0]) + len(local)) % 64)
+		if seen&bit != 0 && prior.contains(local, uri, header) {
+			return false
+		}
+		seen |= bit
+		switch {
+		case string(name) == xmlns:
+			switch {
+			case xmlValueEqual(value, []byte("jabber:client")), xmlValueEqual(value, []byte("jabber:server")),
+				xmlValueEqual(value, []byte("jabber:component:accept")), xmlValueEqual(value, []byte("jabber:component:connect")):
+				namespace = true
+			default:
+				return false
+			}
+		case string(name) == "xmlns:stream":
+			stream = xmlValueEqual(value, []byte(streamNS))
+		case string(prefix) == xmlns:
+			if len(value) == 0 || string(local) == xmlns || (string(local) == "xml") != xmlValueEqual(value, []byte(xmlNS)) || xmlValueEqual(value, []byte(xmlnsNS)) {
+				return false
+			}
+		}
+	}
+}
+
+func xmlParts(name []byte) (prefix, local []byte) {
+	prefix, local, ok := bytes.Cut(name, []byte(":"))
+	if !ok {
+		return nil, name
+	}
+	if len(prefix) == 0 {
+		return nil, nil
+	}
+	return prefix, local
+}
+
+func (a *streamAttrs) contains(local, uri, header []byte) bool {
+	for {
+		name, _, ok := a.next()
+		if !ok || name == nil {
+			return false
+		}
+		p, l := xmlParts(name)
+		if bytes.Equal(local, l) && xmlValueEqual(uri, xmlAttrNS(p, header)) {
+			return true
+		}
+	}
+}
+
+var xmlNamespace, xmlnsNamespace = []byte(xmlNS), []byte(xmlnsNS)
+
+func xmlAttrNS(prefix, header []byte) []byte {
+	switch string(prefix) {
+	case "":
+		return nil
+	case "xml":
+		return xmlNamespace
+	case xmlns:
+		return xmlnsNamespace
+	}
+	for a := streamAttrs(header); ; {
+		name, value, ok := a.next()
+		if !ok || name == nil {
+			return nil
+		}
+		p, l := xmlParts(name)
+		if string(p) == xmlns && bytes.Equal(l, prefix) {
+			return value
+		}
+	}
+}
+
+// xmlName checks a namespace-free XML 1.0 name (NameStartChar / NameChar).
+func xmlName(name []byte) bool {
+	for i := 0; i < len(name); {
+		r, n := utf8.DecodeRune(name[i:])
+		extra := i > 0 && (r == '-' || r == '.' || r >= '0' && r <= '9' || r == 0xb7 || r >= 0x300 && r <= 0x36f || r >= 0x203f && r <= 0x2040)
+		if r == utf8.RuneError && n == 1 || !xmlNameStart(r) && !extra {
+			return false
+		}
+		i += n
+	}
+	return len(name) > 0
+}
+
+func xmlNameStart(r rune) bool {
+	return r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r == '_' ||
+		r >= 0xc0 && r <= 0xd6 || r >= 0xd8 && r <= 0xf6 || r >= 0xf8 && r <= 0x2ff ||
+		r >= 0x370 && r <= 0x37d || r >= 0x37f && r <= 0x1fff || r >= 0x200c && r <= 0x200d ||
+		r >= 0x2070 && r <= 0x218f || r >= 0x2c00 && r <= 0x2fef || r >= 0x3001 && r <= 0xd7ff ||
+		r >= 0xf900 && r <= 0xfdcf || r >= 0xfdf0 && r <= 0xfffd || r >= 0x10000 && r <= 0xeffff
+}
+
+func validXMLValue(b []byte) bool {
+	for len(b) > 0 {
+		r, n := xmlValueRune(b)
+		if n == 0 || !xmlCharacter(r) {
+			return false
+		}
+		b = b[n:]
+	}
+	return true
+}
+
+func xmlValueEqual(a, b []byte) bool {
+	if bytes.Equal(a, b) {
+		return true
+	}
+	for len(a) > 0 && len(b) > 0 {
+		ra, na := xmlValueRune(a)
+		rb, nb := xmlValueRune(b)
+		if na == 0 || nb == 0 || ra != rb {
+			return false
+		}
+		a, b = a[na:], b[nb:]
+	}
+	return len(a) == 0 && len(b) == 0
+}
+
+// xmlValueRune decodes one character with XML attribute normalization.
+func xmlValueRune(b []byte) (rune, int) {
+	switch b[0] {
+	case '<':
+		return 0, 0
+	case '\r':
+		if len(b) > 1 && b[1] == '\n' {
+			return ' ', 2
+		}
+		return ' ', 1
+	case '\n', '\t':
+		return ' ', 1
+	case '&':
+		ref, _, ok := bytes.Cut(b[1:], []byte(";"))
+		if !ok {
+			return 0, 0
+		}
+		n := len(ref) + 2
+		switch string(ref) {
+		case "amp":
+			return '&', n
+		case "lt":
+			return '<', n
+		case "gt":
+			return '>', n
+		case "apos":
+			return '\'', n
+		case "quot":
+			return '"', n
+		}
+		if len(ref) < 2 || ref[0] != '#' {
+			return 0, 0
+		}
+		base := rune(10)
+		ref = ref[1:]
+		if ref[0] == 'x' {
+			base, ref = 16, ref[1:]
+		}
+		if len(ref) == 0 {
+			return 0, 0
+		}
+		var value rune
+		for _, c := range ref {
+			var digit rune
+			switch {
+			case c >= '0' && c <= '9':
+				digit = rune(c - '0')
+			case base == 16 && c|32 >= 'a' && c|32 <= 'f':
+				digit = rune((c|32)-'a') + 10
+			default:
+				return 0, 0
+			}
+			value = value*base + digit
+			if value > utf8.MaxRune {
+				return 0, 0
+			}
+		}
+		return value, n
+	default:
+		r, n := utf8.DecodeRune(b)
+		if r == utf8.RuneError && n == 1 {
+			return 0, 0
+		}
+		return r, n
+	}
+}
+
+func xmlCharacter(r rune) bool {
+	return r == '\t' || r == '\n' || r == '\r' || r >= ' ' && r <= 0xd7ff ||
+		r >= 0xe000 && r <= 0xfffd || r >= 0x10000 && r <= utf8.MaxRune
 }
 
 // DNS matches DNS queries over TCP by their length prefix and header: a

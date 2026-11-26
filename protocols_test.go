@@ -122,13 +122,28 @@ func TestRegexp(t *testing.T) {
 	}
 }
 
-//goland:noinspection HttpUrlsUsage
 func TestXMPP(t *testing.T) {
 	m := XMPP()
 	client := "<?xml version='1.0'?><stream:stream to='example.com' xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' version='1.0'>"
 	matchAll(t, m, []byte(client), len(client), Match)
 	direct := "<stream:stream xmlns=\"jabber:server\" to=\"example.com\">"
-	matchAll(t, m, []byte(direct), len(direct), Match)
+	matchAll(t, m, []byte(direct), len(direct), NoMatch)
+	component := "<stream:stream note='a>b' xmlns='jabber:component:accept' xmlns:stream='http://etherx.jabber.org/streams'>"
+	matchAll(t, m, []byte(component), len(component), Match)
+	for _, attrs := range []string{" db:attr='v' xmlns:db='jabber:server:dialback' xml:lang='en'", " note='&amp;&#65;&#x41;'"} {
+		msg := strings.TrimSuffix(client, ">") + attrs + ">"
+		matchAll(t, m, []byte(msg), len(msg), Match)
+	}
+	for _, attrs := range []string{" xmlns='jabber:client'", " a='unterminated", " a='<'", " a='&unknown;'", " a='&#0;'", " a='x' a='y'", " xmlns:xmlns='bad'", " q:id='v'", " xmlns:a='urn:x' xmlns:b='urn:x' a:v='1' b:v='2'"} {
+		msg := strings.TrimSuffix(client, ">") + attrs + ">"
+		if got := matchXMPP([]byte(msg)); got == Match {
+			t.Fatal(attrs)
+		}
+	}
+	escaped := strings.Replace(component, "jabber:component:accept", "jabber&#58;component:accept", 1)
+	matchAll(t, m, []byte(escaped), len(escaped), Match)
+	wrong := strings.Replace(component, "http://etherx.jabber.org/streams", "wrong", 1)
+	matchAll(t, m, []byte(wrong), len(wrong), NoMatch)
 	other := "<?xml version='1.0'?>\n<stream:stream xmlns='urn:other'>"
 	matchAll(t, m, []byte(other), len(other), NoMatch)
 	matchAll(t, m, []byte("<?xml version='1.0'?><html>"), len("<?xml version='1.0'?><h"), NoMatch)

@@ -1,9 +1,12 @@
 package ipmatch
 
 import (
+	"cmp"
 	"net/netip"
 	"slices"
 	"strings"
+
+	"github.com/djylb/netx/forwarded"
 )
 
 // rangeMin is the number of prefixes from which a Set searches
@@ -15,13 +18,9 @@ const rangeMin = 8
 // are merged into sorted ranges and looked up by binary search. A Set
 // is safe for concurrent use.
 type Set struct {
-	list   []netip.Prefix
-	ranges []addrRange // sorted, disjoint and not adjacent
-	count  int
-}
-
-type addrRange struct {
-	lo, hi netip.Addr
+	list  []netip.Prefix
+	index *forwarded.PrefixSet
+	count int
 }
 
 // NewSet builds a set from prefixes. Invalid prefixes are ignored.
@@ -36,27 +35,8 @@ func NewSet(prefixes ...netip.Prefix) *Set {
 	if len(ps.list) < rangeMin {
 		return ps
 	}
-	ranges := make([]addrRange, len(ps.list))
-	for i, p := range ps.list {
-		ranges[i] = addrRange{lo: p.Addr(), hi: lastAddr(p)}
-	}
-	slices.SortFunc(ranges, func(a, b addrRange) int { return a.lo.Compare(b.lo) })
-	merged := ranges[:1]
-	for _, r := range ranges[1:] {
-		last := &merged[len(merged)-1]
-		if next := last.hi.Next(); next.IsValid() && r.lo.Compare(next) <= 0 && r.lo.BitLen() == last.hi.BitLen() {
-			if r.hi.Compare(last.hi) > 0 {
-				last.hi = r.hi
-			}
-			continue
-		}
-		if r.hi.Compare(last.hi) <= 0 && r.lo.BitLen() == last.hi.BitLen() {
-			continue // inside the last range, which ends at the family's top
-		}
-		merged = append(merged, r)
-	}
-	// A copy, so that the ranges before merging are not kept.
-	ps.list, ps.ranges = nil, slices.Clone(merged)
+	ps.list = compactPrefixes(ps.list)
+	ps.index = forwarded.NewPrefixSet(ps.list...)
 	return ps
 }
 
@@ -83,39 +63,49 @@ func (ps *Set) Len() int { return ps.count }
 // Contains reports whether a is inside one of the prefixes.
 func (ps *Set) Contains(a netip.Addr) bool {
 	a = NormalizeAddr(a)
-	if ps.ranges == nil {
-		for _, p := range ps.list {
-			if p.Contains(a) {
-				return true
-			}
-		}
-		return false
+	if ps.index != nil {
+		return ps.index.Contains(a)
 	}
-	i, _ := slices.BinarySearchFunc(ps.ranges, a, func(r addrRange, a netip.Addr) int {
-		if r.lo.Compare(a) > 0 {
-			return 1
+	for _, p := range ps.list {
+		if p.Contains(a) {
+			return true
 		}
-		return -1
+	}
+	return false
+}
+
+// compactPrefixes builds the minimal ordered CIDR representation for enumeration.
+func compactPrefixes(list []netip.Prefix) []netip.Prefix {
+	slices.SortFunc(list, func(a, b netip.Prefix) int {
+		if c := a.Addr().Compare(b.Addr()); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Bits(), b.Bits())
 	})
-	return i > 0 && a.Compare(ps.ranges[i-1].hi) <= 0
+	out := list[:0]
+	for _, p := range list {
+		out = appendPrefix(out, p)
+	}
+	return slices.Clone(out)
 }
 
-// lastAddr returns the highest address of a masked prefix.
-func lastAddr(p netip.Prefix) netip.Addr {
-	if p.Addr().Is4() {
-		b := p.Addr().As4()
-		setHostBits(b[:], p.Bits())
-		return netip.AddrFrom4(b)
+// appendPrefix discards contained prefixes and joins adjacent siblings.
+func appendPrefix(out []netip.Prefix, p netip.Prefix) []netip.Prefix {
+	for len(out) > 0 {
+		prev := out[len(out)-1]
+		if prev.Contains(p.Addr()) {
+			return out
+		}
+		if prev.Bits() != p.Bits() || p.Bits() == 0 {
+			break
+		}
+		parent := netip.PrefixFrom(prev.Addr(), p.Bits()-1).Masked()
+		if !parent.Contains(p.Addr()) {
+			break
+		}
+		p, out = parent, out[:len(out)-1]
 	}
-	b := p.Addr().As16()
-	setHostBits(b[:], p.Bits())
-	return netip.AddrFrom16(b)
-}
-
-func setHostBits(b []byte, bits int) {
-	for i := bits; i < len(b)*8; i++ {
-		b[i/8] |= 1 << (7 - i%8)
-	}
+	return append(out, p)
 }
 
 // String describes the set, as in Set(10.0.0.0/8, 192.168.0.0/16).
@@ -131,34 +121,5 @@ func (ps *Set) String() string {
 // Prefixes returns the prefixes of the set, masked. A long set returns the
 // fewest prefixes that cover the same addresses, in increasing order.
 func (ps *Set) Prefixes() []netip.Prefix {
-	if ps.ranges == nil {
-		return slices.Clone(ps.list)
-	}
-	var out []netip.Prefix
-	for _, r := range ps.ranges {
-		out = appendRangePrefixes(out, r.lo, r.hi)
-	}
-	return out
-}
-
-// appendRangePrefixes appends the fewest prefixes that cover lo to hi.
-func appendRangePrefixes(dst []netip.Prefix, lo, hi netip.Addr) []netip.Prefix {
-	for {
-		// The shortest prefix that starts at lo and ends no later than hi.
-		bits := lo.BitLen()
-		for bits > 0 {
-			wider := netip.PrefixFrom(lo, bits-1)
-			if wider.Masked().Addr() != lo || lastAddr(wider).Compare(hi) > 0 {
-				break
-			}
-			bits--
-		}
-		p := netip.PrefixFrom(lo, bits)
-		dst = append(dst, p)
-		end := lastAddr(p)
-		if end.Compare(hi) >= 0 {
-			return dst
-		}
-		lo = end.Next()
-	}
+	return slices.Clone(ps.list)
 }

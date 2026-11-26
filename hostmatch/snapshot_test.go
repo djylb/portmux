@@ -1,6 +1,7 @@
 package hostmatch
 
 import (
+	"errors"
 	"maps"
 	"math/rand/v2"
 	"slices"
@@ -46,12 +47,12 @@ func TestCanonical(t *testing.T) {
 	}
 }
 
-// TestMapEdit checks that the changes of Edit are seen together.
+// TestMapEdit checks that the changes of TryEdit are seen together.
 func TestMapEdit(t *testing.T) {
 	var m Map[int]
 	m.Set("a.example", 1)
 	before := m.Load()
-	m.Edit(func(b *MapBuilder[int]) {
+	if err := m.TryEdit(func(b *MapBuilder[int]) {
 		b.Set("b.example", 2)
 		if v, ok := b.Get("b.example"); !ok || v != 2 {
 			t.Error("builder Get")
@@ -59,7 +60,9 @@ func TestMapEdit(t *testing.T) {
 		if !b.Delete("a.example") {
 			t.Error("Delete")
 		}
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if before.Len() != 1 || m.Len() != 1 {
 		t.Fatalf("lengths %d %d", before.Len(), m.Len())
 	}
@@ -176,5 +179,69 @@ func TestBuilderUpdate(t *testing.T) {
 	}
 	if v, _ := s.Get("*.example"); v != 2 {
 		t.Errorf("*.example = %d", v)
+	}
+}
+
+func TestTryEditConflict(t *testing.T) {
+	var m Map[int]
+	entered, release, done := make(chan struct{}, 2), make(chan struct{}), make(chan error, 2)
+	for _, key := range []string{"alpha", "beta"} {
+		go func() {
+			done <- m.TryEdit(func(b *MapBuilder[int]) {
+				entered <- struct{}{}
+				<-release
+				b.Set(key, 1)
+				b.Set(key+"2", 2)
+			})
+		}()
+	}
+	<-entered
+	<-entered
+	close(release)
+	if first, second := <-done, <-done; (first == nil) == (second == nil) || !errors.Is(errors.Join(first, second), ErrEditConflict) || m.Len() != 2 || len(entered) != 0 {
+		t.Fatal(first, second, m.Len())
+	}
+	for _, key := range []string{"alpha", "beta"} {
+		_, a := m.Get(key)
+		_, b := m.Get(key + "2")
+		if a != b {
+			t.Fatal(key)
+		}
+	}
+}
+
+func TestUpdateAcrossSnapshot(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		var b MapBuilder[int]
+		if existing {
+			b.Set("key", 1)
+		}
+		var before *Snapshot[int]
+		b.Update("key", func(old int, ok bool) int {
+			before = b.Snapshot()
+			b.Delete("key")
+			b.Set("other", 3)
+			if ok != existing {
+				t.Fatal(ok, existing)
+			}
+			return old + 2
+		})
+		if value, ok := before.Get("key"); ok != existing || existing && value != 1 {
+			t.Fatal(value, ok)
+		}
+		next := b.Snapshot()
+		if value, ok := next.Get("key"); !ok || value != before.Len()+2 || next.Len() != 2 {
+			t.Fatal(value, next.Len())
+		}
+	}
+}
+
+func TestTryEditPanic(t *testing.T) {
+	var m Map[int]
+	m.Set("key", 1)
+	before := m.Load()
+	err := m.TryEdit(func(b *MapBuilder[int]) { b.Delete("key"); panic("edit") })
+	if e, ok := errors.AsType[*PanicError](err); !ok || e.Value != "edit" || len(e.Stack) == 0 || m.Load() != before {
+		t.Fatal(err)
 	}
 }

@@ -381,3 +381,18 @@ func BenchmarkPeek(b *testing.B) {
 		}
 	})
 }
+
+func BenchmarkServeConnCloseEvents(b *testing.B) {
+	m := New(WithCloseEvents(true), WithObserver(func(Event) {}))
+	defer func() { _ = m.Close() }()
+	_, err := m.Add(RouteConfig{Matchers: []Matcher{Always()}, Handler: func(c *Conn) { _, _ = c.Write(nil); _ = c.Close() }})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if err = m.ServeConn(&memConn{}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

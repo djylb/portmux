@@ -1,6 +1,10 @@
 package hostmatch
 
-import "strings"
+import (
+	"net/netip"
+	"strconv"
+	"strings"
+)
 
 // Name is a host name prepared for matching: lowercased, without one trailing
 // dot, and checked for the bytes of a DNS name or IP address. Preparing a
@@ -67,15 +71,28 @@ var hostTable = func() (t [128]bool) {
 // by anything but a port, and several colons without brackets.
 func NormalizeHost(host string) Name {
 	// Servers disagree on what is meant when brackets hold no IPv6 literal
-	// or are followed by more than a port, and on "a.example:80:80", which
-	// nginx and Express take for a.example and net/http does not.
+	// or are followed by more than a port, or an authority has two ports.
+	suffix := ""
 	if strings.HasPrefix(host, "[") {
 		end := strings.IndexByte(host, ']')
-		if end < 0 || strings.IndexByte(host[1:end], ':') < 0 || end+1 < len(host) && host[end+1] != ':' {
+		if end < 0 {
 			return Name{}
 		}
-	} else if strings.Count(host, ":") > 1 {
-		return Name{}
+		ip, err := netip.ParseAddr(host[1:end])
+		if err != nil || !ip.Is6() {
+			return Name{}
+		}
+		suffix = host[end+1:]
+	} else if i := strings.IndexByte(host, ':'); i >= 0 {
+		suffix = host[i:]
+	}
+	if suffix != "" {
+		if suffix[0] != ':' {
+			return Name{}
+		}
+		if _, err := strconv.ParseUint(suffix[1:], 10, 16); err != nil {
+			return Name{}
+		}
 	}
 	name := SplitHost(host)
 	if name == "" && host != "" {

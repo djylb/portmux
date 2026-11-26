@@ -1,6 +1,7 @@
 package portmux
 
 import (
+	"errors"
 	"net"
 	"slices"
 	"sync/atomic"
@@ -48,13 +49,14 @@ func PeekAny(c net.Conn, matchers []Matcher, opts ...PeekOption) (*Conn, int, er
 // server that peeks at every connection it takes the same way. A Peeker is
 // safe for concurrent use.
 type Peeker struct {
-	tables atomic.Pointer[table] // set once; as a Mux holds its table
-	routes []*Route
-	opts   options
+	tables     atomic.Pointer[table] // set once; as a Mux holds its table
+	routes     []*Route
+	opts       options
+	prepareErr error
 }
 
 // NewPeeker prepares matchers and opts for Peeker.Peek. It panics without
-// matchers or on a nil one.
+// matchers or on a nil one. A panic in Silences is reported by each Peek.
 func NewPeeker(matchers []Matcher, opts ...PeekOption) *Peeker {
 	if len(matchers) == 0 || slices.Contains(matchers, nil) {
 		panic("portmux: PeekAny needs a connection and matchers")
@@ -64,32 +66,53 @@ func NewPeeker(matchers []Matcher, opts ...PeekOption) *Peeker {
 		all[i] = opt
 	}
 	p := &Peeker{opts: newOptions(all)}
+	p.prepare(matchers)
+	return p
+}
+
+func (p *Peeker) prepare(matchers []Matcher) {
+	defer func() {
+		if v := recover(); v != nil {
+			p.prepareErr = NewPanicError(v)
+		}
+	}()
 	t, routes := peekTable(matchers)
 	p.tables.Store(t)
 	p.routes = routes
-	return p
 }
 
 // Peek is PeekAny with the matchers and options of p. It panics without a
 // connection.
-func (p *Peeker) Peek(c net.Conn) (*Conn, int, error) {
+func (p *Peeker) Peek(c net.Conn) (conn *Conn, index int, err error) {
 	if c == nil {
 		panic("portmux: Peek needs a connection")
 	}
 	o := &p.opts
-	conn := &Conn{conn: c}
+	conn = &Conn{conn: c}
+	if p.prepareErr != nil {
+		return conn, -1, p.prepareErr
+	}
 	s := newSniffer(conn, o, time.Now())
 	defer s.release()
-	err := s.readProxyHeader(proxyPolicyFor(o, "", c), &p.tables)
-	index := -1
+	defer func() {
+		if v := recover(); v != nil {
+			err = NewPanicError(v)
+		}
+		if e := s.handOver(nil); e != nil {
+			err = errors.Join(err, e)
+			index = -1
+		}
+		conn.dropEmpty()
+	}()
+	index = -1
+	s.in.setPeer(c)
+	err = s.readProxyHeader(proxyPolicyFor(o, &s.in), &p.tables)
 	if err == nil {
 		var r *Route
 		if r, err = s.match(&p.tables, o.maxSniffBytes); err == nil {
 			index = slices.Index(p.routes, r)
 		}
 	}
-	s.handOver(nil)
-	conn.dropEmpty()
 	return conn, index, err
 }
 

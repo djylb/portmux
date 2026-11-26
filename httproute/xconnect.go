@@ -3,7 +3,6 @@ package httproute
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha1" //nolint:gosec // the WebSocket handshake is defined with SHA-1 (RFC 6455)
 	"encoding/base64"
 	"errors"
 	"io"
@@ -12,10 +11,11 @@ import (
 	"net/http/httputil"
 	"slices"
 	"strings"
-)
 
-// wsGUID is the key suffix of RFC 6455 4.2.2.
-const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	"github.com/djylb/netx"
+	wire "github.com/djylb/netx/httphead"
+	"github.com/djylb/netx/wsconn"
+)
 
 var errBadAccept = errors.New("httproute: backend answered the WebSocket handshake with a wrong Sec-WebSocket-Accept")
 
@@ -53,10 +53,13 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 	}
 	out := req.Clone(req.Context())
 	out.Method, out.Body, out.ContentLength, out.Proto, out.ProtoMajor, out.ProtoMinor = http.MethodGet, http.NoBody, 0, "HTTP/1.1", 1, 1
-	for _, f := range append(hopFields, ":protocol", "Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto") {
+	stripHop(out.Header)
+	for _, f := range []string{":protocol", "Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"} {
 		out.Header.Del(f)
 	}
-	rewrite(&httputil.ProxyRequest{In: req, Out: out}) //nolint:contextcheck // the ReverseProxy hook: the context is the request's
+	pr := &httputil.ProxyRequest{In: req, Out: out}
+	rewrite(pr) //nolint:contextcheck // the ReverseProxy hook: the context is the request's
+	out = pr.Out
 	var nonce [16]byte
 	_, _ = rand.Read(nonce[:])
 	key := base64.StdEncoding.EncodeToString(nonce[:])
@@ -69,7 +72,7 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 		return
 	}
 	backend, ok := res.Body.(io.ReadWriteCloser)
-	if res.StatusCode == http.StatusSwitchingProtocols && (!ok || res.Header.Get("Sec-WebSocket-Accept") != acceptKey(key)) {
+	if res.StatusCode/100 == 2 || res.StatusCode == http.StatusSwitchingProtocols && (!ok || !headerToken(res.Header, "Connection", "upgrade") || !strings.EqualFold(res.Header.Get("Upgrade"), "websocket") || res.Header.Get("Sec-WebSocket-Accept") != wsconn.AcceptKey(key)) {
 		_ = res.Body.Close()
 		proxyError(w, out, errBadAccept)
 		return
@@ -82,9 +85,8 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 	}
 	h := w.Header()
 	maps.Copy(h, res.Header)
-	for _, f := range append(hopFields, "Sec-Websocket-Accept") {
-		h.Del(f)
-	}
+	stripHop(h)
+	h.Del("Sec-WebSocket-Accept")
 	if res.StatusCode != http.StatusSwitchingProtocols {
 		// A refusal goes to the client as it is.
 		defer func() { _ = res.Body.Close() }()
@@ -139,21 +141,35 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 }
 
 func closeWrite(w io.Writer) error {
-	if cw, ok := w.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
-	return errors.ErrUnsupported
-}
-
-func acceptKey(key string) string {
-	sum := sha1.Sum([]byte(key + wsGUID)) //nolint:gosec // see the import
-	return base64.StdEncoding.EncodeToString(sum[:])
+	return (&netx.RelayEnd{Writer: w}).CloseWrite()
 }
 
 // upgradeAllowed reports whether the route allows the protocol token, as
 // an Upgrade field or the :protocol of an extended CONNECT names it, without
 // a version.
 func upgradeAllowed(rt *route, token string) bool {
-	name, _, _ := strings.Cut(strings.TrimSpace(token), "/")
+	name, _, _ := strings.Cut(wire.TrimOWS(token), "/")
 	return name != "" && slices.ContainsFunc(rt.upgrades, func(a string) bool { return strings.EqualFold(a, name) })
+}
+
+func headerToken(h http.Header, field, token string) bool {
+	for _, v := range h.Values(field) {
+		for t := range wire.Tokens(v) {
+			if strings.EqualFold(t, token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func stripHop(h http.Header) {
+	for _, v := range h.Values("Connection") {
+		for t := range wire.Tokens(v) {
+			h.Del(t)
+		}
+	}
+	for _, f := range hopFields {
+		h.Del(f)
+	}
 }

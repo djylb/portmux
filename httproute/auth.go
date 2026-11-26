@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"net/http"
 	"runtime"
@@ -16,8 +17,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/djylb/timeshim"
 )
 
 // DefaultIterations is the PBKDF2 iteration count of HashPassword when it
@@ -36,6 +35,9 @@ var b64 = base64.RawStdEncoding
 // the self-describing form "$pbkdf2-sha256$i=ROUNDS$SALT$KEY" with SALT and
 // KEY in unpadded standard base64.
 func HashPassword(password string, iterations int) (string, error) {
+	if !credentialText(password) {
+		return "", invalid("password contains a control character")
+	}
 	if iterations <= 0 {
 		iterations = DefaultIterations
 	}
@@ -78,7 +80,7 @@ func parseHash(s string) (*passwordHash, error) {
 	}
 	salt, err1 := b64.DecodeString(parts[1])
 	key, err2 := b64.DecodeString(parts[2])
-	if err1 != nil || err2 != nil || len(salt) == 0 || len(key) == 0 {
+	if err1 != nil || err2 != nil || len(salt) != 16 || len(key) != sha256.Size {
 		return nil, ErrHash
 	}
 	return &passwordHash{iterations: n, salt: salt, key: key}, nil
@@ -94,7 +96,7 @@ func (h *passwordHash) verify(password string) bool {
 // once verified are remembered for a while by an HMAC of them under a key
 // of the table, the least recently used dropped first; and at most one hash
 // per CPU is computed at a time, so that wrong passwords cannot take every
-// CPU. A new table remembers nothing of the old one.
+// CPU. Unchanged routes shared by tables share their cache.
 type basicAuth struct {
 	challenge string
 	users     map[string]*passwordHash
@@ -103,7 +105,17 @@ type basicAuth struct {
 	allow     func(r *http.Request, user string) bool
 	macKey    [32]byte
 	cache     *authCache // nil when caching is off
-	slots     chan struct{}
+}
+
+var hashSlots = make(chan struct{}, runtime.GOMAXPROCS(0))
+
+func credentialText(s string) bool {
+	for i := range len(s) {
+		if s[i] < 32 || s[i] == 127 {
+			return false
+		}
+	}
+	return true
 }
 
 func compileAuth(a *BasicAuth) (*basicAuth, error) {
@@ -117,8 +129,13 @@ func compileAuth(a *BasicAuth) (*basicAuth, error) {
 		}
 	}
 	realm = strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(realm)
-	b := &basicAuth{challenge: `Basic realm="` + realm + `", charset="UTF-8"`, verify: a.Verify, allow: a.Allow,
-		slots: make(chan struct{}, runtime.GOMAXPROCS(0))}
+	b := &basicAuth{challenge: `Basic realm="` + realm + `", charset="UTF-8"`, verify: a.Verify, allow: a.Allow}
+	if a.CacheTTL < 0 {
+		return nil, invalid("negative CacheTTL")
+	}
+	if a.CacheSize < 0 {
+		return nil, invalid("negative CacheSize")
+	}
 	if a.Verify != nil {
 		return b, nil
 	}
@@ -128,8 +145,8 @@ func compileAuth(a *BasicAuth) (*basicAuth, error) {
 	b.users = make(map[string]*passwordHash, len(a.Users))
 	most := 1
 	for user, hash := range a.Users {
-		if strings.IndexByte(user, ':') >= 0 {
-			return nil, invalid("user name %q has a colon", user)
+		if !credentialText(user) || strings.Contains(user, ":") {
+			return nil, invalid("invalid user name %q", user)
 		}
 		h, err := parseHash(hash)
 		if err != nil {
@@ -139,12 +156,6 @@ func compileAuth(a *BasicAuth) (*basicAuth, error) {
 		most = max(most, h.iterations)
 	}
 	b.dummy = &passwordHash{iterations: most, salt: make([]byte, 16), key: make([]byte, sha256.Size)}
-	if a.CacheTTL < 0 {
-		return nil, invalid("negative CacheTTL")
-	}
-	if a.CacheSize < 0 {
-		return nil, invalid("negative CacheSize")
-	}
 	if !a.DisableCache {
 		b.cache = &authCache{size: cmp.Or(a.CacheSize, 1024), ttl: cmp.Or(a.CacheTTL, 5*time.Minute),
 			index: map[[32]byte]*list.Element{}, order: list.New()}
@@ -157,7 +168,7 @@ func compileAuth(a *BasicAuth) (*basicAuth, error) {
 // false also when the request's context ends while it waits for a slot.
 func (b *basicAuth) check(r *http.Request) bool {
 	user, password, ok := r.BasicAuth()
-	if !ok || !b.valid(r, user, password) {
+	if !ok || !credentialText(user) || !credentialText(password) || !b.valid(r, user, password) {
 		return false
 	}
 	return b.allow == nil || b.allow(r, user)
@@ -168,21 +179,12 @@ func (b *basicAuth) valid(r *http.Request, user, password string) bool {
 	if b.verify != nil {
 		return b.verify(r, user, password)
 	}
-	mac := hmac.New(sha256.New, b.macKey[:])
-	mac.Write([]byte(user))
-	mac.Write([]byte{0})
-	mac.Write([]byte(password))
-	var id [32]byte
-	mac.Sum(id[:0])
-	now := timeshim.Real.Now
-	if rs := stateOf(r.Context()); rs != nil {
-		now = rs.router.clock.Now
-	}
-	if b.cache.has(id, now()) {
+	id := b.credentialID(user, password)
+	if b.cache.has(id, time.Now()) {
 		return true
 	}
 	select {
-	case b.slots <- struct{}{}:
+	case hashSlots <- struct{}{}:
 	case <-r.Context().Done():
 		return false
 	}
@@ -196,11 +198,23 @@ func (b *basicAuth) valid(r *http.Request, user, password string) bool {
 	if extra := b.dummy.iterations - h.iterations; extra > 0 {
 		_, _ = pbkdf2.Key(sha256.New, password, b.dummy.salt, extra, sha256.Size)
 	}
-	<-b.slots
+	<-hashSlots
 	if ok {
-		b.cache.add(id, now())
+		b.cache.add(id, time.Now())
 	}
 	return ok
+}
+
+func (b *basicAuth) credentialID(user, password string) [32]byte {
+	mac := hmac.New(sha256.New, b.macKey[:])
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(user)))
+	mac.Write(length[:])
+	mac.Write([]byte(user))
+	mac.Write([]byte(password))
+	var id [32]byte
+	mac.Sum(id[:0])
+	return id
 }
 
 // authCache remembers verified credentials, at most size of them, each for
@@ -228,7 +242,7 @@ func (c *authCache) has(id [32]byte, now time.Time) bool {
 	if e == nil {
 		return false
 	}
-	if now.After(e.Value.(*cached).expires) {
+	if !now.Before(e.Value.(*cached).expires) {
 		c.order.Remove(e)
 		delete(c.index, id)
 		return false

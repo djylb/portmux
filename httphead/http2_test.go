@@ -86,7 +86,6 @@ func TestHPACKInvalid(t *testing.T) {
 	}
 }
 
-//goland:noinspection HttpUrlsUsage
 func TestParseHTTP2(t *testing.T) {
 	req, _ := http.NewRequest("POST", "http://API.example.com:8080/svc/../v1/Method?x=1", nil)
 	req.Header.Set("Content-Type", "application/grpc")
@@ -124,8 +123,6 @@ func TestParseHTTP2(t *testing.T) {
 
 // FuzzParseHTTP2 checks that a decision made on a prefix never changes and
 // that a scanner fed in pieces agrees with ParseHTTP2.
-//
-//goland:noinspection HttpUrlsUsage
 func FuzzParseHTTP2(f *testing.F) {
 	req, _ := http.NewRequest("GET", "http://www.example.com/a?b=c", nil)
 	req.Header.Set("Content-Type", "application/grpc")
@@ -161,6 +158,30 @@ func block(fields ...[]byte) []byte {
 	return b
 }
 
+func TestConnectAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		authority string
+		valid     bool
+	}{
+		{"target:0", true},
+		{"target:65535", true},
+		{"target:65536", false},
+		{"target", false},
+		{"target:", false},
+		{":1", false},
+		{"target:1:2", false},
+		{"[target]:1", false},
+	} {
+		_, h1 := Parse([]byte("CONNECT " + tc.authority + " HTTP/1.1\r\n\r\n"))
+		headers := block(lit(":method", "CONNECT"), lit(":authority", tc.authority))
+		_, h2 := ParseHTTP2(block([]byte(HTTP2Preface), frame(frameSettings, 0, 0, nil),
+			frame(frameHeaders, flagEndHeaders, 1, headers)))
+		if (h1 == nil) != tc.valid || (h2 == nil) != tc.valid {
+			t.Errorf("CONNECT %q: HTTP/1 %v, HTTP/2 %v, valid %v", tc.authority, h1, h2, tc.valid)
+		}
+	}
+}
+
 func TestParseHTTP2Frames(t *testing.T) {
 	settings := frame(frameSettings, 0, 0, nil)
 	get := block(lit(":method", "GET"), lit(":scheme", "http"), lit(":path", "/x"), lit(":authority", "a.example"))
@@ -187,6 +208,12 @@ func TestParseHTTP2Frames(t *testing.T) {
 		name, want string
 		data       []byte
 	}{
+		{"bad window", "invalid", conn(frame(frameSettings, 0, 0, []byte{0, 4, 128, 0, 0, 0}), headers(0, 1, get))},
+		{"bad push", "invalid", conn(frame(frameSettings, 0, 0, []byte{0, 2, 0, 0, 0, 2}), headers(0, 1, get))},
+		{"bad frame size", "invalid", conn(frame(frameSettings, 0, 0, []byte{0, 5, 0, 0, 0, 1}), headers(0, 1, get))},
+		{"leading space", "invalid", conn(headers(0, 1, block(get, lit("x", " a"))))},
+		{"trailing tab", "invalid", conn(headers(0, 1, block(get, lit("x", "a\t"))))},
+		{"connect without port", "invalid", conn(headers(0, 1, block(lit(":method", "CONNECT"), lit(":authority", "host"))))},
 		{"plain", "request", conn(headers(0, 1, get))},
 		{"padded", "request", conn(headers(flagPadded, 1, append(append([]byte{2}, get...), 0, 0)))},
 		{"padding too long", "invalid", conn(headers(flagPadded, 1, append([]byte{byte(len(get) + 1)}, get...)))},
@@ -197,6 +224,9 @@ func TestParseHTTP2Frames(t *testing.T) {
 		{"stray continuation", "invalid", conn(frame(frameContinuation, flagEndHeaders, 1, get))},
 		{"even stream", "invalid", conn(headers(0, 2, get))},
 		{"settings ack first", "invalid", append([]byte(HTTP2Preface), frame(frameSettings, flagAck, 0, nil)...)},
+		{"partial settings record", "invalid", append([]byte(HTTP2Preface), frame(frameSettings, 0, 0, []byte{0})...)},
+		{"data before headers", "invalid", conn(frame(0, 0, 1, nil), headers(0, 1, get))},
+		{"forbidden field", "invalid", conn(headers(0, 1, block(get, lit("connection", "keep-alive"))))},
 		{"headers first", "invalid", append([]byte(HTTP2Preface), headers(0, 1, get)...)},
 		{"frame too large", "invalid", conn(frame(0x8, 0, 0, make([]byte, http2MaxFrameSize+1)))},
 		{"too many frames", "invalid", conn(append(updates, headers(0, 1, get))...)},

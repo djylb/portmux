@@ -95,7 +95,11 @@ func TestEvictionSparesMatchedConnections(t *testing.T) {
 	for i := range sniffers {
 		conns[i] = &closeCounter{}
 		sniffers[i] = &sniffer{conn: &Conn{conn: conns[i]}}
-		p.add(sniffers[i], i != 2) // the last one came from ServeConn
+		if i == 2 {
+			p.add(sniffers[i])
+		} else {
+			p.shard(sniffers[i]).idle.insert(sniffers[i])
+		}
 	}
 	p.remove(sniffers[0]) // matched connections leave the set
 	if !p.evictOldest() {
@@ -124,7 +128,8 @@ func TestEvictionFollowsAcceptOrder(t *testing.T) {
 	conns := map[uint64]*closeCounter{}
 	for _, seq := range []uint64{33, 2, 17, 18, 1} {
 		conns[seq] = &closeCounter{}
-		p.add(&sniffer{conn: &Conn{conn: conns[seq], stripe: uint8(seq % counterStripes)}, seq: seq}, true)
+		s := &sniffer{conn: &Conn{conn: conns[seq], stripe: uint8(seq % counterStripes)}, seq: seq}
+		p.shard(s).idle.insert(s)
 	}
 	for _, want := range []uint64{1, 2, 17, 18, 33} {
 		if !p.evictOldest() {
@@ -167,7 +172,7 @@ func TestRateLimitPerClient(t *testing.T) {
 }
 
 func TestRateLimitBuckets(t *testing.T) {
-	l := newRateLimit(10, 2, timeshim.Real)
+	l := newRateLimit(10, 2, timeshim.Real, time.Now())
 	a := netip.MustParseAddr("192.0.2.1")
 	b := netip.MustParseAddr("192.0.2.2")
 	at := func(ms int) time.Duration { return time.Duration(ms) * time.Millisecond }
@@ -202,7 +207,7 @@ func TestRateLimitBuckets(t *testing.T) {
 }
 
 func TestRateLimitTracksBoundedClients(t *testing.T) {
-	l := newRateLimit(1, 1, timeshim.Real)
+	l := newRateLimit(1, 1, timeshim.Real, time.Now())
 	// Fill the tracked clients with exhausted buckets, then check that new
 	// clients pass untracked instead of growing the maps.
 	for i := range DefaultMaxClientRecords * 2 {
@@ -780,12 +785,12 @@ func TestProxyPolicyRunsOutsideAcceptLoop(t *testing.T) {
 }
 
 // TestPanicAfterAdmissionFreesTheClient checks that a connection whose
-// net.Conn panics after the per-client rules counted it, here in RemoteAddr
-// while the addresses that matchers see are set, gives its client's pending
+// net.Conn panics after the per-client rules counted it, here on the
+// first sniff read, gives its client's pending
 // count back.
 func TestPanicAfterAdmissionFreesTheClient(t *testing.T) {
-	// Without an observer, whose event would read the address again.
-	m := startMux(t, WithMaxPendingPerClient(1),
+	events := make(chan Event, 2)
+	m := startMux(t, WithObserver(func(e Event) { events <- e }), WithMaxPendingPerClient(1),
 		WithProxyProtocol(func(string, net.Addr, net.Addr) proxyproto.Policy { return proxyproto.Ignore }))
 	route := m.Listen(Prefix("A"))
 	var wrapped atomic.Bool
@@ -817,21 +822,21 @@ func (l *wrapListener) Accept() (net.Conn, error) {
 	return l.wrap(c), nil
 }
 
-// counterPanicConn panics in RemoteAddr once m counts a pending connection of
+// counterPanicConn panics in Read once m counts a pending connection of
 // some client.
 type counterPanicConn struct {
 	net.Conn
 	m *Mux
 }
 
-func (c *counterPanicConn) RemoteAddr() net.Addr {
+func (c *counterPanicConn) Read(p []byte) (int, error) {
 	c.m.perClient.mu.Lock()
 	counted := len(c.m.perClient.count) > 0
 	c.m.perClient.mu.Unlock()
 	if counted {
-		panic("RemoteAddr failed")
+		panic("read failed")
 	}
-	return c.Conn.RemoteAddr()
+	return c.Conn.Read(p)
 }
 
 // TestClientRecordPolicies checks the size and the full policies of the
@@ -850,7 +855,7 @@ func TestClientRecordPolicies(t *testing.T) {
 		{records{max: 4, full: FullEvictOldest}, 4, true, false, false},
 		{records{max: -1}, 0, true, true, true},
 	} {
-		l := newRateLimit(0.001, 1, timeshim.Real)
+		l := newRateLimit(0.001, 1, timeshim.Real, time.Now())
 		l.allowAt(host(client(0)), 0, tc.rec) // takes its one token
 		for i := 1; i < 64; i++ {
 			l.allowAt(host(client(i)), time.Duration(i), tc.rec)
@@ -948,7 +953,7 @@ func TestWithClientRecords(t *testing.T) {
 // records of other shards for a new client.
 func TestRateSweepOtherShards(t *testing.T) {
 	rec := records{max: 8, full: FullFailClosed}
-	l := newRateLimit(1000, 1, timeshim.Real)
+	l := newRateLimit(1000, 1, timeshim.Real, time.Now())
 	for i := range 8 {
 		l.allowAt(host(netip.AddrFrom4([4]byte{10, 2, 0, byte(i)})), 0, rec)
 	}

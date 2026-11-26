@@ -5,17 +5,22 @@ import (
 	"errors"
 	"io"
 	"iter"
+	"net"
 	"net/textproto"
 	"net/url"
 	"path"
 	"strings"
 	"sync"
 
+	wire "github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux/hostmatch"
 )
 
-// methodConnect is the CONNECT method; net/http is not imported for it.
-const methodConnect = "CONNECT"
+// Method tokens used without importing net/http.
+const (
+	methodOptions = "OPTIONS"
+	methodConnect = "CONNECT"
+)
 
 // ErrInvalid is returned for data that is not the start of a well-formed
 // request head.
@@ -62,8 +67,9 @@ func (r *Request) Name() hostmatch.Name {
 }
 
 // Query returns the parameters of the target's query string. The map is
-// built on the first call and shared by later calls, so it must not be
-// modified.
+// shared by successive calls and must not be modified. Parse and ParseHTTP2
+// reject malformed queries. For a manually constructed Request, Query returns
+// nil when decoding fails.
 func (r *Request) Query() url.Values {
 	r.queryOnce.Do(func() {
 		q := r.RequestURI
@@ -75,7 +81,9 @@ func (r *Request) Query() url.Values {
 		if i := strings.IndexByte(q, '#'); i >= 0 {
 			q = q[:i]
 		}
-		r.query, _ = url.ParseQuery(q)
+		if values, err := url.ParseQuery(q); err == nil {
+			r.query = values
+		}
 	})
 	return r.query
 }
@@ -90,7 +98,7 @@ func (r *Request) Header() textproto.MIMEHeader {
 		for line := range headerLines(r.fields) {
 			colon := strings.IndexByte(line, ':')
 			if key := textproto.CanonicalMIMEHeaderKey(line[:colon]); key != "Host" {
-				h[key] = append(h[key], trimOWS(line[colon+1:]))
+				h[key] = append(h[key], wire.TrimOWS(line[colon+1:]))
 			}
 		}
 		r.header = h
@@ -105,7 +113,7 @@ func (r *Request) Values(name string) iter.Seq[string] {
 		for line := range headerLines(r.fields) {
 			colon := strings.IndexByte(line, ':')
 			if colon == len(name) && strings.EqualFold(line[:colon], name) {
-				if !yield(trimOWS(line[colon+1:])) {
+				if !yield(wire.TrimOWS(line[colon+1:])) {
 					return
 				}
 			}
@@ -126,10 +134,6 @@ func headerLines(fields string) func(func(string) bool) {
 			}
 		}
 	}
-}
-
-func trimOWS(s string) string {
-	return strings.Trim(s, " \t")
 }
 
 // Parse parses data, the first bytes of a connection, as the head of an
@@ -197,7 +201,7 @@ func (s *Scanner) Scan(data []byte) (*Request, error) {
 				}
 			case (c == '\r' || c == '\n') && s.pos == s.methodStart && s.pos < maxLeadingCRLF:
 				// Line breaks before the request line are skipped, as RFC
-				// 9112, Section 2.2 asks and nginx and Node do.
+				// 9112, Section 2.2 recommends.
 				s.pos++
 				s.methodStart = s.pos
 			case c == ' ' && s.pos > s.methodStart:
@@ -268,15 +272,8 @@ func (s *Scanner) field(line []byte) bool {
 	if colon <= 0 {
 		return false
 	}
-	for _, c := range line[:colon] {
-		if !isTokenChar(c) {
-			return false
-		}
-	}
-	for _, c := range line[colon+1:] {
-		if c < ' ' && c != '\t' || c == 0x7f {
-			return false
-		}
+	if !wire.ValidFieldName(string(line[:colon])) || !wire.ValidFieldValue(string(line[colon+1:])) {
+		return false
 	}
 	if colon == 4 && bytes.EqualFold(line[:4], []byte("host")) {
 		s.hosts++
@@ -314,18 +311,24 @@ func (s *Scanner) request(head []byte) (*Request, error) {
 // for an invalid target.
 func (r *Request) finish() bool {
 	target := r.RequestURI
+	if _, query, ok := strings.Cut(target, "?"); ok && !validQuery(query) {
+		return false
+	}
 	switch {
 	case target == "":
 		// Only an HTTP/2 CONNECT request has no target; its authority is
 		// the host.
-		if r.Method != methodConnect {
+		if r.Method != methodConnect || !validConnectAuthority(r.Host) {
 			return false
 		}
 	case strings.IndexByte(target, '#') >= 0:
-		// Clients send no fragment, and servers disagree on whether '#' ends
-		// the path and query, as nginx and Node take it, or is part of them,
-		// as net/http takes it.
+		// Fragments are invalid in request targets.
 		return false
+	case r.Method == methodConnect:
+		if !validConnectAuthority(target) || r.Host != "" && !sameAuthority(target, r.Host, "") {
+			return false
+		}
+		r.Host = target
 	case target[0] == '/':
 		raw := target
 		if i := strings.IndexByte(raw, '?'); i >= 0 {
@@ -337,27 +340,19 @@ func (r *Request) finish() bool {
 		}
 		r.Path = p
 	case target == "*":
+		if r.Method != methodOptions {
+			return false
+		}
 		r.Path = "*"
-	case r.Method == methodConnect:
-		//goland:noinspection HttpUrlsUsage
-		u, err := url.ParseRequestURI("http://" + target)
-		if err != nil || u.Host == "" {
+	default:
+		u, err := url.ParseRequestURI(target)
+		if err != nil || u.Host == "" || u.User != nil {
+			return false
+		}
+		if r.Host != "" && !sameAuthority(r.Host, u.Host, u.Scheme) {
 			return false
 		}
 		r.Host = u.Host
-	default:
-		u, err := url.ParseRequestURI(target)
-		if err != nil {
-			return false
-		}
-		if u.Host != "" {
-			// Servers that read the Host field, as Node and PHP do, would see
-			// another host than the target names.
-			if r.Host != "" && hostmatch.NormalizeHost(r.Host) != hostmatch.NormalizeHost(u.Host) {
-				return false
-			}
-			r.Host = u.Host
-		}
 		p, err := CleanPath(u.EscapedPath())
 		if err != nil {
 			return false
@@ -365,7 +360,31 @@ func (r *Request) finish() bool {
 		r.Path = p
 	}
 	r.name, r.prepared = hostmatch.NormalizeHost(r.Host), true
+	return r.name.Valid()
+}
+
+// validQuery checks the two syntax errors reported by url.ParseQuery without
+// decoding or allocating the parameter map until Query is requested.
+func validQuery(q string) bool {
+	for i := 0; i < len(q); i++ {
+		switch q[i] {
+		case ';':
+			return false
+		case '%':
+			if len(q)-i < 3 || !isHex(q[i+1]) || !isHex(q[i+2]) {
+				return false
+			}
+			i += 2
+		}
+	}
 	return true
+}
+
+func isHex(b byte) bool { return b >= '0' && b <= '9' || b|32 >= 'a' && b|32 <= 'f' }
+
+func validConnectAuthority(authority string) bool {
+	host, port, err := net.SplitHostPort(authority)
+	return err == nil && host != "" && port != "" && hostmatch.NormalizeHost(authority).Valid()
 }
 
 // CleanPath decodes an escaped request path, such as the path of an
@@ -393,13 +412,13 @@ func CleanPath(escaped string) (string, error) {
 			return "", ErrInvalid
 		}
 	}
-	return cleanPath(p), nil
+	return CleanDecodedPath(p), nil
 }
 
 // HasPathPrefix reports whether path, as CleanPath returns it, is prefix or
 // lies below it by whole segments: "/api" has the prefix "/api" and is below
-// it, as are "/api/v1" and "/api;v=1", whose ";" starts the parameters that
-// Tomcat and Jetty remove, but "/apis" is not; a prefix that ends with "/",
+// it, as are "/api/v1" and "/api;v=1", whose ";" starts path parameters.
+// "/apis" has a different first segment. A prefix that ends with "/",
 // such as "/api/", takes only paths below it.
 func HasPathPrefix(path, prefix string) bool {
 	if !strings.HasPrefix(path, prefix) {
@@ -411,9 +430,7 @@ func HasPathPrefix(path, prefix string) bool {
 // ambiguousPath reports whether an escaped path has a segment that servers
 // resolve differently: one that becomes "." or ".." only once decoded, split
 // at an encoded '/' or stripped of ";" parameters, an empty segment with
-// parameters before another segment, or a backslash. nginx, Apache and
-// Tomcat resolve such segments and IIS takes a backslash for a slash, while
-// net/http's ServeMux and Express match the segments as they are.
+// parameters before another segment, or a backslash.
 func ambiguousPath(escaped string) bool {
 	if strings.IndexByte(escaped, '\\') >= 0 || strings.Contains(escaped, "%5C") || strings.Contains(escaped, "%5c") {
 		return true
@@ -442,10 +459,10 @@ func ambiguousPath(escaped string) bool {
 	return false
 }
 
-// cleanPath resolves "." and ".." segments and repeated slashes as servers
+// CleanDecodedPath resolves "." and ".." segments and repeated slashes as servers
 // do, keeping a trailing slash. An empty path becomes "/". Clean paths are
 // returned without allocating.
-func cleanPath(p string) string {
+func CleanDecodedPath(p string) string {
 	if p == "" {
 		return "/"
 	}
@@ -463,18 +480,24 @@ func cleanPath(p string) string {
 }
 
 func isTokenChar(c byte) bool {
-	return c < 0x80 && tokenTable[c]
+	return wire.ValidFieldName(string([]byte{c}))
 }
 
-var tokenTable = func() (t [128]bool) {
-	for c := 'a'; c <= 'z'; c++ {
-		t[c], t[c-'a'+'A'] = true, true
+func sameAuthority(a, b, scheme string) bool {
+	port := func(s string) string {
+		if _, p, e := net.SplitHostPort(s); e == nil {
+			if digits := strings.TrimLeft(p, "0"); digits != "" {
+				return digits
+			}
+			return "0"
+		}
+		switch scheme {
+		case "http":
+			return "80"
+		case "https":
+			return "443"
+		}
+		return ""
 	}
-	for c := '0'; c <= '9'; c++ {
-		t[c] = true
-	}
-	for _, c := range "!#$%&'*+-.^_`|~" {
-		t[c] = true
-	}
-	return t
-}()
+	return hostmatch.NormalizeHost(a) == hostmatch.NormalizeHost(b) && port(a) == port(b)
+}

@@ -12,16 +12,18 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	wire "github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/httprewrite"
 	"github.com/djylb/netx/proxyproto"
+	"github.com/djylb/portmux"
 	"github.com/djylb/portmux/hostmatch"
+	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/timeshim"
 )
 
@@ -63,7 +65,7 @@ func (proxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		rs.key = key
 		if key != "" {
 			rs.keyed = rs.transport.acquire(key)
-			defer rs.transport.release(rs.keyed)
+			defer rs.transport.releaseRequest(rs.keyed)
 		}
 	}
 	filterUpgrade(req, rs.route)
@@ -82,8 +84,8 @@ func filterUpgrade(req *http.Request, rt *route) {
 	ups := req.Header.Values("Upgrade")
 	allowed := true
 	for _, v := range ups {
-		for tok := range strings.SplitSeq(v, ",") {
-			if strings.TrimSpace(tok) != "" && !upgradeAllowed(rt, tok) {
+		for tok := range wire.Tokens(v) {
+			if !upgradeAllowed(rt, tok) {
 				allowed = false
 			}
 		}
@@ -157,7 +159,7 @@ func replacePath(u *url.URL, in *http.Request, rs *reqState) {
 	if strings.IndexByte(esc, '%') < 0 {
 		return
 	}
-	escRest, ok := escapedSuffix(cleanKeepSlash(esc), len(rt.path))
+	escRest, ok := escapedSuffix(httphead.CleanDecodedPath(esc), len(rt.path))
 	if !ok {
 		return
 	}
@@ -175,7 +177,7 @@ func canonicalPath(u *url.URL, in *http.Request, rs *reqState) {
 	if strings.IndexByte(esc, '%') < 0 {
 		return
 	}
-	if clean := cleanKeepSlash(esc); clean != rs.path {
+	if clean := httphead.CleanDecodedPath(esc); clean != rs.path {
 		if dec, err := url.PathUnescape(clean); err == nil && dec == rs.path {
 			u.RawPath = clean
 		}
@@ -214,19 +216,6 @@ func joinPath(prefix, rest string) string {
 		return prefix + "/" + rest
 	}
 	return prefix + rest
-}
-
-// cleanKeepSlash resolves "." and ".." segments and repeated slashes,
-// keeping a trailing slash.
-func cleanKeepSlash(p string) string {
-	if p == "" {
-		return "/"
-	}
-	c := path.Clean(p)
-	if strings.HasSuffix(p, "/") && c != "/" {
-		c += "/"
-	}
-	return c
 }
 
 // roundTripper sends a request with the transport of its route's upstream,
@@ -338,9 +327,9 @@ func (t *transports) CloseIdleConnections() {
 // counts their connections so that a Router knows when a replaced pool has
 // none left.
 type pool struct {
+	retired atomic.Pointer[Router]
 	transports
-	open  atomic.Int64
-	drain timeshim.Timer // of a replaced pool with connections; under Router.mu
+	open atomic.Int64
 
 	up      *upstream // what the transports of keys are built from
 	keys    map[string]*keyPool
@@ -379,9 +368,8 @@ func (p *pool) pushFront(k *keyPool) {
 
 // acquire returns the transports of key, made when the key has none, for
 // a request that calls release when it ends. Above maxKeys keys it closes
-// the idle connections of the least recently used key, which then leaves
-// the pool unless requests use it; keys with requests in progress stay, so
-// the pool exceeds maxKeys by no more than the requests in progress.
+// the idle connections of the least recently used key and removes it from
+// the index immediately. Requests using its transports keep them until release.
 // Choosing the key takes constant time, however many keys there are.
 func (p *pool) acquire(key string) *keyPool {
 	p.mu.Lock()
@@ -398,6 +386,7 @@ func (p *pool) acquire(key string) *keyPool {
 		// while this one waits for its requests to end.
 		evict = p.lru.prev
 		evict.unlink()
+		delete(p.keys, evict.key)
 	}
 	p.mu.Unlock()
 	if evict != nil {
@@ -408,20 +397,24 @@ func (p *pool) acquire(key string) *keyPool {
 }
 
 // release gives back a reference of acquire or of a connection of k.
-func (p *pool) release(k *keyPool) {
+func (p *pool) release(k *keyPool) (evicted bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	k.refs--
-	switch {
-	case p.keys[k.key] != k:
-	case k.refs == 0:
+	if p.keys[k.key] != k {
+		return true
+	}
+	if k.refs == 0 {
 		delete(p.keys, k.key)
 		k.unlink()
-	case k.prev == nil:
-		// Evicted while in use and still holding connections, which
-		// became idle after the eviction closed the idle ones: listed
-		// again, so that a later eviction can take it.
-		p.pushFront(k)
+	}
+	return false
+}
+
+// releaseRequest closes idle connections again if eviction raced the request.
+func (p *pool) releaseRequest(k *keyPool) {
+	if p.release(k) {
+		k.CloseIdleConnections()
 	}
 }
 
@@ -512,7 +505,11 @@ type countedConn struct {
 
 func (c *countedConn) Close() error {
 	c.once.Do(func() {
-		c.pool.open.Add(-1)
+		if c.pool.open.Add(-1) == 0 {
+			if owner := c.pool.retired.Load(); owner != nil {
+				owner.dropEmptyPool(c.pool)
+			}
+		}
 		if c.keyed != nil {
 			c.pool.release(c.keyed)
 		}
@@ -547,20 +544,37 @@ func dialTLS2(ctx context.Context, _, addr string) (net.Conn, error) {
 // upstream's dial timeout and until the Router closes, sends a PROXY header
 // if the upstream wants one and, with alpn, runs TLS over the connection.
 // addr is the outbound URL's host and port.
-func connect(ctx context.Context, addr string, alpn []string) (net.Conn, error) {
+func connect(ctx context.Context, addr string, alpn []string) (result net.Conn, dialErr error) {
+	var c net.Conn
+	defer func() {
+		if v := recover(); v != nil {
+			dialErr = portmux.NewPanicError(v)
+			if c != nil {
+				_ = c.Close()
+			}
+			result = nil
+		}
+	}()
 	rs := stateOf(ctx)
 	if rs == nil || rs.up == nil || rs.transport == nil {
 		return nil, errNoUpstream
 	}
 	up := rs.up
-	cancel := context.CancelFunc(func() {})
+	var cancel context.CancelFunc
 	if up.DialTimeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, up.DialTimeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
 	defer context.AfterFunc(rs.router.ctx, cancel)() //nolint:contextcheck // ends the dial with the Router, by design
-	c, err := callDial(ctx, up, rs)
+	var err error
+	c, err = callDial(ctx, up, rs)
 	if err != nil {
+		return nil, err
+	}
+	if err = ctx.Err(); err != nil {
+		_ = c.Close()
 		return nil, err
 	}
 	rs.transport.open.Add(1)
@@ -613,31 +627,56 @@ func sendProxyHeader(ctx context.Context, c net.Conn, v proxyproto.Version, rs *
 		return err
 	}
 	if d, ok := ctx.Deadline(); ok {
-		_ = c.SetWriteDeadline(d)
-		defer func() { _ = c.SetWriteDeadline(time.Time{}) }()
+		if err = c.SetWriteDeadline(d); err != nil {
+			return err
+		}
 	}
-	_, err = c.Write(b)
-	return err
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { defer close(done); _ = c.Close() })
+	n, err := c.Write(b)
+	if !stop() {
+		<-done
+		return ctx.Err()
+	}
+	if err != nil {
+		return err
+	}
+	if n != len(b) {
+		return io.ErrShortWrite
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return c.SetWriteDeadline(time.Time{})
+	}
+	return nil
 }
 
 // idleConn closes an upgraded backend connection through which nothing
 // passed for its timeout.
 type idleConn struct {
 	io.ReadWriteCloser
-	d     time.Duration
-	timer timeshim.Timer
+	d      time.Duration
+	mu     sync.Mutex
+	closed bool
+	timer  timeshim.Timer
 }
 
 func newIdleConn(c io.ReadWriteCloser, d time.Duration, clk timeshim.Clock) *idleConn {
 	ic := &idleConn{ReadWriteCloser: c, d: d}
-	ic.timer = clk.AfterFunc(d, func() { _ = c.Close() })
+	timer := clk.AfterFunc(d, func() { _ = ic.Close() })
+	ic.mu.Lock()
+	ic.timer = timer
+	closed := ic.closed
+	ic.mu.Unlock()
+	if closed {
+		timer.Stop()
+	}
 	return ic
 }
 
 func (c *idleConn) Read(p []byte) (int, error) {
 	n, err := c.ReadWriteCloser.Read(p)
 	if n > 0 {
-		c.timer.Reset(c.d)
+		c.touch()
 	}
 	return n, err
 }
@@ -645,13 +684,40 @@ func (c *idleConn) Read(p []byte) (int, error) {
 func (c *idleConn) Write(p []byte) (int, error) {
 	n, err := c.ReadWriteCloser.Write(p)
 	if n > 0 {
-		c.timer.Reset(c.d)
+		c.touch()
 	}
 	return n, err
 }
 
+func (c *idleConn) touch() {
+	c.mu.Lock()
+	closed, timer := c.closed, c.timer
+	c.mu.Unlock()
+	if closed {
+		return
+	}
+	timer.Reset(c.d)
+	// A Close concurrent with Reset may have stopped the old timer.
+	c.mu.Lock()
+	closed = c.closed
+	c.mu.Unlock()
+	if closed {
+		timer.Stop()
+	}
+}
+
 func (c *idleConn) Close() error {
-	c.timer.Stop()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	timer := c.timer
+	c.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
 	return c.ReadWriteCloser.Close()
 }
 
@@ -668,7 +734,7 @@ var (
 func callDial(ctx context.Context, up *upstream, rs *reqState) (c net.Conn, err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			c, err = nil, fmt.Errorf("%w: upstream %q: %v", errDialPanic, up.Name, p)
+			c, err = nil, fmt.Errorf("%w: upstream %q: %w", errDialPanic, up.Name, portmux.NewPanicError(p))
 		}
 	}()
 	c, err = up.Dial(ctx, DialInfo{
@@ -734,13 +800,7 @@ func (respondHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if status == 0 {
 		status = http.StatusOK
 	}
-	body := r.Body
-	if !bodyAllowed(status) {
-		body = nil
-	} else {
-		h.Set("Content-Length", strconv.Itoa(len(body)))
-	}
-	respond(w, req, rs, status, body)
+	respond(w, req, rs, status, r.Body)
 }
 
 // respond applies the route's response rules and writes the response.
@@ -753,14 +813,22 @@ func respond(w http.ResponseWriter, req *http.Request, rs *reqState, status int,
 			rs.router.opts.ErrorLog.Printf("httproute: route %q: %v", rs.route.name, err)
 		}
 	}
+	if bodyAllowed(status) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	} else {
+		body = nil
+		w.Header().Del("Content-Length")
+	}
 	w.WriteHeader(status)
 	if req.Method != http.MethodHead && len(body) > 0 {
-		_, _ = w.Write(body)
+		if _, err := w.Write(body); err != nil {
+			rs.err = errors.Join(rs.err, err)
+		}
 	}
 }
 
 func bodyAllowed(status int) bool {
-	return status != http.StatusNoContent && status != http.StatusNotModified
+	return status >= 200 && status != http.StatusResetContent && status != http.StatusNoContent && status != http.StatusNotModified
 }
 
 // bufferPool lends ReverseProxy its copy buffers.

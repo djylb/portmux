@@ -2,7 +2,8 @@ package portmux
 
 import (
 	"errors"
-	"fmt"
+
+	"github.com/djylb/portmux/internal/panicerr"
 )
 
 var (
@@ -67,16 +68,9 @@ var (
 	ErrInvalidRoute = errors.New("portmux: invalid route")
 )
 
-// PanicError is reported for a connection whose matcher, resolver, PROXY
-// protocol policy or route handler panicked: the Mux recovers, closes the
-// connection and goes on serving the others.
-type PanicError struct {
-	// Value is the value passed to panic.
-	Value any
-	// Stack is the stack of the goroutine that panicked.
-	Stack []byte
-}
+// PanicError records a panic recovered while running a callback. Value holds
+// the original panic and Stack identifies the goroutine that recovered it.
+type PanicError = panicerr.PanicError
 
-func (e *PanicError) Error() string {
-	return fmt.Sprintf("portmux: panic serving a connection: %v", e.Value)
-}
+// NewPanicError captures the stack of the goroutine that recovered value.
+func NewPanicError(value any) *PanicError { return panicerr.New(value) }

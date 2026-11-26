@@ -48,8 +48,7 @@ func newTable(s routeSet, order []*Route) *table {
 		if !canMatch(r, st) {
 			continue
 		}
-		var silences []time.Duration
-		reportSilences(st.matchers, func(d time.Duration) { silences = append(silences, d) })
+		silences := st.silences
 		if len(st.entries) > 0 {
 			for _, name := range st.entries {
 				t.byEntry[name].add(r, st, silences)
