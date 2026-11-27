@@ -1,4 +1,4 @@
-github.com/djylb/netx v0.0.0-20261127135004-84459fb784ea h1:giQUpEunyOrg9ygspvz/UPl3EJHL5j0ljLGsVFW+0sY=
-github.com/djylb/netx v0.0.0-20261127135004-84459fb784ea/go.mod h1:y0BAyZQbOnhThRfqyku3Jnnai06ENRHBzYKobkyuunM=
-github.com/djylb/timeshim v0.0.0-20261121052148-1ed9b7a27ad0 h1:BBQv+m6gL1FL9PH25D1OC/SQP4O2I6kY5vzwWI7NGmM=
-github.com/djylb/timeshim v0.0.0-20261121052148-1ed9b7a27ad0/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
+github.com/djylb/netx v0.0.0-20261127164606-0061df8d5f98 h1:eLHP8YJKHFJiPREMyT8ZSNvunI3ruitAYjUdOWqpZwg=
+github.com/djylb/netx v0.0.0-20261127164606-0061df8d5f98/go.mod h1:y0BAyZQbOnhThRfqyku3Jnnai06ENRHBzYKobkyuunM=
+github.com/djylb/timeshim v0.0.0-20261127164912-d5db81fbd4d9 h1:zJQR4aKBKIqUQhjPXaOzTm82O8KWRcgDu4tr2vlIFfY=
+github.com/djylb/timeshim v0.0.0-20261127164912-d5db81fbd4d9/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
