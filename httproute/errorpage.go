@@ -59,7 +59,7 @@ func compilePage(p ErrorPage, vars httprewrite.Vars) (*page, error) {
 			}
 			pg.parts = append(pg.parts, pagePart{text: text}, pagePart{v: t})
 			pg.size += len(text)
-			text = nil //nolint:prealloc // the text between variables: how much of it comes is not known
+			text = nil //nolint:prealloc // The page part now owns the buffer, and the next literal may be empty.
 			body = body[i+end+1:]
 		default:
 			text = append(text, '$')
@@ -94,7 +94,7 @@ func (pg *page) render(c *httprewrite.Context) []byte {
 
 func compilePages(pages map[int]ErrorPage) (map[int]*page, error) {
 	if len(pages) == 0 {
-		return nil, nil //nolint:nilnil // no pages is not an error, and nil is the empty table
+		return nil, nil //nolint:nilnil // A nil map represents a valid empty set of error pages.
 	}
 	out := make(map[int]*page, len(pages))
 	vars := Vars()

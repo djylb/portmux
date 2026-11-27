@@ -58,7 +58,7 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 		out.Header.Del(f)
 	}
 	pr := &httputil.ProxyRequest{In: req, Out: out}
-	rewrite(pr) //nolint:contextcheck // the ReverseProxy hook: the context is the request's
+	rewrite(pr) //nolint:contextcheck // The ReverseProxy hook gets the incoming context from pr.In.
 	out = pr.Out
 	var nonce [16]byte
 	_, _ = rand.Read(nonce[:])
@@ -78,7 +78,7 @@ func proxyExtendedConnect(w http.ResponseWriter, req *http.Request, rs *reqState
 		return
 	}
 	res.Request = out
-	if err := modifyResponse(res); err != nil { //nolint:contextcheck // the ReverseProxy hook: the context is the response's request's
+	if err := modifyResponse(res); err != nil { //nolint:contextcheck // The ReverseProxy hook gets the incoming context through res.Request, which is the cloned request.
 		_ = res.Body.Close()
 		proxyError(w, out, err)
 		return

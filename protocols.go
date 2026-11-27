@@ -319,7 +319,7 @@ func (a *streamAttrs) next() (name, value []byte, valid bool) {
 	return name, rest[1 : 1+end], true
 }
 
-// XML and XMPP namespace URIs are wire identifiers, not links.
+// XML and XMPP require these exact namespace URIs on the wire.
 //
 //goland:noinspection HttpUrlsUsage
 const (

@@ -90,7 +90,7 @@ type Router struct {
 
 	srv   *http.Server
 	proxy *httputil.ReverseProxy
-	ctx   context.Context //nolint:containedctx // the Router's lifetime, canceled by Shutdown and Close; requests and dials end with it
+	ctx   context.Context //nolint:containedctx // The Router owns this lifetime context and cancels it to stop requests and dials.
 	stop  context.CancelFunc
 
 	ln          *netx.ChanListener // for ServeConn
@@ -595,7 +595,7 @@ func (r *Router) route(rec *recorder, req *http.Request, st *state, rs *reqState
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)
 		defer cancel()
-		defer context.AfterFunc(r.ctx, cancel)() //nolint:contextcheck // ends the request with the Router, by design
+		defer context.AfterFunc(r.ctx, cancel)() //nolint:contextcheck // The Router lifetime also cancels requests served by a caller-owned server.
 	}
 	rt.handler.ServeHTTP(w, req.WithContext(ctx))
 }

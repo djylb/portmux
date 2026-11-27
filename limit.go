@@ -28,9 +28,9 @@ var shardSeed = maphash.MakeSeed()
 
 // shardOf spreads clients over n shards by all bytes of their address: the
 // keys of IPv6 clients are networks, whose last bytes are all zero.
-func shardOf(client netip.Prefix, n int) int {
+func shardOf(client netip.Prefix, n uint64) uint64 {
 	b := client.Addr().As16()
-	return int(maphash.Bytes(shardSeed, b[:]) % uint64(n)) //nolint:gosec // n is a positive shard count
+	return maphash.Bytes(shardSeed, b[:]) % n
 }
 
 // slotLimit counts the undelivered connections from Serve for

@@ -566,7 +566,7 @@ func connect(ctx context.Context, addr string, alpn []string) (result net.Conn, 
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
-	defer context.AfterFunc(rs.router.ctx, cancel)() //nolint:contextcheck // ends the dial with the Router, by design
+	defer context.AfterFunc(rs.router.ctx, cancel)() //nolint:contextcheck // The Router lifetime supplies an independent cancellation signal for the dial.
 	var err error
 	c, err = callDial(ctx, up, rs)
 	if err != nil {

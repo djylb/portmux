@@ -1,7 +1,7 @@
 package fingerprint
 
 import (
-	"crypto/md5" //nolint:gosec // JA3 is defined as an MD5 digest; it names a fingerprint and protects nothing
+	"crypto/md5" //nolint:gosec // JA3 specifies MD5 as its fingerprint digest.
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -134,7 +134,7 @@ func JA3(h *tlshello.Hello) string {
 		}
 		b = strconv.AppendUint(b, uint64(f), 10)
 	}
-	sum := md5.Sum(b) //nolint:gosec // see the import
+	sum := md5.Sum(b) //nolint:gosec // JA3 requires an MD5 digest for interoperable fingerprints.
 	return hex.EncodeToString(sum[:])
 }
 
@@ -214,5 +214,5 @@ func (f Filter) String() string {
 
 // digit is the ASCII digit of n, from 0 to 9.
 func digit(n int) byte {
-	return byte('0' + n) //nolint:gosec // callers pass 0 to 9
+	return byte('0' + n) //nolint:gosec // Callers bound n to 0 through 9, so '0' + n fits in a byte.
 }

@@ -147,7 +147,7 @@ type stripedCounters [counterStripes]struct {
 
 // newStripe picks the stripe of a connection from ServeConn.
 func newStripe() uint8 {
-	return uint8(rand.Uint32() % counterStripes) //nolint:gosec // counterStripes fits a byte; spreading counters needs no secure randomness
+	return uint8(rand.Uint32() % counterStripes) //nolint:gosec // A fast pseudorandom draw spreads counters across at most 16 stripes.
 }
 
 func (c *stripedCounters) at(stripe uint8) *counters {

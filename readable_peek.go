@@ -20,7 +20,7 @@ func waitReadable(c net.Conn) error {
 	}
 	rc, err := sc.SyscallConn()
 	if err != nil {
-		return nil //nolint:nilerr // without the raw connection there is nothing to wait on: the read goes ahead
+		return nil //nolint:nilerr // If raw socket access fails, the caller falls back to reading the connection directly.
 	}
 	var peek [1]byte
 	err = rc.Read(func(fd uintptr) bool {

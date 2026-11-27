@@ -308,7 +308,7 @@ var (
 	builtinTLSFilters  map[string]builtin[TLSFilter]
 )
 
-func init() { //nolint:gochecknoinits // the table is built here: see the comment above
+func init() { //nolint:gochecknoinits // The builders look up the tables recursively, so package variable initializers would form a cycle.
 	builtinMatchers = map[string]builtin[Matcher]{
 		"AnyBytes": noArgs(AnyBytes), "Always": noArgs(Always), "SSH": noArgs(SSH), "HTTP2Preface": noArgs(HTTP2Preface),
 		"SOCKS4": noArgs(SOCKS4), "SOCKS5": noArgs(SOCKS5), "PostgreSQL": noArgs(PostgreSQL), "MQTT": noArgs(MQTT),
@@ -647,7 +647,7 @@ func (p *parser) int(n *node, maxValue int) (int, error) {
 // port reads a port number.
 func (p *parser) port(n *node) (uint16, error) {
 	v, err := p.int(n, 65535)
-	return uint16(v), err //nolint:gosec // p.int bounds v to 65535
+	return uint16(v), err //nolint:gosec // p.int returns a value from 0 through 65535, including zero on error.
 }
 
 // prefix reads an IP prefix, or an address that stands for a single one.
