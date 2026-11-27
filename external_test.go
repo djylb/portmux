@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux"
 	"github.com/djylb/portmux/hostmatch"
-	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/ipmatch"
 	"github.com/djylb/portmux/tlshello"
 )
@@ -48,10 +48,10 @@ func TestExternalParsers(t *testing.T) {
 		t.Fatalf("half a hello: %v", err)
 	}
 
-	req, err := httphead.Parse([]byte("POST /v1/x HTTP/1.1\r\nHost: api.example.com:8443\r\nContent-Length: 2\r\n\r\nok"))
+	req, err := httphead.ScanRequest([]byte("POST /v1/x HTTP/1.1\r\nHost: api.example.com:8443\r\nContent-Length: 2\r\n\r\nok"))
 	if err != nil || req.Method != "POST" || hostmatch.SplitHost(req.Host) != "api.example.com" ||
-		req.Header().Get("Content-Length") != "2" {
-		t.Fatalf("httphead.Parse = %+v, %v", req, err)
+		req.Header.Get("Content-Length") != "2" {
+		t.Fatalf("httphead.ScanRequest = %+v, %v", req, err)
 	}
 }
 

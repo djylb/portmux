@@ -7,12 +7,25 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/djylb/netx/proxyproto"
 	"github.com/djylb/portmux/internal/testutil"
 )
+
+func TestPeekHTTPAboveDefaultParserLimit(t *testing.T) {
+	data := []byte("GET / HTTP/1.1\r\nX-Pad: " + strings.Repeat("p", 64<<10) + "\r\n\r\n")
+	conn, err := Peek(&memConn{data: data}, HTTP1(), WithMaxSniffBytes(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if req := conn.HTTPRequest(); req == nil || req.Path != "/" {
+		t.Fatalf("HTTPRequest = %+v", req)
+	}
+}
 
 // pair returns both ends of a loopback TCP connection.
 func pair(t *testing.T) (client, server net.Conn) {

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/djylb/portmux/httphead"
+	"github.com/djylb/netx/httphead"
 )
 
 // Result is the decision of a Matcher for the input seen so far.

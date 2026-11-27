@@ -11,9 +11,8 @@ import (
 	"time"
 
 	"github.com/djylb/netx/forwarded"
-	wire "github.com/djylb/netx/httphead"
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/httprewrite"
-	"github.com/djylb/portmux/httphead"
 )
 
 // MaxRegexpLen bounds the length of Route.PathRegexp.
@@ -381,7 +380,7 @@ func validRedirectStatus(s int) bool {
 
 // isToken reports whether s is an HTTP token, as method and field names are.
 func isToken(s string) bool {
-	return wire.ValidFieldName(s)
+	return httphead.ValidFieldName(s)
 }
 
 // isCleanPath reports whether p is a clean absolute path, as request paths

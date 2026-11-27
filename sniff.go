@@ -418,6 +418,7 @@ func (s *sniffer) readProxyHeader(mode proxyproto.Policy, tables *atomic.Pointer
 // connections that are still undecided.
 func (s *sniffer) match(tables *atomic.Pointer[table], maxSniffBytes int) (*Route, error) {
 	in := &s.in
+	in.http.MaxBytes, in.h2.MaxBytes = maxSniffBytes, maxSniffBytes
 	limit := s.off + maxSniffBytes
 	for {
 		if t := tables.Load(); t != s.table {

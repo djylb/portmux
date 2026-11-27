@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/proxyproto"
-	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/tlshello"
 )
 
@@ -262,8 +262,8 @@ func resultOf(err error) Result {
 	return NoMatch
 }
 
-func parseHTTP(data []byte) (*httphead.Request, Result) {
-	r, err := httphead.Parse(data)
+func parseHTTP(data []byte) (*httphead.RoutedRequest, Result) {
+	r, err := httphead.ScanRequest(data)
 	return r, resultOf(err)
 }
 

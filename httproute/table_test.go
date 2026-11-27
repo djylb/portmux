@@ -12,9 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/httprewrite"
 	"github.com/djylb/portmux/hostmatch"
-	"github.com/djylb/portmux/httphead"
 )
 
 var okRespond = &Respond{Body: []byte("ok")}

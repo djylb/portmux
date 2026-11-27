@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/djylb/portmux/httphead"
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux/internal/testutil"
 )
 

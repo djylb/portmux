@@ -316,7 +316,7 @@ func TestInvalidAndShortInputs(t *testing.T) {
 		{"tls with huge record then close", "\x16\x03\x01\xff\xff\x01", true},
 		{"tls wrong handshake", "\x16\x03\x01\x00\x04\x02\x00\x00\x00", false},
 		{"nul in header name", "GET / HTTP/1.1\r\nHo\x00st: x\r\n\r\n", false},
-		{"long method", strings.Repeat("A", 64), false},
+		{"truncated long method", strings.Repeat("A", 64), true},
 		{"http/2 version", "GET / HTTP/2.0\r\n\r\n", false},
 		{"empty then close", "", true},
 		{"random", string(randomBytes(512)), false},

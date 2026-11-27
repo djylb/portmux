@@ -19,9 +19,9 @@ import (
 
 	"github.com/djylb/netx"
 	"github.com/djylb/netx/forwarded"
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux"
 	"github.com/djylb/portmux/hostmatch"
-	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/internal/pmap"
 	"github.com/djylb/timeshim"
 )

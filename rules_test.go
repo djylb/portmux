@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/djylb/portmux/httphead"
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux/tlshello"
 )
 
@@ -104,7 +104,7 @@ func (a *netAddr) String() string  { return a.s }
 
 func TestParseMatcherNames(t *testing.T) {
 	office := RemoteIP(netip.MustParsePrefix("10.0.0.0/8"))
-	internal := HTTPFilterFunc(func(r *httphead.Request) bool { return r.Header().Get("X-Internal") != "" })
+	internal := HTTPFilterFunc(func(r *httphead.RoutedRequest) bool { return r.Header.Get("X-Internal") != "" })
 	modern := TLSFilterFunc(func(h *tlshello.Hello) bool { return h.MaxVersion() >= 0x0304 })
 	names := &Names{
 		Matchers:    map[string]Matcher{"office": office},

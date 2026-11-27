@@ -10,8 +10,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/proxyproto"
-	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/timeshim"
 )
 
@@ -498,7 +498,7 @@ func TestObservationAndParserAllocations(t *testing.T) {
 	}
 	request := []byte("GET /?q=one&v=%20 HTTP/1.1\r\n\r\n")
 	if n := testing.AllocsPerRun(100, func() {
-		if _, e := httphead.Parse(request); e != nil {
+		if _, e := httphead.ScanRequest(request); e != nil {
 			t.Fatal(e)
 		}
 	}); n > 2 {

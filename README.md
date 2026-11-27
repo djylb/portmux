@@ -6,7 +6,7 @@ databases and custom prefixes — and routing them to separate `net.Listener`s
 or handlers. Routes, limits and options change while serving.
 
 Requires Go 1.26. Besides the standard library it uses only
-[netx](https://github.com/djylb/netx) for PROXY protocol headers and
+[netx](https://github.com/djylb/netx) for HTTP and PROXY protocol headers and
 [timeshim](https://github.com/djylb/timeshim) as its injectable clock.
 
 ## Install
@@ -23,13 +23,27 @@ go get github.com/djylb/portmux
 | `portmux/hostmatch`   | `Set` and `Map` of host name patterns such as `*.example.com`              |
 | `portmux/ipmatch`     | `Set` of IP prefixes, for block lists and networks                         |
 | `portmux/tlshello`    | TLS ClientHello parser                                                     |
-| `portmux/httphead`    | HTTP/1.x and h2c request head parsers, with HPACK                          |
 | `portmux/fingerprint` | JA4 and JA3 fingerprints of ClientHellos, and filters by them              |
 | `portmux/httproute`   | HTTP request routing: reverse proxy, redirects, header rules, error pages  |
 
 A program carries only the packages it imports: the tool packages work without
 a Mux, only `fingerprint` imports hash functions, and only `httproute` imports
 `net/http` and `crypto/tls`.
+
+### Migrate from `portmux/httphead`
+
+Import `github.com/djylb/netx/httphead`. `Conn.HTTPRequest`,
+`Conn.HTTP2Request`, `Input.HTTPRequest`, `Input.HTTP2Request`, and the two
+request fields on `Event` now expose `*httphead.RoutedRequest`. Use that type
+for custom `HTTPFilter.Match` methods, `HTTPFilterFunc` callbacks, and explicit
+type arguments to filter combinators.
+
+Use `ScanRequest` for one-shot HTTP/1.x parsing and `ParseHTTP2` for h2c.
+On a routed request, use `Target` for the raw request target and
+`Header.Get` or `Header.All` to read fields. `Header` retains the wire Host
+field when present, while `Host` is the authority selected for routing. Use
+`hostmatch.NormalizeHost(req.Host)` in place of `req.Name()`. `Query()`
+returns a fresh map. Treat requests returned by portmux as read-only.
 
 ## Usage
 
@@ -790,15 +804,17 @@ routes that one before them hides entirely.
 |-----------------------------------------------------------------|-----------------------------------------------------------|
 | `Peek(c, m, sniffOpts...)`, `PeekAny(c, ms, sniffOpts...)`      | Sniff one connection, and tell which matcher took it      |
 | `NewPeeker(ms, sniffOpts...)`, `Peeker.Peek(c)`                 | `PeekAny` with its matchers prepared once                 |
-| `tlshello.Parse`, `httphead.Parse`, `httphead.ParseHTTP2`       | Parse the first bytes of a connection                     |
+| `tlshello.Parse`, `httphead.ScanRequest`, `httphead.ParseHTTP2` | Parse the first bytes of a connection                     |
 | `httphead.CleanPath`, `httphead.HasPathPrefix`                  | Resolve request paths and compare them as routes do       |
 | `tlshello.Scanner`, `httphead.Scanner`, `httphead.HTTP2Scanner` | Parse as bytes arrive                                     |
 | `fingerprint.JA4`, `fingerprint.JA3`                            | Fingerprint a client's TLS library                        |
 | `hostmatch.Set`, `hostmatch.Map`, `ipmatch.Set`                 | Match host names and IP addresses as the routes do        |
 | `NewInput`, `ParseMatcher`                                      | Run matchers on bytes of your choice; read them from text |
 
-Parsers return `io.ErrUnexpectedEOF` while the bytes are incomplete and
-`ErrInvalid` when they are not of their protocol.
+Parsers return `io.ErrUnexpectedEOF` while the bytes are incomplete.
+`tlshello` reports invalid input with `ErrInvalid`. For HTTP,
+`httphead` distinguishes malformed input, unsupported versions and size
+limits with `ErrMalformed`, `ErrVersion` and `ErrTooLarge`.
 
 ## Limits
 

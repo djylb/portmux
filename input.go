@@ -6,9 +6,9 @@ import (
 	"net"
 	"time"
 
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/proxyproto"
 	"github.com/djylb/portmux/hostmatch"
-	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/tlshello"
 )
 
@@ -26,9 +26,9 @@ type Input struct {
 
 	hello *tlshello.Hello
 	tls   tlshello.Scanner
-	req   *httphead.Request
+	req   *httphead.RoutedRequest
 	http  httphead.Scanner
-	req2  *httphead.Request
+	req2  *httphead.RoutedRequest
 	h2    httphead.HTTP2Scanner
 
 	// values are the ones of SetValue, in the order set.
@@ -170,8 +170,10 @@ func NewInput(remote, local net.Addr) *Input {
 func (in *Input) SetBytes(data []byte, final bool) {
 	if len(data) < len(in.data) {
 		in.hello, in.tls, in.tlsP = nil, tlshello.Scanner{}, parseState{}
-		in.req, in.http, in.httpP = nil, httphead.Scanner{}, parseState{}
-		in.req2, in.h2, in.h2P = nil, httphead.HTTP2Scanner{}, parseState{}
+		in.http.Reset()
+		in.req, in.httpP = nil, parseState{}
+		in.h2.Reset()
+		in.req2, in.h2P = nil, parseState{}
 		in.nmemo = 0
 		clear(in.values)
 		in.values = in.values[:0]
@@ -265,7 +267,7 @@ func (in *Input) ClientHello() (*tlshello.Hello, Result) {
 // httphead. It returns Match and the parsed request once the request line and
 // every header field were received, and NoMatch when the input is not an
 // HTTP/1.x request.
-func (in *Input) HTTPRequest() (*httphead.Request, Result) {
+func (in *Input) HTTPRequest() (*httphead.RoutedRequest, Result) {
 	res := in.step(&in.httpP, in.http.Need(), func() (err error) {
 		in.req, err = in.http.Scan(in.data)
 		return err
@@ -280,7 +282,7 @@ func (in *Input) HTTPRequest() (*httphead.Request, Result) {
 // knowledge, with httphead. It returns Match and the first request once its
 // header block was received, and NoMatch when the input is not such a
 // connection; see HTTP2.
-func (in *Input) HTTP2Request() (*httphead.Request, Result) {
+func (in *Input) HTTP2Request() (*httphead.RoutedRequest, Result) {
 	res := in.step(&in.h2P, in.h2.Need(), func() (err error) {
 		in.req2, err = in.h2.Scan(in.data)
 		return err

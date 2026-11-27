@@ -18,12 +18,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	wire "github.com/djylb/netx/httphead"
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/httprewrite"
 	"github.com/djylb/netx/proxyproto"
 	"github.com/djylb/portmux"
 	"github.com/djylb/portmux/hostmatch"
-	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/timeshim"
 )
 
@@ -84,7 +83,7 @@ func filterUpgrade(req *http.Request, rt *route) {
 	ups := req.Header.Values("Upgrade")
 	allowed := true
 	for _, v := range ups {
-		for tok := range wire.Tokens(v) {
+		for tok := range httphead.Tokens(v) {
 			if !upgradeAllowed(rt, tok) {
 				allowed = false
 			}

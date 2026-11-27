@@ -3,20 +3,20 @@ package portmux
 import (
 	"slices"
 
-	"github.com/djylb/portmux/httphead"
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux/tlshello"
 )
 
-// Filter restricts what a protocol matcher accepts. HTTP1 takes filters of
-// *httphead.Request and TLS filters of *tlshello.Hello. Filters given to one matcher
-// must all pass; AllOf, AnyOf and NoneOf combine filters of one protocol in
-// any nesting.
+// Filter restricts what a protocol matcher accepts. HTTP1 and HTTP2 take
+// filters of *httphead.RoutedRequest and TLS takes filters of *tlshello.Hello.
+// Filters given to one matcher must all pass. AllOf, AnyOf and NoneOf combine
+// filters of one protocol in any nesting.
 type Filter[T any] interface {
 	Match(v T) bool
 }
 
 // HTTPFilter restricts the requests accepted by HTTP1.
-type HTTPFilter = Filter[*httphead.Request]
+type HTTPFilter = Filter[*httphead.RoutedRequest]
 
 // TLSFilter restricts the ClientHellos accepted by TLS.
 type TLSFilter = Filter[*tlshello.Hello]
@@ -25,7 +25,7 @@ type TLSFilter = Filter[*tlshello.Hello]
 type FilterFunc[T any] func(v T) bool
 
 // HTTPFilterFunc adapts a function to HTTPFilter.
-type HTTPFilterFunc = FilterFunc[*httphead.Request]
+type HTTPFilterFunc = FilterFunc[*httphead.RoutedRequest]
 
 // TLSFilterFunc adapts a function to TLSFilter.
 type TLSFilterFunc = FilterFunc[*tlshello.Hello]

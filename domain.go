@@ -55,11 +55,11 @@ func (in *Input) requestedName() (hostmatch.Name, Result) {
 	}
 	req, httpRes := in.HTTPRequest()
 	if httpRes == Match {
-		return req.Name(), Match
+		return hostmatch.NormalizeHost(req.Host), Match
 	}
 	req, h2Res := in.HTTP2Request()
 	if h2Res == Match {
-		return req.Name(), Match
+		return hostmatch.NormalizeHost(req.Host), Match
 	}
 	if tlsRes == NeedMore || httpRes == NeedMore || h2Res == NeedMore {
 		return hostmatch.Name{}, NeedMore

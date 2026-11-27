@@ -328,7 +328,7 @@ func TestNestedMuxOverTLS(t *testing.T) {
 	}
 }
 
-func TestHeaderFilterAndLazyHeader(t *testing.T) {
+func TestHeaderFilterAndRequestHeader(t *testing.T) {
 	req, res := parseHTTP([]byte("GET / HTTP/1.1\r\nHost: h\r\nX-Kind: a, B\r\n" +
 		"X-Any:\r\nx-kind: c\r\n\r\n"))
 	if res != Match {
@@ -350,11 +350,11 @@ func TestHeaderFilterAndLazyHeader(t *testing.T) {
 			t.Errorf("%s = %v, want %v", tt.name, got, tt.want)
 		}
 	}
-	h := req.Header()
+	h := req.Header
 	if got := h.Values("X-Kind"); len(got) != 2 || got[0] != "a, B" || got[1] != "c" {
 		t.Fatalf("X-Kind = %q", got)
 	}
-	if got, ok := h["X-Any"]; !ok || got[0] != "" {
+	if got := h.Values("X-Any"); len(got) != 1 || got[0] != "" {
 		t.Fatalf("X-Any = %q", got)
 	}
 	// Obsolete line folding is rejected rather than interpreted.
@@ -366,8 +366,8 @@ func TestHeaderFilterAndLazyHeader(t *testing.T) {
 			t.Errorf("folded %q: %v", head, res)
 		}
 	}
-	if req.Header()["Host"] != nil {
-		t.Fatal("Host in Header")
+	if got := h.Get("Host"); got != "h" {
+		t.Fatalf("Host = %q", got)
 	}
 }
 

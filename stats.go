@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/djylb/portmux/httphead"
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux/tlshello"
 )
 
@@ -257,8 +257,8 @@ type Event struct {
 	// was refused. Each is set only when its parse succeeded, that is,
 	// matched a complete head, and is nil otherwise.
 	ClientHello  *tlshello.Hello
-	HTTPRequest  *httphead.Request
-	HTTP2Request *httphead.Request
+	HTTPRequest  *httphead.RoutedRequest
+	HTTP2Request *httphead.RoutedRequest
 	// Peer is the address of the TCP peer, which differs from Remote when a
 	// PROXY header was parsed: the peer is then the proxy that sent it.
 	Peer net.Addr

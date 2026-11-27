@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/proxyproto"
-	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/internal/testutil"
 )
 
@@ -140,7 +140,7 @@ func TestSnapshotDescribesRoutes(t *testing.T) {
 	mustAdd(t, m, RouteConfig{Name: "misc", Matchers: []Matcher{
 		Prefix("TST"), SSH(), HTTP2Preface(), SOCKS5(), Silent(2 * time.Second), Not(LocalPort(80, 443)),
 		Named("acme", MatcherFunc(func(*Input) Result { return NoMatch })), MatcherFunc(func(*Input) Result { return NoMatch }),
-		HTTP1(Method("GET"), Path("/a"), Header("X-Kind", "a"), HTTPFilterFunc(func(*httphead.Request) bool { return true })),
+		HTTP1(Method("GET"), Path("/a"), Header("X-Kind", "a"), HTTPFilterFunc(func(*httphead.RoutedRequest) bool { return true })),
 	}})
 	paused := mustAdd(t, m, RouteConfig{Name: "paused"})
 	mustAdd(t, m, RouteConfig{Name: "default", Fallback: true})

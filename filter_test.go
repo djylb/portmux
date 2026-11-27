@@ -5,12 +5,12 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/djylb/portmux/httphead"
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux/internal/testutil"
 	"github.com/djylb/portmux/tlshello"
 )
 
-func parsedRequest(t *testing.T, host, path string) *httphead.Request {
+func parsedRequest(t *testing.T, host, path string) *httphead.RoutedRequest {
 	t.Helper()
 	req, res := parseHTTP([]byte("GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\n\r\n"))
 	if res != Match {
@@ -39,10 +39,10 @@ func TestHTTPFilterCombinations(t *testing.T) {
 		{"first group other path", AnyOf(AllOf(Host("a.example"), PathPrefix("/api/")), Host("b.example")), "a.example", "/web", false},
 		{"second group", AnyOf(AllOf(Host("a.example"), PathPrefix("/api/")), Host("b.example")), "b.example", "/web", true},
 		// Empty sets.
-		{"empty AllOf", AllOf[*httphead.Request](), "x", "/", true},
-		{"empty AnyOf", AnyOf[*httphead.Request](), "x", "/", false},
-		{"empty NoneOf", NoneOf[*httphead.Request](), "x", "/", true},
-		{"func", HTTPFilterFunc(func(r *httphead.Request) bool { return r.Path == "/f" }), "x", "/f", true},
+		{"empty AllOf", AllOf[*httphead.RoutedRequest](), "x", "/", true},
+		{"empty AnyOf", AnyOf[*httphead.RoutedRequest](), "x", "/", false},
+		{"empty NoneOf", NoneOf[*httphead.RoutedRequest](), "x", "/", true},
+		{"func", HTTPFilterFunc(func(r *httphead.RoutedRequest) bool { return r.Path == "/f" }), "x", "/f", true},
 	}
 	for _, tt := range tests {
 		if got := tt.filter.Match(parsedRequest(t, tt.host, tt.path)); got != tt.want {
@@ -92,7 +92,7 @@ func TestFilterDescriptions(t *testing.T) {
 			t.Error("AnyOf(nil) did not panic")
 		}
 	}()
-	AnyOf[*httphead.Request](nil)
+	AnyOf[*httphead.RoutedRequest](nil)
 }
 
 // TestPathIsResolved checks that path rules see the path a server resolves,

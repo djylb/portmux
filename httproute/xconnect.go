@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"github.com/djylb/netx"
-	wire "github.com/djylb/netx/httphead"
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/wsconn"
 )
 
@@ -148,13 +148,13 @@ func closeWrite(w io.Writer) error {
 // an Upgrade field or the :protocol of an extended CONNECT names it, without
 // a version.
 func upgradeAllowed(rt *route, token string) bool {
-	name, _, _ := strings.Cut(wire.TrimOWS(token), "/")
+	name, _, _ := strings.Cut(httphead.TrimOWS(token), "/")
 	return name != "" && slices.ContainsFunc(rt.upgrades, func(a string) bool { return strings.EqualFold(a, name) })
 }
 
 func headerToken(h http.Header, field, token string) bool {
 	for _, v := range h.Values(field) {
-		for t := range wire.Tokens(v) {
+		for t := range httphead.Tokens(v) {
 			if strings.EqualFold(t, token) {
 				return true
 			}
@@ -165,7 +165,7 @@ func headerToken(h http.Header, field, token string) bool {
 
 func stripHop(h http.Header) {
 	for _, v := range h.Values("Connection") {
-		for t := range wire.Tokens(v) {
+		for t := range httphead.Tokens(v) {
 			h.Del(t)
 		}
 	}

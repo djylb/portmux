@@ -68,13 +68,6 @@ linters:
       - linters:
           - govet
         text: "fieldalignment: .*leading bytes of pointer data"
-      # The RFC 7541 tables are data copied from the specification: their
-      # repeated names are the table, and the two Huffman arrays look alike
-      # by being arrays of numbers.
-      - path: httphead/hpack_tables\.go
-        linters:
-          - goconst
-          - dupl
       # Tests build errors in place, repeat their case names and unpack
       # fixtures they partly ignore; they open files and run the test
       # binary by path.

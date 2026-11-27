@@ -5,9 +5,8 @@ import (
 	"slices"
 	"strings"
 
-	wire "github.com/djylb/netx/httphead"
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux/hostmatch"
-	"github.com/djylb/portmux/httphead"
 )
 
 // HTTP1 matches connections that start with an HTTP/1.x request and pass every
@@ -46,24 +45,26 @@ type hostFilter struct {
 	hosts *hostmatch.Set
 }
 
-func (f hostFilter) Match(r *httphead.Request) bool { return f.hosts.MatchName(r.Name()) }
-func (f hostFilter) String() string                 { return call("Host", f.hosts.Patterns(), quote) }
+func (f hostFilter) Match(r *httphead.RoutedRequest) bool {
+	return f.hosts.MatchName(hostmatch.NormalizeHost(r.Host))
+}
+func (f hostFilter) String() string { return call("Host", f.hosts.Patterns(), quote) }
 
 // Method accepts requests with one of the methods. Methods are case-sensitive.
 func Method(methods ...string) HTTPFilter {
-	return listFilter{name: "Method", values: slices.Clone(methods), field: func(r *httphead.Request) string { return r.Method }}
+	return listFilter{name: "Method", values: slices.Clone(methods), field: func(r *httphead.RoutedRequest) string { return r.Method }}
 }
 
 // Path accepts requests whose decoded path equals one of the paths.
 func Path(paths ...string) HTTPFilter {
-	return listFilter{name: "Path", values: slices.Clone(paths), field: func(r *httphead.Request) string { return r.Path }}
+	return listFilter{name: "Path", values: slices.Clone(paths), field: func(r *httphead.RoutedRequest) string { return r.Path }}
 }
 
 // PathPrefix accepts requests whose path is one of the prefixes or lies below
 // it: PathPrefix("/api") accepts "/api" and "/api/v1" but not "/apis", and
 // PathPrefix("/api/") accepts only paths below "/api/".
 func PathPrefix(prefixes ...string) HTTPFilter {
-	return listFilter{name: "PathPrefix", values: slices.Clone(prefixes), prefix: true, field: func(r *httphead.Request) string { return r.Path }}
+	return listFilter{name: "PathPrefix", values: slices.Clone(prefixes), prefix: true, field: func(r *httphead.RoutedRequest) string { return r.Path }}
 }
 
 // listFilter compares a request field with a list of values.
@@ -71,10 +72,10 @@ type listFilter struct {
 	name   string
 	values []string
 	prefix bool
-	field  func(*httphead.Request) string
+	field  func(*httphead.RoutedRequest) string
 }
 
-func (f listFilter) Match(r *httphead.Request) bool {
+func (f listFilter) Match(r *httphead.RoutedRequest) bool {
 	v := f.field(r)
 	for _, want := range f.values {
 		if v == want || f.prefix && httphead.HasPathPrefix(v, want) {
@@ -96,7 +97,7 @@ type queryFilter struct {
 	values []string
 }
 
-func (f queryFilter) Match(r *httphead.Request) bool {
+func (f queryFilter) Match(r *httphead.RoutedRequest) bool {
 	got, ok := r.Query()[f.name]
 	if !ok {
 		return false
@@ -119,8 +120,8 @@ func (f queryFilter) String() string {
 // HostRegexp accepts requests whose host, lowercased and without its port,
 // matches re. Hosts with bytes that no DNS name or IP address has never match.
 func HostRegexp(re *regexp.Regexp) HTTPFilter {
-	return newRegexpFilter("HostRegexp", re, func(r *httphead.Request, re *regexp.Regexp) bool {
-		n := r.Name()
+	return newRegexpFilter("HostRegexp", re, func(r *httphead.RoutedRequest, re *regexp.Regexp) bool {
+		n := hostmatch.NormalizeHost(r.Host)
 		return n.Valid() && n.String() != "" && re.MatchString(n.String())
 	})
 }
@@ -128,7 +129,7 @@ func HostRegexp(re *regexp.Regexp) HTTPFilter {
 // PathRegexp accepts requests whose path, decoded and resolved as Path is,
 // matches re.
 func PathRegexp(re *regexp.Regexp) HTTPFilter {
-	return newRegexpFilter("PathRegexp", re, func(r *httphead.Request, re *regexp.Regexp) bool {
+	return newRegexpFilter("PathRegexp", re, func(r *httphead.RoutedRequest, re *regexp.Regexp) bool {
 		return re.MatchString(r.Path)
 	})
 }
@@ -147,8 +148,8 @@ type headerRegexpFilter struct {
 	re   *regexp.Regexp
 }
 
-func (f headerRegexpFilter) Match(r *httphead.Request) bool {
-	for v := range r.Values(f.name) {
+func (f headerRegexpFilter) Match(r *httphead.RoutedRequest) bool {
+	for v := range r.Header.All(f.name) {
 		if f.re.MatchString(v) {
 			return true
 		}
@@ -194,8 +195,8 @@ type headerFilter struct {
 	tokens []string
 }
 
-func (f headerFilter) Match(r *httphead.Request) bool {
-	for v := range r.Values(f.name) {
+func (f headerFilter) Match(r *httphead.RoutedRequest) bool {
+	for v := range r.Header.All(f.name) {
 		if len(f.tokens) == 0 || hasToken(v, f.tokens) {
 			return true
 		}
@@ -220,14 +221,14 @@ var (
 	upgradeWebSocket  = headerFilter{name: "Upgrade", tokens: []string{"websocket"}}
 )
 
-func (webSocketFilter) Match(r *httphead.Request) bool {
+func (webSocketFilter) Match(r *httphead.RoutedRequest) bool {
 	return connectionUpgrade.Match(r) && upgradeWebSocket.Match(r)
 }
 
 func (webSocketFilter) String() string { return "WebSocket()" }
 
 func hasToken(list string, tokens []string) bool {
-	for part := range wire.Tokens(list) {
+	for part := range httphead.Tokens(list) {
 		for _, t := range tokens {
 			if strings.EqualFold(part, t) {
 				return true

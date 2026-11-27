@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/portmux/hostmatch"
-	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/tlshello"
 )
 
@@ -135,7 +135,7 @@ func portableRule(v any, depth int) bool {
 		return portableChildren(v, depth)
 	case tlsMatcher:
 		return portableChildren(v, depth)
-	case filterSet[*httphead.Request]:
+	case filterSet[*httphead.RoutedRequest]:
 		return portableChildren(v.filters, depth)
 	case filterSet[*tlshello.Hello]:
 		return portableChildren(v.filters, depth)
@@ -143,7 +143,7 @@ func portableRule(v any, depth int) bool {
 		return v.set != nil
 	case *regexpMatcher:
 		return v != nil
-	case headerRegexpFilter, regexpFilter[*httphead.Request], regexpFilter[*tlshello.Hello]:
+	case headerRegexpFilter, regexpFilter[*httphead.RoutedRequest], regexpFilter[*tlshello.Hello]:
 		return true
 	case alwaysMatcher, anyMatcher, prefixMatcher, binaryMatcher, domainMatcher, portMatcher, silentMatcher,
 		hostFilter, listFilter, queryFilter, headerFilter, webSocketFilter, sniFilter, minVersionFilter, alpnFilter:
@@ -510,7 +510,7 @@ func (p *parser) httpFilter(n *node) (HTTPFilter, error) {
 		case f == nil:
 			return nil, p.fail(n.pos, "HTTP filter %s is nil", n.text)
 		}
-		return namedFilter[*httphead.Request]{name: n.text, f: f}, nil
+		return namedFilter[*httphead.RoutedRequest]{name: n.text, f: f}, nil
 	}
 	if f, ok, err := buildBuiltin(p, n, builtinHTTPFilters); ok {
 		return f, err

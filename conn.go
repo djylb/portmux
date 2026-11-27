@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/djylb/netx/httphead"
 	"github.com/djylb/netx/proxyproto"
 	"github.com/djylb/portmux/hostmatch"
-	"github.com/djylb/portmux/httphead"
 	"github.com/djylb/portmux/tlshello"
 	"github.com/djylb/timeshim"
 )
@@ -378,14 +378,14 @@ func (c *Conn) ClientHello() *tlshello.Hello {
 // HTTPRequest returns the HTTP/1.x request head parsed while matching, or
 // nil when none was parsed. It is always set for routes that matched with
 // HTTP1.
-func (c *Conn) HTTPRequest() *httphead.Request {
+func (c *Conn) HTTPRequest() *httphead.RoutedRequest {
 	return c.req
 }
 
 // HTTP2Request returns the first request of a cleartext HTTP/2 connection
 // parsed while matching, or nil when none was parsed. It is always set for
 // routes that matched with HTTP2.
-func (c *Conn) HTTP2Request() *httphead.Request {
+func (c *Conn) HTTP2Request() *httphead.RoutedRequest {
 	return c.req2
 }
 
@@ -428,8 +428,8 @@ func (a eventAddresses) event(entry string, route *Route, p *parsed, err error) 
 // the connection carry it.
 type parsed struct {
 	hello  *tlshello.Hello
-	req    *httphead.Request // HTTP/1.x
-	req2   *httphead.Request // h2c
+	req    *httphead.RoutedRequest // HTTP/1.x
+	req2   *httphead.RoutedRequest // h2c
 	values valueList
 	name   *hostmatch.Name // or nil
 }
@@ -449,9 +449,9 @@ func (p *parsed) requestedName() string {
 	case p.hello != nil:
 		n = p.hello.Name()
 	case p.req != nil:
-		n = p.req.Name()
+		n = hostmatch.NormalizeHost(p.req.Host)
 	case p.req2 != nil:
-		n = p.req2.Name()
+		n = hostmatch.NormalizeHost(p.req2.Host)
 	}
 	if !n.Valid() {
 		return ""
