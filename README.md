@@ -38,6 +38,7 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -63,11 +64,11 @@ func main() {
 	}
 	config := &tls.Config{Certificates: []tls.Certificate{cert}}
 
+	go serveHTTP(tls.NewListener(admin, config), http.FileServer(http.Dir("admin")))
+	go serveHTTP(tls.NewListener(site, config), http.FileServer(http.Dir("www")))
+	go serveHTTP(web, http.RedirectHandler("https://example.com/", http.StatusMovedPermanently))
 	go forward(agents, "127.0.0.1:9000")
 	go forward(ssh, "127.0.0.1:22")
-	go http.Serve(tls.NewListener(admin, config), http.FileServer(http.Dir("admin")))
-	go http.Serve(tls.NewListener(site, config), http.FileServer(http.Dir("www")))
-	go http.Serve(web, http.RedirectHandler("https://example.com/", http.StatusMovedPermanently))
 
 	ln, err := net.Listen("tcp", ":443")
 	if err != nil {
@@ -76,24 +77,64 @@ func main() {
 	log.Fatal(m.Serve(ln))
 }
 
-// forward proxies every connection of l to addr.
-func forward(l net.Listener, addr string) {
+func serveHTTP(l net.Listener, h http.Handler) {
+	s := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
+	if err := s.Serve(l); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Print(err)
+	}
+}
+
+func forward(route *portmux.Route, addr string) {
 	for {
-		c, err := l.Accept()
+		c, err := route.AcceptConn()
 		if err != nil {
+			log.Print(err)
 			return
 		}
-		go func() {
-			defer c.Close()
-			backend, err := net.Dial("tcp", addr)
-			if err != nil {
-				return
-			}
-			defer backend.Close()
-			go io.Copy(backend, c)
-			io.Copy(c, backend)
-		}()
+		go forwardConn(c, addr)
 	}
+}
+
+func forwardConn(c *portmux.Conn, addr string) {
+	defer func() { _ = c.Close() }()
+	upstream, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	defer func() { _ = upstream.Close() }()
+	backend, ok := upstream.(*net.TCPConn)
+	if !ok {
+		log.Printf("unexpected upstream connection type %T", upstream)
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		copyHalf(backend, c)
+		close(done)
+	}()
+	copyHalf(c, backend)
+	<-done
+}
+
+type halfConn interface {
+	net.Conn
+	CloseWrite() error
+}
+
+// Half-close at EOF so the peer can still send its response.
+func copyHalf(dst halfConn, src net.Conn) {
+	_, err := io.Copy(dst, src)
+	if err == nil {
+		err = dst.CloseWrite()
+	}
+	if err == nil {
+		return
+	}
+	log.Print(err)
+	_ = dst.Close()
+	_ = src.Close()
 }
 ```
 
@@ -729,8 +770,8 @@ routes that one before them hides entirely.
   are an invalid config unless the field gives them a meaning.
   `Upstream.MaxIdleConns` and `IdleConnTimeout` default to 64 and 90 s,
   unlike `http.Transport`, where 0 means no limit.
-  The zero value is no bound for `Upstream.ResponseHeaderTimeout`,
-  `Route.UpgradeIdleTimeout` and `Route.MaxRequestBody`.
+  Zero leaves `Upstream.ResponseHeaderTimeout`, `Route.UpgradeIdleTimeout`
+  and `Route.MaxRequestBody` unlimited.
 - Hop-by-hop fields are removed; upgrades such as WebSocket, trailers,
   `Expect: 100-continue` and streaming responses pass through. With "h2" in
   the TLS config's `NextProtos`, clients may use HTTP/2.

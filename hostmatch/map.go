@@ -2,12 +2,11 @@ package hostmatch
 
 import (
 	"errors"
-
-	"github.com/djylb/portmux/internal/panicerr"
 	"iter"
 	"strings"
 	"sync/atomic"
 
+	"github.com/djylb/portmux/internal/panicerr"
 	"github.com/djylb/portmux/internal/pmap"
 )
 
@@ -57,8 +56,8 @@ type Map[V any] struct {
 
 // hostEntry is a pattern, as it compares, and its value.
 type hostEntry[V any] struct {
-	pattern string
 	value   V
+	pattern string
 }
 
 // hostPattern is a pattern normalized as Set compares it.

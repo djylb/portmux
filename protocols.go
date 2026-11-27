@@ -319,6 +319,9 @@ func (a *streamAttrs) next() (name, value []byte, valid bool) {
 	return name, rest[1 : 1+end], true
 }
 
+// XML and XMPP namespace URIs are wire identifiers, not links.
+//
+//goland:noinspection HttpUrlsUsage
 const (
 	xmlNS    = "http://www.w3.org/XML/1998/namespace"
 	xmlnsNS  = "http://www.w3.org/2000/xmlns/"

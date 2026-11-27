@@ -98,14 +98,22 @@ func TestH2CRouting(t *testing.T) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", m.Addr().String())
 		}}
 		defer tr.CloseIdleConnections()
-		req, _ := http.NewRequest("POST", "http://svc.example.com/x", strings.NewReader("body"))
+		// Both transports connect to the local cleartext listener.
+		//goland:noinspection HttpUrlsUsage
+		req, err := http.NewRequest("POST", "http://svc.example.com/x", strings.NewReader("body"))
+		if err != nil {
+			t.Fatal(err)
+		}
 		req.Header.Set("Content-Type", contentType)
 		resp, err := (&http.Client{Transport: tr, Timeout: 5 * time.Second}).Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = resp.Body.Close() }()
-		b, _ := io.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
 		return string(b)
 	}
 	for _, tt := range []struct {

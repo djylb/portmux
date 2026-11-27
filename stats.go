@@ -271,14 +271,14 @@ type Event struct {
 	Read     int64
 	Written  int64
 
-	values valueList // of Input.SetValue
-
 	// Closed reports an event of WithCloseEvents: the delivered connection
 	// was closed.
 	Closed bool
 	// Banned reports that this connection's failure banned its client; see
 	// WithBanPerClient.
 	Banned bool
+
+	values valueList // of Input.SetValue
 }
 
 // Value returns the value that a matcher or resolver stored under key with

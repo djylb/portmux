@@ -87,7 +87,12 @@ func TestHPACKInvalid(t *testing.T) {
 }
 
 func TestParseHTTP2(t *testing.T) {
-	req, _ := http.NewRequest("POST", "http://API.example.com:8080/svc/../v1/Method?x=1", nil)
+	// The request is encoded by an in-memory h2c client.
+	//goland:noinspection HttpUrlsUsage
+	req, err := http.NewRequest("POST", "http://API.example.com:8080/svc/../v1/Method?x=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	req.Header.Set("Content-Type", "application/grpc")
 	req.Header.Set("Te", "trailers")
 	data := testutil.H2CBytes(t, req)
@@ -124,7 +129,12 @@ func TestParseHTTP2(t *testing.T) {
 // FuzzParseHTTP2 checks that a decision made on a prefix never changes and
 // that a scanner fed in pieces agrees with ParseHTTP2.
 func FuzzParseHTTP2(f *testing.F) {
-	req, _ := http.NewRequest("GET", "http://www.example.com/a?b=c", nil)
+	// The seed is encoded by an in-memory h2c client.
+	//goland:noinspection HttpUrlsUsage
+	req, err := http.NewRequest("GET", "http://www.example.com/a?b=c", nil)
+	if err != nil {
+		f.Fatal(err)
+	}
 	req.Header.Set("Content-Type", "application/grpc")
 	f.Add(testutil.H2CBytes(f, req), uint8(3))
 	f.Add([]byte(HTTP2Preface+"\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x0d\x01\x05\x00\x00\x00\x01\x82\x86\x84\x41\x8c\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff"), uint8(1))

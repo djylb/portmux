@@ -417,7 +417,12 @@ func TestResolveHosts(t *testing.T) {
 }
 
 func TestDomainMatchesH2C(t *testing.T) {
-	req, _ := http.NewRequest("GET", "http://www.example.com/", nil)
+	// The in-memory h2c client requires the cleartext scheme.
+	//goland:noinspection HttpUrlsUsage
+	req, err := http.NewRequest("GET", "http://www.example.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	data := testutil.H2CBytes(t, req)
 	if Domain("*.example.com").Match(inputOf(data)) != Match || Domain("other.org").Match(inputOf(data)) != NoMatch {
 		t.Fatal("Domain on h2c")

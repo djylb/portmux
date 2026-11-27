@@ -364,23 +364,36 @@ func TestRequestedNameOfYourOwn(t *testing.T) {
 
 // TestPeekAny tells which matcher took a connection.
 func TestPeekAny(t *testing.T) {
-	for data, want := range map[string]int{"SSH-2.0-x\r\n": 2, "GET / HTTP/1.1\r\nHost: h\r\n\r\n": 1, "\x00\x01": -1} {
-		a, b := net.Pipe()
-		defer func() { _ = b.Close() }()
-		done := make(chan struct{})
-		go func() { defer close(done); _, _ = b.Write([]byte(data)) }()
-		conn, i, err := PeekAny(a, []Matcher{TLS(), HTTP1(), SSH()})
-		if i != want || (want >= 0) != (err == nil) {
-			t.Errorf("%q: PeekAny = %d, %v; want %d", data, i, err, want)
-		}
-		if want < 0 && !errors.Is(err, ErrNoMatch) {
-			t.Errorf("%q: error %v", data, err)
-		}
-		if conn == nil {
-			t.Fatalf("%q: PeekAny returned no Conn", data)
-		}
-		_ = conn.Close()
-		<-done
+	for _, tc := range []struct {
+		name string
+		data string
+		want int
+	}{
+		{name: "SSH", data: "SSH-2.0-x\r\n", want: 2},
+		{name: "HTTP1", data: "GET / HTTP/1.1\r\nHost: h\r\n\r\n", want: 1},
+		{name: "no match", data: "\x00\x01", want: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b := net.Pipe()
+			done := make(chan struct{})
+			t.Cleanup(func() {
+				_ = b.Close()
+				_ = a.Close()
+				<-done
+			})
+			go func() { defer close(done); _, _ = b.Write([]byte(tc.data)) }()
+			conn, i, err := PeekAny(a, []Matcher{TLS(), HTTP1(), SSH()})
+			if i != tc.want || (tc.want >= 0) != (err == nil) {
+				t.Errorf("PeekAny = %d, %v; want %d", i, err, tc.want)
+			}
+			if tc.want < 0 && !errors.Is(err, ErrNoMatch) {
+				t.Errorf("error %v", err)
+			}
+			if conn == nil {
+				t.Fatal("PeekAny returned no Conn")
+			}
+			_ = conn.Close()
+		})
 	}
 }
 

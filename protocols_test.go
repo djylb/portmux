@@ -123,18 +123,23 @@ func TestRegexp(t *testing.T) {
 }
 
 func TestXMPP(t *testing.T) {
+	if !xmlCharacter(0x10ffff) || xmlCharacter(0x110000) {
+		t.Fatal("invalid XML character range")
+	}
 	m := XMPP()
+	// The namespace URI is matched verbatim on the wire.
+	//goland:noinspection HttpUrlsUsage
 	client := "<?xml version='1.0'?><stream:stream to='example.com' xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' version='1.0'>"
 	matchAll(t, m, []byte(client), len(client), Match)
 	direct := "<stream:stream xmlns=\"jabber:server\" to=\"example.com\">"
 	matchAll(t, m, []byte(direct), len(direct), NoMatch)
-	component := "<stream:stream note='a>b' xmlns='jabber:component:accept' xmlns:stream='http://etherx.jabber.org/streams'>"
+	component := "<stream:stream note='a>b' xmlns='jabber:component:accept' xmlns:stream='" + streamNS + "'>"
 	matchAll(t, m, []byte(component), len(component), Match)
-	for _, attrs := range []string{" db:attr='v' xmlns:db='jabber:server:dialback' xml:lang='en'", " note='&amp;&#65;&#x41;'"} {
+	for _, attrs := range []string{" db:attr='v' xmlns:db='jabber:server:dialback' xml:lang='en'", " note='&amp;&#65;&#x41;'", " note='&#x10000;&#x10ffff;'"} {
 		msg := strings.TrimSuffix(client, ">") + attrs + ">"
 		matchAll(t, m, []byte(msg), len(msg), Match)
 	}
-	for _, attrs := range []string{" xmlns='jabber:client'", " a='unterminated", " a='<'", " a='&unknown;'", " a='&#0;'", " a='x' a='y'", " xmlns:xmlns='bad'", " q:id='v'", " xmlns:a='urn:x' xmlns:b='urn:x' a:v='1' b:v='2'"} {
+	for _, attrs := range []string{" xmlns='jabber:client'", " a='unterminated", " a='<'", " a='&unknown;'", " a='&#0;'", " a='&#xd800;'", " a='&#x110000;'", " a='x' a='y'", " xmlns:xmlns='bad'", " q:id='v'", " xmlns:a='urn:x' xmlns:b='urn:x' a:v='1' b:v='2'"} {
 		msg := strings.TrimSuffix(client, ">") + attrs + ">"
 		if got := matchXMPP([]byte(msg)); got == Match {
 			t.Fatal(attrs)
@@ -142,7 +147,7 @@ func TestXMPP(t *testing.T) {
 	}
 	escaped := strings.Replace(component, "jabber:component:accept", "jabber&#58;component:accept", 1)
 	matchAll(t, m, []byte(escaped), len(escaped), Match)
-	wrong := strings.Replace(component, "http://etherx.jabber.org/streams", "wrong", 1)
+	wrong := strings.Replace(component, streamNS, "wrong", 1)
 	matchAll(t, m, []byte(wrong), len(wrong), NoMatch)
 	other := "<?xml version='1.0'?>\n<stream:stream xmlns='urn:other'>"
 	matchAll(t, m, []byte(other), len(other), NoMatch)

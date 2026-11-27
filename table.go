@@ -165,7 +165,7 @@ func (rs *ruleSet) finish(t *table) {
 }
 
 // evaluate returns the first route that is not ruled out yet, if it matches.
-// Routes that cannot match any more are marked in dead.
+// Routes that cannot match anymore are marked in dead.
 // It returns the route that takes the connection and the route that decided,
 // which differ for a resolver.
 func (rs *ruleSet) evaluate(dead []bool, in *Input) (target, via *Route, res Result) {
@@ -183,7 +183,7 @@ func (rs *ruleSet) evaluate(dead []bool, in *Input) (target, via *Route, res Res
 			}
 		case NoMatch:
 		}
-		// The rule cannot match any more.
+		// The rule cannot match anymore.
 		dead[i] = true
 	}
 	return nil, nil, NoMatch

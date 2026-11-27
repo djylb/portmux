@@ -4,8 +4,8 @@ linters:
   default: all
   disable:
     # Formatting and naming style that gofmt and the code's idiom already
-    # settle: blank-line placement, short names in short scopes, the
-    # if err := f(); err != nil form, embedded-field spacing.
+    # settle: blank-line placement, short names in short scopes, inline
+    # error checks, and embedded-field spacing.
     - wsl
     - wsl_v5
     - nlreturn
@@ -49,18 +49,13 @@ linters:
     # Type assertions follow a classification of the Limiter's kind; a
     # mismatch is a bug that must panic.
     - forcetypeassert
-    # No import rules: the module has no dependencies.
+    # The module does not impose additional import rules.
     - depguard
     # Deprecated, replaced by gomodguard_v2.
     - gomodguard
   settings:
     govet:
       enable-all: true
-      disable:
-        # Checked on its own, as fieldalignment; what remains are
-        # pointer-byte reports, for which fields keep their order of
-        # meaning.
-        - fieldalignment
     exhaustive:
       default-signifies-exhaustive: true
     nolintlint:
@@ -68,6 +63,11 @@ linters:
       require-specific: true
   exclusions:
     rules:
+      # Keep fields in semantic order when only pointer bytes can be reduced.
+      # Fieldalignment still checks struct sizes.
+      - linters:
+          - govet
+        text: "fieldalignment: .*leading bytes of pointer data"
       # The RFC 7541 tables are data copied from the specification: their
       # repeated names are the table, and the two Huffman arrays look alike
       # by being arrays of numbers.

@@ -44,6 +44,8 @@ func scanInPieces(t *testing.T, data []byte, step uint8, parse, scan func([]byte
 }
 
 func TestParse(t *testing.T) {
+	// Absolute-form fixtures exercise the default port for the cleartext scheme.
+	//goland:noinspection HttpUrlsUsage
 	tests := []struct {
 		name   string
 		data   string

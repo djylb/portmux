@@ -504,7 +504,7 @@ func TestObservationAndParserAllocations(t *testing.T) {
 	}); n > 2 {
 		t.Errorf("query allocated %v times", n)
 	}
-	stream := []byte("<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams'>")
+	stream := []byte("<stream:stream xmlns='jabber:server' xmlns:stream='" + streamNS + "'>")
 	if n := testing.AllocsPerRun(100, func() {
 		if matchXMPP(stream) != Match {
 			t.Fatal("stream")

@@ -15,7 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -69,7 +69,8 @@ func startRouter(t *testing.T, o Options, c Config) (*Router, string) {
 		_ = r.Close()
 		<-done
 	})
-	return r, "http://" + ln.Addr().String()
+	base := url.URL{Scheme: "http", Host: ln.Addr().String()}
+	return r, base.String()
 }
 
 // client returns an HTTP client whose idle connections close with the test.
@@ -105,11 +106,15 @@ func get(t *testing.T, c *http.Client, method, url, host string, header http.Hea
 	return res, string(body)
 }
 
-// rawRequest writes a request to a new connection to addr and returns the
-// connection and a reader of it.
+// rawRequest writes a request to the test listener at base and returns
+// the connection and a reader of it.
 func rawRequest(t *testing.T, base, request string) (net.Conn, *bufio.Reader) {
 	t.Helper()
-	c, err := net.Dial("tcp", strings.TrimPrefix(base, "http://"))
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := net.Dial("tcp", u.Host)
 	if err != nil {
 		t.Fatal(err)
 	}

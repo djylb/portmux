@@ -124,17 +124,17 @@ func portableRule(v any, depth int) bool {
 	}
 	switch v := v.(type) {
 	case andMatcher:
-		return portableChildren([]Matcher(v), depth)
+		return portableChildren(v, depth)
 	case orMatcher:
-		return portableChildren([]Matcher(v), depth)
+		return portableChildren(v, depth)
 	case notMatcher:
 		return portableRule(v.m, depth+1)
 	case httpMatcher:
-		return portableChildren([]HTTPFilter(v), depth)
+		return portableChildren(v, depth)
 	case http2Matcher:
-		return portableChildren([]HTTPFilter(v), depth)
+		return portableChildren(v, depth)
 	case tlsMatcher:
-		return portableChildren([]TLSFilter(v), depth)
+		return portableChildren(v, depth)
 	case filterSet[*httphead.Request]:
 		return portableChildren(v.filters, depth)
 	case filterSet[*tlshello.Hello]:
@@ -324,14 +324,14 @@ func init() { //nolint:gochecknoinits // the table is built here: see the commen
 		"HTTP1":     variadic((*parser).httpFilter, HTTP1),
 		"HTTP2":     variadic((*parser).httpFilter, HTTP2),
 		"TLS":       variadic((*parser).tlsFilter, TLS),
-		"Not": {1, 1, func(p *parser, args []*node) (Matcher, error) {
+		"Not": {lo: 1, hi: 1, build: func(p *parser, args []*node) (Matcher, error) {
 			m, err := p.matcher(args[0])
 			if err != nil {
 				return nil, err
 			}
 			return Not(m), nil
 		}},
-		"Regexp": {2, 2, func(p *parser, args []*node) (Matcher, error) {
+		"Regexp": {lo: 2, hi: 2, build: func(p *parser, args []*node) (Matcher, error) {
 			re, err := p.regexp(args[0])
 			if err != nil {
 				return nil, err
@@ -342,7 +342,7 @@ func init() { //nolint:gochecknoinits // the table is built here: see the commen
 			}
 			return Regexp(re, size), nil
 		}},
-		"Silent": {1, 1, func(p *parser, args []*node) (Matcher, error) {
+		"Silent": {lo: 1, hi: 1, build: func(p *parser, args []*node) (Matcher, error) {
 			d, err := time.ParseDuration(args[0].text)
 			if err != nil || args[0].call || args[0].str {
 				return nil, p.fail(args[0].pos, "invalid duration")
@@ -360,7 +360,7 @@ func init() { //nolint:gochecknoinits // the table is built here: see the commen
 		"Header":     nameAndStrings(Header),
 		"Query":      nameAndStrings(Query),
 		"WebSocket":  noArgs(WebSocket),
-		"HeaderRegexp": {2, 2, func(p *parser, args []*node) (HTTPFilter, error) {
+		"HeaderRegexp": {lo: 2, hi: 2, build: func(p *parser, args []*node) (HTTPFilter, error) {
 			name, err := p.str(args[0])
 			if err != nil {
 				return nil, err
@@ -377,7 +377,7 @@ func init() { //nolint:gochecknoinits // the table is built here: see the commen
 		"SNI":       variadic((*parser).hostPattern, SNI),
 		"ALPN":      variadic((*parser).str, ALPN),
 		"SNIRegexp": oneRegexp(SNIRegexp),
-		"MinTLSVersion": {1, 1, func(p *parser, args []*node) (TLSFilter, error) {
+		"MinTLSVersion": {lo: 1, hi: 1, build: func(p *parser, args []*node) (TLSFilter, error) {
 			v, ok := parseVersion(args[0].text)
 			if !ok || args[0].call || args[0].str {
 				return nil, p.fail(args[0].pos, "invalid TLS version")
@@ -390,12 +390,12 @@ func init() { //nolint:gochecknoinits // the table is built here: see the commen
 
 // noArgs is a built-in without arguments.
 func noArgs[T any](f func() T) builtin[T] {
-	return builtin[T]{0, 0, func(*parser, []*node) (T, error) { return f(), nil }}
+	return builtin[T]{lo: 0, hi: 0, build: func(*parser, []*node) (T, error) { return f(), nil }}
 }
 
 // variadic is a built-in of any number of arguments, each read with arg.
 func variadic[A, T any](arg func(*parser, *node) (A, error), f func(...A) T) builtin[T] {
-	return builtin[T]{0, -1, func(p *parser, args []*node) (T, error) {
+	return builtin[T]{lo: 0, hi: -1, build: func(p *parser, args []*node) (T, error) {
 		vs, err := each(args, func(n *node) (A, error) { return arg(p, n) })
 		if err != nil {
 			var zero T
@@ -407,7 +407,7 @@ func variadic[A, T any](arg func(*parser, *node) (A, error), f func(...A) T) bui
 
 // oneRegexp is a built-in of one regular expression.
 func oneRegexp[T any](f func(*regexp.Regexp) T) builtin[T] {
-	return builtin[T]{1, 1, func(p *parser, args []*node) (T, error) {
+	return builtin[T]{lo: 1, hi: 1, build: func(p *parser, args []*node) (T, error) {
 		re, err := p.regexp(args[0])
 		if err != nil {
 			var zero T
@@ -419,7 +419,7 @@ func oneRegexp[T any](f func(*regexp.Regexp) T) builtin[T] {
 
 // nameAndStrings is a built-in of a name and any number of strings after it.
 func nameAndStrings[T any](f func(string, ...string) T) builtin[T] {
-	return builtin[T]{1, -1, func(p *parser, args []*node) (T, error) {
+	return builtin[T]{lo: 1, hi: -1, build: func(p *parser, args []*node) (T, error) {
 		ss, err := each(args, p.str)
 		if err != nil {
 			var zero T

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -126,7 +127,8 @@ func TestHTTPServersOnRoutes(t *testing.T) {
 	t.Cleanup(client.CloseIdleConnections)
 	get := func(host, path string) string {
 		t.Helper()
-		req, err := http.NewRequest(http.MethodGet, "http://"+m.Addr().String()+path, nil)
+		u := url.URL{Scheme: "http", Host: m.Addr().String(), Path: path}
+		req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -325,7 +325,7 @@ func (m *Mux) claim(s *sniffer, r *Route, st *routeState) error {
 	}
 	// A connection that Close no longer reaches through the pending set
 	// is not handed over once Close began, and the done channels of the
-	// routes stop one that waits for Accept. One handed over is
+	// routes stop one that waits for Accept. A connection already handed over was
 	// delivered before Close began.
 	if m.closed.Load() {
 		return net.ErrClosed

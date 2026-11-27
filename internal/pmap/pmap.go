@@ -551,7 +551,7 @@ func build[V any](es []slot[V], shift uint) *node[V] {
 		case 1:
 			n.slots = append(n.slots, part[0])
 		default:
-			n.slots = append(n.slots, slot[V]{sub: build(part, shift+bitsPerLevel)})
+			n.slots = append(n.slots, slot[V]{sub: build[V](part, shift+bitsPerLevel)})
 		}
 	}
 	return n

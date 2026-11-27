@@ -138,7 +138,7 @@ func (m *Mux) Config() Config {
 // Listen adds an unnamed route with priority 0 for the matchers and returns
 // it, a net.Listener of the connections it matches. Routes with equal
 // priority are tried in the order they were added, so for a static setup
-// Listen routes can simply be added from specific to general. After Close it
+// Listen routes can simply be added from specific to general. After Close, it
 // returns a closed route, whose Accept returns net.ErrClosed, as a listener
 // does. Listen panics on a nil matcher and without matchers, as a route
 // without them matches nothing: take every connection with AnyBytes or
@@ -157,7 +157,7 @@ func (m *Mux) Listen(matchers ...Matcher) *Route {
 
 // Add adds a route. Each change of the routes rebuilds what connections are
 // matched against, in time that grows with the number of routes, so add many
-// routes at once with Batch. After Close it returns net.ErrClosed with the
+// routes at once with Batch. After Close, it returns net.ErrClosed with the
 // route, closed.
 func (m *Mux) Add(cfg RouteConfig) (*Route, error) {
 	var r *Route
@@ -420,7 +420,7 @@ func (m *Mux) runHandler(handler func(*Conn), conn *Conn, cs *connSettings, deli
 // ServeConn matches c and hands it to a route, in the calling goroutine. It
 // returns nil once a route accepted c; for a route with a handler, it calls
 // the handler and returns when the handler returns, or a *PanicError when
-// the handler panicked. Otherwise it closes c and returns the reason, which
+// the handler panicked. Otherwise, it closes c and returns the reason, which
 // the observer of WithObserver also receives.
 //
 // Connections passed to ServeConn skip the admission that Serve applies: the
