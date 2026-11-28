@@ -534,7 +534,7 @@ func xmlValueRune(b []byte) (rune, int) {
 
 func xmlCharacter(r rune) bool {
 	return r == '\t' || r == '\n' || r == '\r' || r >= ' ' && r <= 0xd7ff ||
-		r >= 0xe000 && r <= 0xfffd || r >= 0x10000 && r <= utf8.MaxRune
+		r >= 0xe000 && r <= 0xfffd || r >= 0x10000 && utf8.ValidRune(r)
 }
 
 // DNS matches DNS queries over TCP by their length prefix and header: a
