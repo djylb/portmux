@@ -106,18 +106,24 @@ func TestBanListBounds(t *testing.T) {
 		t.Fatal("ban period")
 	}
 	// Expired clients are swept, and the list stops growing when full.
+	representatives := make(map[*banShard]banKey, banShards)
 	for i := range DefaultMaxClientRecords + 100 {
 		ip := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
-		l.fail(banKey{client: host(ip)}, 10*time.Minute, 5, time.Second, time.Minute, testRecords)
+		key := banKey{client: host(ip)}
+		representatives[l.shard(key.client)] = key
+		l.fail(key, 10*time.Minute, 5, time.Second, time.Minute, testRecords)
 	}
 	if n := l.size.Load(); n > DefaultMaxClientRecords {
 		t.Fatalf("size %d", n)
 	}
-	for i := range sweepEvery * banShards {
-		ip := netip.AddrFrom4([4]byte{172, 16, byte(i >> 8), byte(i)})
-		l.fail(banKey{client: host(ip)}, time.Hour, 5, time.Second, time.Minute, testRecords)
+	// Give each populated shard a full sweep interval, independently of
+	// the addresses encountered with this process's hash seed.
+	for _, key := range representatives {
+		for range sweepEvery {
+			l.fail(key, time.Hour, sweepEvery+1, time.Second, time.Minute, testRecords)
+		}
 	}
-	if n := l.size.Load(); n > DefaultMaxClientRecords/2 {
+	if n := l.size.Load(); n > banShards {
 		t.Fatalf("size %d after sweeping", n)
 	}
 }

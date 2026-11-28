@@ -199,6 +199,11 @@ func copyHalf(dst halfConn, src net.Conn) {
   but a certificate for `*.example.com` does not cover it. Names compare
   case-insensitively and without a trailing dot, and names with bytes that
   no host name has, such as `@` or any non-ASCII byte, match nothing.
+  For legacy `*example.com`, use `example.com` and `*.example.com` so
+  names such as `fooexample.com` cannot claim the route.
+  `hostmatch.RewriteLegacyPattern` performs this rewrite and passes valid
+  patterns through. For partial labels such as `api-*.example.com`, list
+  the intended exact hosts to avoid admitting unrelated names.
 - Paths are decoded and resolved as servers resolve them, so `/public/../admin/`
   is `/admin/`, a path with a control character once decoded is ruled out, and `PathPrefix("/api")` matches `/api` and `/api/v1` but not
   `/apis`.

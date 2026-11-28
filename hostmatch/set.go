@@ -74,8 +74,11 @@ func NewSet(patterns ...string) *Set {
 // Patterns returns the patterns the set was built from.
 func (h *Set) Patterns() []string { return slices.Clone(h.patterns) }
 
-// ErrPattern reports a pattern that CheckPattern rejects.
-var ErrPattern = errors.New("hostmatch: invalid pattern")
+// ErrInvalid reports a pattern that CheckPattern or RewriteLegacyPattern rejects.
+var ErrInvalid = errors.New("hostmatch: invalid pattern")
+
+// ErrPattern is the error used for invalid patterns.
+var ErrPattern = ErrInvalid
 
 // CheckPattern reports whether p is one of the patterns of Set: an exact
 // name, "*.name", ".name", "*" or "". Names have labels of ASCII letters,
@@ -110,13 +113,44 @@ func CheckPattern(p string) error {
 		}
 		for i := range len(label) {
 			if c := label[i]; c == '*' {
-				return fmt.Errorf("%w: %q has '*' where only a leading \"*.\" may be", ErrPattern, p)
+				if suffix, ok := legacySuffix(p); ok {
+					return fmt.Errorf("%w: %q: use %q and %q for the domain and its subdomains", ErrPattern, p, suffix, "*."+suffix)
+				}
+				return fmt.Errorf("%w: %q has a partial or misplaced wildcard; list exact host names or use a full leading label \"*.\"", ErrPattern, p)
 			} else if c >= 0x80 || !hostTable[c] || c == '%' {
 				return fmt.Errorf("%w: %q has the byte %q", ErrPattern, p, c)
 			}
 		}
 	}
 	return nil
+}
+
+// RewriteLegacyPattern returns a valid pattern unchanged. It rewrites
+// "*example.com" as "example.com" and "*.example.com", matching only at
+// DNS label boundaries. The suffix must contain at least two labels.
+// Other malformed patterns return an error matching [ErrInvalid].
+// For a partial label such as "api-*.example.com", list the intended hosts.
+func RewriteLegacyPattern(pattern string) ([]string, error) {
+	if suffix, ok := legacySuffix(pattern); ok {
+		return []string{suffix, "*." + suffix}, nil
+	}
+	if err := CheckPattern(pattern); err != nil {
+		return nil, err
+	}
+	return []string{pattern}, nil
+}
+
+func legacySuffix(pattern string) (string, bool) {
+	suffix, ok := strings.CutPrefix(pattern, "*")
+	if !ok || strings.HasPrefix(suffix, ".") || strings.ContainsAny(suffix, "*:") || !strings.Contains(strings.TrimSuffix(suffix, "."), ".") {
+		return "", false
+	}
+	// Reject IP addresses and require a suffix that passes the same rules
+	// as a wildcard pattern.
+	if _, err := netip.ParseAddr(strings.TrimSuffix(suffix, ".")); err == nil || CheckPattern("*."+suffix) != nil {
+		return "", false
+	}
+	return suffix, true
 }
 
 func mustPattern(p string) {

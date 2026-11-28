@@ -5,6 +5,8 @@
 // ones that share all they leave alone, so changes cost little however many
 // patterns there are. Map holds a Snapshot that Set, Delete and TryEdit
 // replace while lookups run. CheckPattern refuses patterns of other forms.
+// RewriteLegacyPattern migrates a leading star attached to a domain into
+// separate patterns for the domain and its subdomains.
 //
 // Names compare case-insensitively and without a trailing dot, and names
 // with bytes that no DNS name or IP address has match no pattern. Normalize
