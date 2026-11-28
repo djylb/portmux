@@ -17,10 +17,7 @@ func TestRewriteLegacyPattern(t *testing.T) {
 		legacy   = "*" + domain
 		partial  = "api-*." + domain
 	)
-	if err := hostmatch.CheckPattern(legacy); !errors.Is(err, hostmatch.ErrPattern) ||
-		!strings.Contains(err.Error(), fmt.Sprintf("%q and %q", domain, wildcard)) {
-		t.Fatalf("legacy diagnostic: %v", err)
-	}
+	wantDiagnostic(t, hostmatch.CheckPattern(legacy), fmt.Sprintf("%q and %q", domain, wildcard))
 	patterns, err := hostmatch.RewriteLegacyPattern(legacy)
 	if err != nil || !slices.Equal(patterns, []string{domain, wildcard}) {
 		t.Fatalf("rewrite: %q, %v", patterns, err)
@@ -40,9 +37,17 @@ func TestRewriteLegacyPattern(t *testing.T) {
 			t.Errorf("rewrite %q = %q, %v", pattern, got, err)
 		}
 	}
-	if err := hostmatch.CheckPattern(partial); !errors.Is(err, hostmatch.ErrPattern) ||
-		!strings.Contains(err.Error(), "list exact host names") {
-		t.Fatalf("partial diagnostic: %v", err)
+	wantDiagnostic(t, hostmatch.CheckPattern(partial), "list exact host names")
+}
+
+// wantDiagnostic checks that err is a pattern error whose text explains the fix.
+func wantDiagnostic(t *testing.T, err error, hint string) {
+	t.Helper()
+	if err == nil || !errors.Is(err, hostmatch.ErrPattern) {
+		t.Fatalf("got %v, want a pattern error", err)
+	}
+	if !strings.Contains(err.Error(), hint) {
+		t.Fatalf("diagnostic %q lacks %q", err, hint)
 	}
 }
 
